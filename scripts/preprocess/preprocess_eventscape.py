@@ -636,6 +636,7 @@ def process_sequence(
     output_width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     normalize: bool,
     output_dtype: str,
     show_progress: bool,
@@ -668,6 +669,7 @@ def process_sequence(
         output_width=output_width,
         downsample_factor=downsample_factor,
     )
+    voxel_channels = int(t_bins) * (2 if split_polarity else 1)
     voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -679,7 +681,7 @@ def process_sequence(
     try:
         writer = VoxelH5Writer(
             outfile=tmp_path,
-            t_bins=t_bins,
+            t_bins=voxel_channels,
             height=effective_output_height,
             width=effective_output_width,
             voxel_dtype=voxel_dtype,
@@ -699,6 +701,9 @@ def process_sequence(
         writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
         writer.h5f.attrs["spatial_resize_mode"] = "nearest"
         writer.h5f.attrs["t_bins"] = int(t_bins)
+        writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
+        writer.h5f.attrs["split_polarity"] = int(split_polarity)
+        writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
         writer.h5f.attrs["window_mode"] = "event_file"
         writer.h5f.attrs["normalize"] = int(normalize)
         writer.h5f.attrs["num_event_files"] = int(len(event_files))
@@ -710,6 +715,7 @@ def process_sequence(
         voxelizer = EventVoxelGrid(
             input_size=(t_bins, effective_output_height, effective_output_width),
             normalize=normalize,
+            separate_polarity=split_polarity,
         )
         if show_progress:
             pbar = tqdm.tqdm(total=len(event_files), desc=sequence_dir.name, leave=False)
@@ -814,6 +820,7 @@ def _process_sequence_with_retry(
     output_width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     normalize: bool,
     output_dtype: str,
     tmp_suffix: str,
@@ -833,6 +840,7 @@ def _process_sequence_with_retry(
                 output_width=output_width,
                 downsample_factor=downsample_factor,
                 t_bins=t_bins,
+                split_polarity=split_polarity,
                 normalize=normalize,
                 output_dtype=output_dtype,
                 show_progress=False,
@@ -866,6 +874,7 @@ def _worker_process_sequence(job: dict) -> tuple[str, bool, str | None]:
         output_width=job["output_width"],
         downsample_factor=job["downsample_factor"],
         t_bins=job["t_bins"],
+        split_polarity=job["split_polarity"],
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
         tmp_suffix=job["tmp_suffix"],
@@ -903,6 +912,7 @@ def process_dataset_root(
     output_width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     normalize: bool,
     output_dtype: str,
     tmp_suffix: str,
@@ -950,6 +960,7 @@ def process_dataset_root(
                 "output_width": int(output_width),
                 "downsample_factor": int(downsample_factor),
                 "t_bins": int(t_bins),
+                "split_polarity": bool(split_polarity),
                 "normalize": bool(normalize),
                 "output_dtype": output_dtype,
                 "tmp_suffix": tmp_suffix,
@@ -1035,6 +1046,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--t_bins", type=int, default=5, help="Number of temporal bins for voxel representation.")
     parser.add_argument(
+        "--split_polarity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Accumulate positive/negative events into separate channels (output channels = 2*t_bins).",
+    )
+    parser.add_argument(
         "--normalize",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1066,6 +1083,7 @@ if __name__ == "__main__":
             output_width=args.output_width,
             downsample_factor=args.downsample_factor,
             t_bins=args.t_bins,
+            split_polarity=args.split_polarity,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             tmp_suffix=args.tmp_suffix,
@@ -1084,6 +1102,7 @@ if __name__ == "__main__":
             output_width=args.output_width,
             downsample_factor=args.downsample_factor,
             t_bins=args.t_bins,
+            split_polarity=args.split_polarity,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             show_progress=True,

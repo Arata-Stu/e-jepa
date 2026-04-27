@@ -516,6 +516,7 @@ def process_single_file(
     width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     accum_time: int,
     stride_time: int,
     start_time_us: int | None,
@@ -551,6 +552,7 @@ def process_single_file(
         input_width=width,
         downsample_factor=downsample_factor,
     )
+    voxel_channels = int(t_bins) * (2 if split_polarity else 1)
     voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
     if sync_segmentation and (segmentation_dir is None or not segmentation_dir.exists()):
         print(f"[WARN] segmentation directory unavailable for {input_path}; metadata will be marked unavailable.")
@@ -568,7 +570,7 @@ def process_single_file(
 
             writer = VoxelH5Writer(
                 outfile=tmp_path,
-                t_bins=t_bins,
+                t_bins=voxel_channels,
                 height=output_height,
                 width=output_width,
                 voxel_dtype=voxel_dtype,
@@ -583,6 +585,9 @@ def process_single_file(
             writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
             writer.h5f.attrs["spatial_resize_mode"] = "nearest"
             writer.h5f.attrs["t_bins"] = int(t_bins)
+            writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
+            writer.h5f.attrs["split_polarity"] = int(split_polarity)
+            writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
             writer.h5f.attrs["window_mode"] = window_mode
             writer.h5f.attrs["accum_time_us"] = int(accum_time)
             writer.h5f.attrs["stride_time_us"] = int(stride_time)
@@ -624,7 +629,11 @@ def process_single_file(
             else:
                 seg_timestamps, seg_relpaths = np.empty((0,), dtype=np.int64), []
 
-            voxelizer = EventVoxelGrid(input_size=(t_bins, output_height, output_width), normalize=normalize)
+            voxelizer = EventVoxelGrid(
+                input_size=(t_bins, output_height, output_width),
+                normalize=normalize,
+                separate_polarity=split_polarity,
+            )
 
             if show_pbar:
                 pbar = tqdm.tqdm(total=len(windows), desc=input_path.name, leave=False)
@@ -689,6 +698,7 @@ def _process_file_with_retry(
     width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     accum_time: int,
     stride_time: int,
     start_time_us: int | None,
@@ -714,6 +724,7 @@ def _process_file_with_retry(
                 width=width,
                 downsample_factor=downsample_factor,
                 t_bins=t_bins,
+                split_polarity=split_polarity,
                 accum_time=accum_time,
                 stride_time=stride_time,
                 start_time_us=start_time_us,
@@ -755,6 +766,7 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         width=job["width"],
         downsample_factor=job["downsample_factor"],
         t_bins=job["t_bins"],
+        split_polarity=job["split_polarity"],
         accum_time=job["accum_time"],
         stride_time=job["stride_time"],
         start_time_us=job["start_time_us"],
@@ -905,6 +917,7 @@ def process_dataset_root(
     width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     accum_time: int,
     stride_time: int,
     window_mode: str,
@@ -1002,6 +1015,7 @@ def process_dataset_root(
                 "width": int(width),
                 "downsample_factor": int(downsample_factor),
                 "t_bins": int(t_bins),
+                "split_polarity": bool(split_polarity),
                 "accum_time": int(accum_time),
                 "stride_time": int(stride_time),
                 "start_time_us": int(start_time_us) if start_time_us is not None else None,
@@ -1054,6 +1068,7 @@ def process_dsec_root(
     width: int,
     downsample_factor: int,
     t_bins: int,
+    split_polarity: bool,
     accum_time: int,
     stride_time: int,
     window_mode: str,
@@ -1083,6 +1098,7 @@ def process_dsec_root(
         width=width,
         downsample_factor=downsample_factor,
         t_bins=t_bins,
+        split_polarity=split_polarity,
         accum_time=accum_time,
         stride_time=stride_time,
         start_time_us=start_time_us,
@@ -1159,6 +1175,12 @@ if __name__ == "__main__":
         help="Nearest-neighbor spatial downsample factor (2 means 1/2 resolution).",
     )
     parser.add_argument("--t_bins", type=int, default=5, help="Number of temporal bins for voxel representation.")
+    parser.add_argument(
+        "--split_polarity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Accumulate positive/negative events into separate channels (output channels = 2*t_bins).",
+    )
     parser.add_argument(
         "--accum_time",
         type=int,
@@ -1265,6 +1287,7 @@ if __name__ == "__main__":
             width=args.input_width,
             downsample_factor=args.downsample_factor,
             t_bins=args.t_bins,
+            split_polarity=args.split_polarity,
             accum_time=args.accum_time,
             stride_time=stride_time,
             start_time_us=args.start_time_us,
@@ -1292,6 +1315,7 @@ if __name__ == "__main__":
             width=args.input_width,
             downsample_factor=args.downsample_factor,
             t_bins=args.t_bins,
+            split_polarity=args.split_polarity,
             accum_time=args.accum_time,
             stride_time=stride_time,
             start_time_us=args.start_time_us,

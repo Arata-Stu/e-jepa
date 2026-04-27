@@ -12,6 +12,8 @@ This directory contains dataset-specific preprocessing scripts:
 - Single-file mode uses `--input_path` and `--output_path`.
 - Root mode uses `--dataset_root` (DSEC also supports `--dsec_root`).
 - `--downsample_factor` supports `1` or `2` (nearest-neighbor spatial mapping).
+- `--split_polarity` is enabled by default and stores positive/negative events in separate channel groups.
+  With split polarity, voxel channels become `2 * t_bins` (shape uses `C` below).
 - In root mode, generated filenames include a scale tag (`_1x` or `_2x`) when filename is generated from suffix/default naming.
 - Temporary files are written with `--tmp_suffix` and atomically renamed on success.
 
@@ -126,7 +128,7 @@ Base datasets:
 
 ```text
 /
-  voxels                    float16|float32  shape=(N, t_bins, H, W)
+  voxels                    float16|float32  shape=(N, C, H, W)
   window_t_start_us         uint64           shape=(N,)
   window_t_end_us           uint64           shape=(N,)
   window_event_count        uint64           shape=(N,)
@@ -156,6 +158,8 @@ Important attrs:
   @downsample_factor
   @spatial_resize_mode
   @t_bins
+  @voxel_channels
+  @split_polarity
   @window_mode
   @accum_time_us
   @stride_time_us
@@ -273,7 +277,7 @@ With `--output_root`:
 
 ```text
 /
-  voxels                    float16|float32  shape=(N, t_bins, H, W)
+  voxels                    float16|float32  shape=(N, C, H, W)
   window_index              uint64           shape=(N,)
   window_t_start_us         uint64           shape=(N,)
   window_t_end_us           uint64           shape=(N,)
@@ -299,6 +303,8 @@ Important attrs:
   @downsample_factor
   @spatial_resize_mode
   @t_bins
+  @voxel_channels
+  @split_polarity
   @accum_time_us
   @stride_time_us
   @time_origin_us
@@ -406,7 +412,7 @@ With `--output_root`:
 
 ```text
 /
-  voxels                    float16|float32  shape=(N, t_bins, H, W)
+  voxels                    float16|float32  shape=(N, C, H, W)
   window_index              uint64           shape=(N,)
   window_t_start_us         uint64           shape=(N,)
   window_t_end_us           uint64           shape=(N,)
@@ -433,6 +439,8 @@ Important attrs:
   @downsample_factor
   @spatial_resize_mode
   @t_bins
+  @voxel_channels
+  @split_polarity
   @accum_time_us
   @stride_time_us
   @sync_target               # event_only | semantic | depth
@@ -585,7 +593,7 @@ With `--output_root`:
 
 ```text
 /
-  voxels                    float16|float32  shape=(N, t_bins, H, W)
+  voxels                    float16|float32  shape=(N, C, H, W)
   window_index              uint64           shape=(N,)
   window_t_start_us         int64            shape=(N,)
   window_t_end_us           int64            shape=(N,)
@@ -624,6 +632,8 @@ Important attrs:
   @downsample_factor
   @spatial_resize_mode
   @t_bins
+  @voxel_channels
+  @split_polarity
   @window_mode               # event_file
   @normalize
   @num_event_files

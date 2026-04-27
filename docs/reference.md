@@ -10,3 +10,4 @@
 ## メモ
 - `source/src/...` の二重構造は廃止
 - model内部 import は `src.models...` を向くように調整済み
+- stage1 用イベントデータセットは `src/datasets/` に追加（詳細: `docs/stage1_event_dataset.md`）

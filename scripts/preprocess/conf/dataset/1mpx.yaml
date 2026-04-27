@@ -1,0 +1,27 @@
+name: 1mpx
+
+dataset_root: null
+output_root: null
+
+splits: [train, test, val]
+recursive: false
+output_suffix: _voxels.h5
+output_subdir: null
+overwrite: false
+
+input_height: 720
+input_width: 1280
+output_height: 720
+output_width: 1280
+downsample_factor: 1
+
+t_bins: 10
+split_polarity: true
+accum_time: 50000
+stride_time: null
+start_time_us: null
+
+normalize: true
+output_dtype: float16
+tmp_suffix: .tmp
+num_processes: 1

@@ -1,0 +1,32 @@
+name: dsec
+
+dataset_root: null
+output_root: null
+
+splits: [train, test]
+output_name: null
+output_suffix: _voxels.h5
+output_subdir: null
+overwrite: false
+
+input_height: 480
+input_width: 640
+downsample_factor: 1
+
+t_bins: 10
+split_polarity: true
+accum_time: 50000
+stride_time: null
+start_time_us: null
+window_mode: fixed
+
+image_root: null
+sync_segmentation: false
+segmentation_root: null
+segmentation_subdir: 11classes_renamed
+segmentation_tolerance_us: 0
+
+normalize: true
+output_dtype: float16
+tmp_suffix: .tmp
+num_processes: 1

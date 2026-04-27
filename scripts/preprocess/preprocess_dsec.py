@@ -1,0 +1,1307 @@
+from __future__ import annotations
+
+import argparse
+import multiprocessing as mp
+import os
+import sys
+import weakref
+from pathlib import Path
+
+import h5py
+import numpy as np
+import torch
+import tqdm
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.representations import EventVoxelGrid
+from scripts.preprocess.utils import (
+    cleanup_tmp_file,
+    ensure_scale_tag_in_filename,
+    get_h5_compression_flags,
+    normalized_output_subdir,
+    normalized_output_suffix,
+    tmp_output_path,
+)
+
+
+H5_COMPRESSION_FLAGS = get_h5_compression_flags()
+
+
+def _empty_events() -> dict[str, np.ndarray]:
+    return {
+        "x": np.empty((0,), dtype=np.uint16),
+        "y": np.empty((0,), dtype=np.uint16),
+        "p": np.empty((0,), dtype=np.uint8),
+        "t": np.empty((0,), dtype=np.int64),
+    }
+
+
+def _read_t_offset(filehandle: h5py.File) -> int:
+    if "t_offset" not in filehandle:
+        return 0
+    return int(filehandle["t_offset"][()])
+
+
+def _extract_from_h5_by_index(filehandle: h5py.File, ev_start_idx: int, ev_end_idx: int) -> dict[str, np.ndarray]:
+    events = filehandle["events"]
+    t_offset = _read_t_offset(filehandle)
+
+    x = events["x"][ev_start_idx:ev_end_idx]
+    y = events["y"][ev_start_idx:ev_end_idx]
+    p = events["p"][ev_start_idx:ev_end_idx]
+    t = events["t"][ev_start_idx:ev_end_idx].astype(np.int64) + t_offset
+
+    return {
+        "x": x,
+        "y": y,
+        "p": p,
+        "t": t,
+    }
+
+
+def _get_time_bounds_us(filehandle: h5py.File) -> tuple[int | None, int | None]:
+    t = filehandle["events/t"]
+    num_events = len(t)
+    if num_events == 0:
+        return None, None
+
+    t_offset = _read_t_offset(filehandle)
+    t_first = int(t[0]) + t_offset
+    t_last_exclusive = int(t[num_events - 1]) + t_offset + 1
+    return t_first, t_last_exclusive
+
+
+def _load_ms_to_idx(filehandle: h5py.File) -> np.ndarray | None:
+    if "ms_to_idx" not in filehandle:
+        return None
+    return filehandle["ms_to_idx"][()]
+
+
+def _coarse_bounds_from_ms_to_idx(
+    ms_to_idx: np.ndarray | None,
+    num_events: int,
+    start_us: int,
+    end_us: int,
+) -> tuple[int, int]:
+    if ms_to_idx is None or ms_to_idx.size == 0:
+        return 0, num_events
+
+    start_ms = max(int(start_us // 1000), 0)
+    end_ms_exclusive = max(int((end_us + 999) // 1000), start_ms + 1)
+
+    start_ms = min(start_ms, ms_to_idx.size - 1)
+    start_idx = int(ms_to_idx[start_ms])
+
+    if end_ms_exclusive >= ms_to_idx.size:
+        end_idx = num_events
+    else:
+        end_idx = int(ms_to_idx[end_ms_exclusive])
+
+    start_idx = max(0, min(start_idx, num_events))
+    end_idx = max(0, min(end_idx, num_events))
+    return start_idx, end_idx
+
+
+def _extract_events_by_time(
+    filehandle: h5py.File,
+    start_us: int,
+    end_us: int,
+    ms_to_idx: np.ndarray | None,
+) -> dict[str, np.ndarray]:
+    if end_us <= start_us:
+        return _empty_events()
+
+    t_ds = filehandle["events/t"]
+    num_events = len(t_ds)
+    if num_events == 0:
+        return _empty_events()
+
+    coarse_start, coarse_end = _coarse_bounds_from_ms_to_idx(
+        ms_to_idx=ms_to_idx,
+        num_events=num_events,
+        start_us=start_us,
+        end_us=end_us,
+    )
+    if coarse_end <= coarse_start:
+        return _empty_events()
+
+    t_offset = _read_t_offset(filehandle)
+    t_coarse_abs = t_ds[coarse_start:coarse_end].astype(np.int64) + t_offset
+    if t_coarse_abs.size == 0:
+        return _empty_events()
+
+    rel_start = int(np.searchsorted(t_coarse_abs, start_us, side="left"))
+    rel_end = int(np.searchsorted(t_coarse_abs, end_us, side="left"))
+    ev_start_idx = coarse_start + rel_start
+    ev_end_idx = coarse_start + rel_end
+
+    if ev_end_idx <= ev_start_idx:
+        return _empty_events()
+    return _extract_from_h5_by_index(filehandle, ev_start_idx=ev_start_idx, ev_end_idx=ev_end_idx)
+
+
+def _events_to_voxel_numpy(
+    events: dict[str, np.ndarray],
+    voxelizer: EventVoxelGrid,
+    input_height: int,
+    input_width: int,
+    downsample_factor: int,
+) -> np.ndarray:
+    processed = _downsample_events_nearest(
+        events=events,
+        input_height=input_height,
+        input_width=input_width,
+        downsample_factor=downsample_factor,
+    )
+    if len(processed["t"]) == 0:
+        return np.zeros(voxelizer.voxel_grid.shape, dtype=np.float32)
+
+    # Convert to float tensors once to match interpolation arithmetic inside voxelizer.
+    # Shift time to improve float precision.
+    t_shifted = (processed["t"] - processed["t"][0]).astype(np.float32, copy=False)
+    events_torch = {
+        "x": torch.from_numpy(processed["x"].astype(np.float32, copy=False)),
+        "y": torch.from_numpy(processed["y"].astype(np.float32, copy=False)),
+        "p": torch.from_numpy(processed["p"].astype(np.float32, copy=False)),
+        "t": torch.from_numpy(t_shifted),
+    }
+    voxel = voxelizer.convert(events_torch)
+    return voxel.cpu().numpy().astype(np.float32, copy=False)
+
+
+def _resolve_output_resolution(input_height: int, input_width: int, downsample_factor: int) -> tuple[int, int]:
+    if int(downsample_factor) < 1:
+        raise ValueError("downsample_factor must be >= 1")
+    if int(downsample_factor) == 1:
+        return int(input_height), int(input_width)
+
+    if input_height % int(downsample_factor) != 0 or input_width % int(downsample_factor) != 0:
+        raise ValueError(
+            "input resolution must be divisible by downsample_factor for nearest downsample: "
+            f"{input_width}x{input_height}, factor={downsample_factor}"
+        )
+    return int(input_height // int(downsample_factor)), int(input_width // int(downsample_factor))
+
+
+def _downsample_events_nearest(
+    events: dict[str, np.ndarray],
+    input_height: int,
+    input_width: int,
+    downsample_factor: int,
+) -> dict[str, np.ndarray]:
+    if len(events["t"]) == 0:
+        return _empty_events()
+
+    out_height, out_width = _resolve_output_resolution(
+        input_height=input_height,
+        input_width=input_width,
+        downsample_factor=downsample_factor,
+    )
+    x_src = events["x"].astype(np.int64, copy=False)
+    y_src = events["y"].astype(np.int64, copy=False)
+    p_src = events["p"]
+    t_src = events["t"]
+
+    valid_in = (x_src >= 0) & (x_src < int(input_width)) & (y_src >= 0) & (y_src < int(input_height))
+    if not np.any(valid_in):
+        return _empty_events()
+
+    x_src = x_src[valid_in]
+    y_src = y_src[valid_in]
+    p_src = p_src[valid_in]
+    t_src = t_src[valid_in]
+
+    if int(downsample_factor) == 1:
+        x_out = x_src.astype(np.float32, copy=False)
+        y_out = y_src.astype(np.float32, copy=False)
+    else:
+        # Nearest-neighbor downsample by integer factor (e.g., factor=2 for 1/2 resolution).
+        x_out = (x_src // int(downsample_factor)).astype(np.float32, copy=False)
+        y_out = (y_src // int(downsample_factor)).astype(np.float32, copy=False)
+
+    valid_out = (
+        (x_out >= 0)
+        & (x_out < float(out_width))
+        & (y_out >= 0)
+        & (y_out < float(out_height))
+    )
+    if not np.any(valid_out):
+        return _empty_events()
+
+    return {
+        "x": x_out[valid_out],
+        "y": y_out[valid_out],
+        "p": p_src[valid_out].astype(np.uint8, copy=False),
+        "t": t_src[valid_out].astype(np.int64, copy=False),
+    }
+
+
+def _load_image_timestamps(image_timestamps_path: Path) -> np.ndarray:
+    if not image_timestamps_path.exists():
+        raise FileNotFoundError(f"image timestamps file not found: {image_timestamps_path}")
+
+    timestamps = np.loadtxt(str(image_timestamps_path), dtype=np.int64)
+    timestamps = np.atleast_1d(timestamps).astype(np.int64, copy=False).reshape(-1)
+    return timestamps
+
+
+def _build_fixed_windows(
+    t_first_us: int,
+    t_last_exclusive_us: int,
+    accum_time_us: int,
+    stride_time_us: int,
+) -> list[tuple[int, int, int]]:
+    starts = np.arange(t_first_us, t_last_exclusive_us, stride_time_us, dtype=np.int64)
+    windows: list[tuple[int, int, int]] = []
+    for start_us in starts:
+        start_int = int(start_us)
+        end_int = min(start_int + int(accum_time_us), int(t_last_exclusive_us))
+        anchor_int = start_int + (end_int - start_int) // 2
+        windows.append((start_int, end_int, anchor_int))
+    return windows
+
+
+def _build_image_middle_windows(
+    t_first_us: int,
+    t_last_exclusive_us: int,
+    image_timestamps_us: np.ndarray,
+) -> list[tuple[int, int, int]]:
+    if image_timestamps_us.size == 0:
+        return []
+
+    image_timestamps_us = image_timestamps_us.astype(np.int64, copy=False)
+    midpoints = np.empty((max(image_timestamps_us.size - 1, 0),), dtype=np.int64)
+    for i in range(image_timestamps_us.size - 1):
+        # Use midpoint between adjacent image timestamps as temporal boundary.
+        midpoints[i] = image_timestamps_us[i] + (image_timestamps_us[i + 1] - image_timestamps_us[i]) // 2
+
+    windows: list[tuple[int, int, int]] = []
+    for i in range(image_timestamps_us.size):
+        if i == 0:
+            start_us = int(t_first_us)
+        else:
+            start_us = int(midpoints[i - 1])
+
+        if i < image_timestamps_us.size - 1:
+            end_us = int(midpoints[i])
+        else:
+            end_us = int(t_last_exclusive_us)
+
+        start_us = max(start_us, int(t_first_us))
+        end_us = min(end_us, int(t_last_exclusive_us))
+        anchor_us = int(image_timestamps_us[i])
+        windows.append((start_us, end_us, anchor_us))
+    return windows
+
+
+def _load_segmentation_index(segmentation_dir: Path) -> tuple[np.ndarray, list[str]]:
+    if not segmentation_dir.exists() or not segmentation_dir.is_dir():
+        return np.empty((0,), dtype=np.int64), []
+
+    timestamped_files: list[tuple[int, str]] = []
+    for label_path in sorted(segmentation_dir.glob("*.png")):
+        try:
+            timestamped_files.append((int(label_path.stem), label_path.name))
+        except ValueError:
+            continue
+
+    if len(timestamped_files) == 0:
+        return np.empty((0,), dtype=np.int64), []
+
+    timestamped_files.sort(key=lambda x: x[0])
+    timestamps = np.array([t for t, _ in timestamped_files], dtype=np.int64)
+    relpaths = [n for _, n in timestamped_files]
+    return timestamps, relpaths
+
+
+def _match_segmentation_timestamp(
+    anchor_us: int,
+    seg_timestamps_us: np.ndarray,
+    seg_relpaths: list[str],
+    tolerance_us: int,
+) -> tuple[int, int, int, str]:
+    if seg_timestamps_us.size == 0:
+        return 0, -1, -1, ""
+
+    idx = int(np.searchsorted(seg_timestamps_us, anchor_us, side="left"))
+    candidate_indices: list[int] = []
+    if idx < seg_timestamps_us.size:
+        candidate_indices.append(idx)
+    if idx > 0:
+        candidate_indices.append(idx - 1)
+
+    best_idx = min(candidate_indices, key=lambda k: abs(int(seg_timestamps_us[k]) - int(anchor_us)))
+    matched_ts = int(seg_timestamps_us[best_idx])
+    delta_us = int(anchor_us - matched_ts)
+    available = int(abs(delta_us) <= int(tolerance_us))
+    relpath = seg_relpaths[best_idx] if available else ""
+    return available, matched_ts, delta_us, relpath
+
+
+class VoxelH5Writer:
+    def __init__(
+        self,
+        outfile: Path,
+        t_bins: int,
+        height: int,
+        width: int,
+        voxel_dtype: np.dtype,
+        with_segmentation_meta: bool = False,
+        initial_capacity: int = 256,
+    ):
+        if outfile.exists():
+            raise FileExistsError(f"output already exists: {outfile}")
+
+        self.h5f = h5py.File(str(outfile), "a")
+        self._finalizer = weakref.finalize(self, self.close_callback, self.h5f)
+
+        self._capacity = int(initial_capacity)
+        self._num_windows = 0
+        self._with_segmentation_meta = bool(with_segmentation_meta)
+        self._datasets: list[str] = [
+            "voxels",
+            "window_t_start_us",
+            "window_t_end_us",
+            "window_event_count",
+            "anchor_timestamp_us",
+        ]
+
+        voxel_chunks = (1, t_bins, min(height, 64), min(width, 64))
+        scalar_chunks = (min(self._capacity, 4096),)
+
+        self.h5f.create_dataset(
+            "voxels",
+            shape=(self._capacity, t_bins, height, width),
+            maxshape=(None, t_bins, height, width),
+            dtype=voxel_dtype,
+            chunks=voxel_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_t_start_us",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="u8",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_t_end_us",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="u8",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_event_count",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="u8",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "anchor_timestamp_us",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="i8",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+
+        if self._with_segmentation_meta:
+            string_dtype = h5py.string_dtype(encoding="utf-8")
+            self.h5f.create_dataset(
+                "segmentation_available",
+                shape=(self._capacity,),
+                maxshape=(None,),
+                dtype="u1",
+                chunks=scalar_chunks,
+                **H5_COMPRESSION_FLAGS,
+            )
+            self.h5f.create_dataset(
+                "segmentation_timestamp_us",
+                shape=(self._capacity,),
+                maxshape=(None,),
+                dtype="i8",
+                chunks=scalar_chunks,
+                **H5_COMPRESSION_FLAGS,
+            )
+            self.h5f.create_dataset(
+                "segmentation_time_delta_us",
+                shape=(self._capacity,),
+                maxshape=(None,),
+                dtype="i8",
+                chunks=scalar_chunks,
+                **H5_COMPRESSION_FLAGS,
+            )
+            self.h5f.create_dataset(
+                "segmentation_relpath",
+                shape=(self._capacity,),
+                maxshape=(None,),
+                dtype=string_dtype,
+                chunks=scalar_chunks,
+            )
+            self._datasets.extend(
+                [
+                    "segmentation_available",
+                    "segmentation_timestamp_us",
+                    "segmentation_time_delta_us",
+                    "segmentation_relpath",
+                ]
+            )
+
+    @staticmethod
+    def close_callback(h5f: h5py.File):
+        h5f.close()
+
+    def _ensure_capacity(self, needed: int):
+        if needed <= self._capacity:
+            return
+
+        new_capacity = self._capacity
+        while new_capacity < needed:
+            new_capacity *= 2
+
+        for dset_name in self._datasets:
+            self.h5f[dset_name].resize(new_capacity, axis=0)
+        self._capacity = new_capacity
+
+    def add_window(
+        self,
+        voxel: np.ndarray,
+        t_start_us: int,
+        t_end_us: int,
+        event_count: int,
+        anchor_timestamp_us: int,
+        segmentation_available: int = 0,
+        segmentation_timestamp_us: int = -1,
+        segmentation_time_delta_us: int = -1,
+        segmentation_relpath: str = "",
+    ):
+        idx = self._num_windows
+        self._ensure_capacity(idx + 1)
+
+        self.h5f["voxels"][idx] = voxel
+        self.h5f["window_t_start_us"][idx] = int(t_start_us)
+        self.h5f["window_t_end_us"][idx] = int(t_end_us)
+        self.h5f["window_event_count"][idx] = int(event_count)
+        self.h5f["anchor_timestamp_us"][idx] = int(anchor_timestamp_us)
+        if self._with_segmentation_meta:
+            self.h5f["segmentation_available"][idx] = int(segmentation_available)
+            self.h5f["segmentation_timestamp_us"][idx] = int(segmentation_timestamp_us)
+            self.h5f["segmentation_time_delta_us"][idx] = int(segmentation_time_delta_us)
+            self.h5f["segmentation_relpath"][idx] = segmentation_relpath
+        self._num_windows += 1
+
+    def _trim(self):
+        for dset_name in self._datasets:
+            self.h5f[dset_name].resize(self._num_windows, axis=0)
+
+    def close(self):
+        if self._finalizer.alive:
+            self._trim()
+            self._finalizer()
+
+
+def process_single_file(
+    input_path: Path,
+    output_path: Path,
+    height: int,
+    width: int,
+    downsample_factor: int,
+    t_bins: int,
+    accum_time: int,
+    stride_time: int,
+    start_time_us: int | None,
+    window_mode: str,
+    image_timestamps_path: Path | None,
+    normalize: bool,
+    output_dtype: str,
+    sync_segmentation: bool,
+    segmentation_dir: Path | None,
+    segmentation_tolerance_us: int,
+    show_pbar: bool = True,
+    tmp_suffix: str = ".tmp",
+):
+    if t_bins <= 0:
+        raise ValueError("t_bins must be > 0")
+    if height <= 0 or width <= 0:
+        raise ValueError("height and width must be > 0")
+    if int(downsample_factor) not in (1, 2):
+        raise ValueError("downsample_factor must be 1 or 2")
+    if accum_time <= 0:
+        raise ValueError("accum_time must be > 0")
+    if stride_time <= 0:
+        raise ValueError("stride_time must be > 0")
+    if segmentation_tolerance_us < 0:
+        raise ValueError("segmentation_tolerance_us must be >= 0")
+    if window_mode not in ("fixed", "image_middle"):
+        raise ValueError(f"unsupported window_mode: {window_mode}")
+    if window_mode == "image_middle" and image_timestamps_path is None:
+        raise ValueError("window_mode=image_middle requires image_timestamps_path")
+
+    output_height, output_width = _resolve_output_resolution(
+        input_height=height,
+        input_width=width,
+        downsample_factor=downsample_factor,
+    )
+    voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
+    if sync_segmentation and (segmentation_dir is None or not segmentation_dir.exists()):
+        print(f"[WARN] segmentation directory unavailable for {input_path}; metadata will be marked unavailable.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
+    cleanup_tmp_file(tmp_path=tmp_path, context=f"start processing {input_path}", strict=True)
+
+    writer = None
+    pbar = None
+    try:
+        with h5py.File(str(input_path), "r") as h5f:
+            t_first, t_last_exclusive = _get_time_bounds_us(h5f)
+            ms_to_idx = _load_ms_to_idx(h5f)
+
+            writer = VoxelH5Writer(
+                outfile=tmp_path,
+                t_bins=t_bins,
+                height=output_height,
+                width=output_width,
+                voxel_dtype=voxel_dtype,
+                with_segmentation_meta=sync_segmentation,
+            )
+            writer.h5f.attrs["representation"] = "event_voxel_grid"
+            writer.h5f.attrs["source_file"] = str(input_path)
+            writer.h5f.attrs["input_height"] = int(height)
+            writer.h5f.attrs["input_width"] = int(width)
+            writer.h5f.attrs["height"] = int(output_height)
+            writer.h5f.attrs["width"] = int(output_width)
+            writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
+            writer.h5f.attrs["spatial_resize_mode"] = "nearest"
+            writer.h5f.attrs["t_bins"] = int(t_bins)
+            writer.h5f.attrs["window_mode"] = window_mode
+            writer.h5f.attrs["accum_time_us"] = int(accum_time)
+            writer.h5f.attrs["stride_time_us"] = int(stride_time)
+            writer.h5f.attrs["normalize"] = int(normalize)
+            writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
+            writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
+            writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
+            writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
+
+            if t_first is None or t_last_exclusive is None:
+                writer.h5f.attrs["time_origin_us"] = -1
+                writer.close()
+                writer = None
+                os.replace(tmp_path, output_path)
+                return
+
+            time_origin_us = int(t_first) if start_time_us is None else int(start_time_us)
+            writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
+
+            if window_mode == "fixed":
+                window_start_us = max(int(t_first), time_origin_us)
+                windows = _build_fixed_windows(
+                    t_first_us=window_start_us,
+                    t_last_exclusive_us=t_last_exclusive,
+                    accum_time_us=accum_time,
+                    stride_time_us=stride_time,
+                )
+            else:
+                image_timestamps = _load_image_timestamps(image_timestamps_path)
+                windows = _build_image_middle_windows(
+                    t_first_us=t_first,
+                    t_last_exclusive_us=t_last_exclusive,
+                    image_timestamps_us=image_timestamps,
+                )
+                writer.h5f.attrs["num_image_timestamps"] = int(len(image_timestamps))
+
+            if sync_segmentation and segmentation_dir is not None:
+                seg_timestamps, seg_relpaths = _load_segmentation_index(segmentation_dir)
+            else:
+                seg_timestamps, seg_relpaths = np.empty((0,), dtype=np.int64), []
+
+            voxelizer = EventVoxelGrid(input_size=(t_bins, output_height, output_width), normalize=normalize)
+
+            if show_pbar:
+                pbar = tqdm.tqdm(total=len(windows), desc=input_path.name, leave=False)
+
+            for start_us_int, end_us_int, anchor_us_int in windows:
+                events = _extract_events_by_time(
+                    filehandle=h5f,
+                    start_us=start_us_int,
+                    end_us=end_us_int,
+                    ms_to_idx=ms_to_idx,
+                )
+                voxel = _events_to_voxel_numpy(
+                    events=events,
+                    voxelizer=voxelizer,
+                    input_height=height,
+                    input_width=width,
+                    downsample_factor=downsample_factor,
+                )
+                voxel = voxel.astype(voxel_dtype, copy=False)
+                seg_available = 0
+                seg_timestamp = -1
+                seg_delta = -1
+                seg_relpath = ""
+                if sync_segmentation:
+                    seg_available, seg_timestamp, seg_delta, seg_relpath = _match_segmentation_timestamp(
+                        anchor_us=anchor_us_int,
+                        seg_timestamps_us=seg_timestamps,
+                        seg_relpaths=seg_relpaths,
+                        tolerance_us=segmentation_tolerance_us,
+                    )
+                writer.add_window(
+                    voxel=voxel,
+                    t_start_us=start_us_int,
+                    t_end_us=end_us_int,
+                    event_count=len(events["t"]),
+                    anchor_timestamp_us=anchor_us_int,
+                    segmentation_available=seg_available,
+                    segmentation_timestamp_us=seg_timestamp,
+                    segmentation_time_delta_us=seg_delta,
+                    segmentation_relpath=seg_relpath,
+                )
+                if pbar is not None:
+                    pbar.update(1)
+
+        writer.close()
+        writer = None
+        os.replace(tmp_path, output_path)
+    except Exception:
+        if writer is not None:
+            writer.close()
+        cleanup_tmp_file(tmp_path=tmp_path, context=f"exception cleanup for {input_path}", strict=False)
+        raise
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+
+def _process_file_with_retry(
+    input_path: Path,
+    output_path: Path,
+    height: int,
+    width: int,
+    downsample_factor: int,
+    t_bins: int,
+    accum_time: int,
+    stride_time: int,
+    start_time_us: int | None,
+    window_mode: str,
+    image_timestamps_path: Path | None,
+    normalize: bool,
+    output_dtype: str,
+    sync_segmentation: bool,
+    segmentation_dir: Path | None,
+    segmentation_tolerance_us: int,
+    tmp_suffix: str,
+) -> tuple[bool, str | None]:
+    stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
+    if not cleanup_tmp_file(tmp_path=stale_tmp_path, context=f"resume prep for {input_path}", strict=False):
+        return False, f"could not remove stale tmp file: {stale_tmp_path}"
+
+    for attempt in (1, 2):
+        try:
+            process_single_file(
+                input_path=input_path,
+                output_path=output_path,
+                height=height,
+                width=width,
+                downsample_factor=downsample_factor,
+                t_bins=t_bins,
+                accum_time=accum_time,
+                stride_time=stride_time,
+                start_time_us=start_time_us,
+                window_mode=window_mode,
+                image_timestamps_path=image_timestamps_path,
+                normalize=normalize,
+                output_dtype=output_dtype,
+                sync_segmentation=sync_segmentation,
+                segmentation_dir=segmentation_dir,
+                segmentation_tolerance_us=segmentation_tolerance_us,
+                show_pbar=False,
+                tmp_suffix=tmp_suffix,
+            )
+            return True, None
+        except Exception as exc:
+            if attempt == 1:
+                cleanup_ok = cleanup_tmp_file(
+                    tmp_path=stale_tmp_path,
+                    context=f"retry prep for {input_path}",
+                    strict=False,
+                )
+                if not cleanup_ok:
+                    return False, f"retry cleanup failed for {stale_tmp_path}: {exc}"
+                continue
+            return False, str(exc)
+
+    return False, "unknown failure"
+
+
+def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
+    input_path = Path(job["input_path"])
+    output_path = Path(job["output_path"])
+    image_timestamps_path = Path(job["image_timestamps_path"]) if job.get("image_timestamps_path") else None
+    segmentation_dir = Path(job["segmentation_dir"]) if job.get("segmentation_dir") else None
+    ok, err = _process_file_with_retry(
+        input_path=input_path,
+        output_path=output_path,
+        height=job["height"],
+        width=job["width"],
+        downsample_factor=job["downsample_factor"],
+        t_bins=job["t_bins"],
+        accum_time=job["accum_time"],
+        stride_time=job["stride_time"],
+        start_time_us=job["start_time_us"],
+        window_mode=job["window_mode"],
+        image_timestamps_path=image_timestamps_path,
+        normalize=job["normalize"],
+        output_dtype=job["output_dtype"],
+        sync_segmentation=job["sync_segmentation"],
+        segmentation_dir=segmentation_dir,
+        segmentation_tolerance_us=job["segmentation_tolerance_us"],
+        tmp_suffix=job["tmp_suffix"],
+    )
+    return str(input_path), ok, err
+
+
+def find_dsec_event_files(dsec_root: Path, splits: list[str]) -> list[dict]:
+    records: list[dict] = []
+    seen_paths: set[Path] = set()
+
+    for split in splits:
+        base_dirs = [
+            (dsec_root / split, "split"),
+            (dsec_root / f"{split}_events", "split_events"),
+        ]
+        found_any_base = False
+        for base_dir, layout in base_dirs:
+            if not base_dir.exists():
+                continue
+            found_any_base = True
+
+            for sequence_dir in sorted(base_dir.iterdir()):
+                if not sequence_dir.is_dir():
+                    continue
+                input_file = sequence_dir / "events/left/events.h5"
+                if not input_file.exists():
+                    print(f"[WARN] missing events file: {input_file}")
+                    continue
+                resolved = input_file.resolve()
+                if resolved in seen_paths:
+                    continue
+                seen_paths.add(resolved)
+                records.append(
+                    {
+                        "input_path": input_file,
+                        "split": split,
+                        "sequence": sequence_dir.name,
+                        "layout": layout,
+                    }
+                )
+
+        if not found_any_base:
+            print(f"[WARN] missing split directory for '{split}': {dsec_root / split} or {dsec_root / f'{split}_events'}")
+
+    records.sort(key=lambda r: str(r["input_path"]))
+    return records
+
+
+def _resolve_image_timestamps_path(
+    input_path: Path,
+    split: str,
+    sequence: str,
+    dataset_root: Path,
+    image_root: Path | None,
+) -> Path:
+    sequence_dir = input_path.parent.parent.parent
+    base = image_root if image_root is not None else dataset_root
+
+    candidates = [
+        sequence_dir / "images/timestamps.txt",
+        sequence_dir / "images/left/timestamps.txt",
+        base / split / sequence / "images/timestamps.txt",
+        base / split / sequence / "images/left/timestamps.txt",
+        base / f"{split}_images" / sequence / "images/timestamps.txt",
+        base / f"{split}_images" / sequence / "images/left/timestamps.txt",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    tried = "\n".join(f"  - {p}" for p in candidates)
+    raise FileNotFoundError(
+        f"could not resolve image timestamps for split='{split}', sequence='{sequence}'. tried:\n{tried}"
+    )
+
+
+def _resolve_segmentation_dir(
+    input_path: Path,
+    split: str,
+    sequence: str,
+    dataset_root: Path,
+    segmentation_root: Path | None,
+    segmentation_subdir: str,
+) -> Path | None:
+    sequence_dir = input_path.parent.parent.parent
+    base = segmentation_root if segmentation_root is not None else dataset_root
+
+    candidates = [
+        sequence_dir / "semantic_segmentation" / segmentation_subdir,
+        base / split / sequence / segmentation_subdir,
+        base / "semantic_segmentation" / split / sequence / segmentation_subdir,
+        base / "semantic_segmentation" / sequence / segmentation_subdir,
+        base / f"{split}_semantic_segmentation" / split / sequence / segmentation_subdir,
+        base / f"{split}_semantic_segmentation" / sequence / segmentation_subdir,
+    ]
+
+    for path in candidates:
+        if path.exists() and path.is_dir():
+            return path
+    return None
+
+
+def _build_output_path(
+    input_path: Path,
+    dsec_root: Path,
+    output_root: Path | None,
+    output_name: str | None,
+    normalized_output_suffix: str | None,
+    normalized_subdir: str | None,
+    downsample_factor: int,
+) -> Path:
+    if normalized_output_suffix is not None:
+        output_filename = f"{input_path.stem}{normalized_output_suffix}"
+        output_filename = ensure_scale_tag_in_filename(output_filename, downsample_factor=downsample_factor)
+    elif output_name is not None:
+        output_filename = output_name
+    else:
+        raise ValueError("either output_name or output_suffix must be provided")
+
+    if output_root is None:
+        output_dir = input_path.parent
+    else:
+        rel_input = input_path.relative_to(dsec_root)
+        output_dir = output_root / rel_input.parent
+
+    if normalized_subdir is not None:
+        output_dir = output_dir / normalized_subdir
+    return output_dir / output_filename
+
+
+def process_dataset_root(
+    dataset_root: Path,
+    splits: list[str],
+    output_name: str | None,
+    overwrite: bool,
+    output_root: Path | None,
+    height: int,
+    width: int,
+    downsample_factor: int,
+    t_bins: int,
+    accum_time: int,
+    stride_time: int,
+    window_mode: str,
+    image_root: Path | None,
+    normalize: bool,
+    output_dtype: str,
+    sync_segmentation: bool,
+    segmentation_root: Path | None,
+    segmentation_subdir: str,
+    segmentation_tolerance_us: int,
+    tmp_suffix: str,
+    num_processes: int,
+    output_suffix: str | None = None,
+    output_subdir: str | None = None,
+    start_time_us: int | None = None,
+):
+    if int(num_processes) < 1:
+        raise ValueError("num_processes must be >= 1")
+    if output_name is not None and output_suffix is not None:
+        raise ValueError("use either output_name or output_suffix, not both")
+
+    normalized_suffix = normalized_output_suffix(output_suffix) if output_suffix is not None else None
+    normalized_subdir = normalized_output_subdir(output_subdir)
+    resolved_output_name = (
+        output_name
+        if output_name is not None
+        else ensure_scale_tag_in_filename("voxels.h5", downsample_factor=downsample_factor)
+    )
+
+    input_records = find_dsec_event_files(dsec_root=dataset_root, splits=splits)
+    if len(input_records) == 0:
+        raise FileNotFoundError(f"No events.h5 found under root={dataset_root}, splits={splits}")
+    if output_root is not None:
+        output_root.mkdir(parents=True, exist_ok=True)
+
+    jobs: list[dict] = []
+    num_done = 0
+    num_skipped = 0
+    num_failed = 0
+
+    for record in tqdm.tqdm(input_records, desc="DSEC sequences"):
+        input_path = Path(record["input_path"])
+        output_path = _build_output_path(
+            input_path=input_path,
+            dsec_root=dataset_root,
+            output_root=output_root,
+            output_name=resolved_output_name,
+            normalized_output_suffix=normalized_suffix,
+            normalized_subdir=normalized_subdir,
+            downsample_factor=downsample_factor,
+        )
+        if output_path.exists():
+            if overwrite:
+                output_path.unlink()
+            else:
+                num_skipped += 1
+                continue
+
+        image_timestamps_path: Path | None = None
+        if window_mode == "image_middle":
+            try:
+                image_timestamps_path = _resolve_image_timestamps_path(
+                    input_path=input_path,
+                    split=str(record["split"]),
+                    sequence=str(record["sequence"]),
+                    dataset_root=dataset_root,
+                    image_root=image_root,
+                )
+            except Exception as exc:
+                num_failed += 1
+                print(f"[FAILED] {input_path}: {exc}")
+                continue
+
+        segmentation_dir: Path | None = None
+        if sync_segmentation:
+            segmentation_dir = _resolve_segmentation_dir(
+                input_path=input_path,
+                split=str(record["split"]),
+                sequence=str(record["sequence"]),
+                dataset_root=dataset_root,
+                segmentation_root=segmentation_root,
+                segmentation_subdir=segmentation_subdir,
+            )
+            if segmentation_dir is None:
+                print(
+                    "[WARN] segmentation directory not found; sync metadata will be marked unavailable: "
+                    f"split={record['split']}, sequence={record['sequence']}"
+                )
+
+        jobs.append(
+            {
+                "input_path": str(input_path),
+                "output_path": str(output_path),
+                "height": int(height),
+                "width": int(width),
+                "downsample_factor": int(downsample_factor),
+                "t_bins": int(t_bins),
+                "accum_time": int(accum_time),
+                "stride_time": int(stride_time),
+                "start_time_us": int(start_time_us) if start_time_us is not None else None,
+                "window_mode": window_mode,
+                "image_timestamps_path": str(image_timestamps_path) if image_timestamps_path is not None else None,
+                "normalize": bool(normalize),
+                "output_dtype": output_dtype,
+                "sync_segmentation": bool(sync_segmentation),
+                "segmentation_dir": str(segmentation_dir) if segmentation_dir is not None else None,
+                "segmentation_tolerance_us": int(segmentation_tolerance_us),
+                "tmp_suffix": tmp_suffix,
+            }
+        )
+
+    if len(jobs) > 0:
+        if int(num_processes) == 1:
+            iterator = (_worker_process_file(job) for job in jobs)
+            for input_name, success, err in tqdm.tqdm(iterator, total=len(jobs), desc="DSEC workers"):
+                if success:
+                    num_done += 1
+                else:
+                    num_failed += 1
+                    print(f"[FAILED] {input_name}: {err}")
+        else:
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=int(num_processes)) as pool:
+                for input_name, success, err in tqdm.tqdm(
+                    pool.imap_unordered(_worker_process_file, jobs),
+                    total=len(jobs),
+                    desc="DSEC workers",
+                ):
+                    if success:
+                        num_done += 1
+                    else:
+                        num_failed += 1
+                        print(f"[FAILED] {input_name}: {err}")
+
+    print(f"[SUMMARY] done={num_done}, skipped={num_skipped}, failed={num_failed}")
+    if num_failed > 0:
+        raise RuntimeError(f"{num_failed} sequences failed while processing {dataset_root}")
+
+
+def process_dsec_root(
+    dsec_root: Path,
+    splits: list[str],
+    output_name: str | None,
+    overwrite: bool,
+    output_root: Path | None,
+    height: int,
+    width: int,
+    downsample_factor: int,
+    t_bins: int,
+    accum_time: int,
+    stride_time: int,
+    window_mode: str,
+    image_root: Path | None,
+    normalize: bool,
+    output_dtype: str,
+    sync_segmentation: bool,
+    segmentation_root: Path | None,
+    segmentation_subdir: str,
+    segmentation_tolerance_us: int,
+    tmp_suffix: str,
+    num_processes: int,
+    output_suffix: str | None = None,
+    output_subdir: str | None = None,
+    start_time_us: int | None = None,
+):
+    # Backward-compatible wrapper.
+    process_dataset_root(
+        dataset_root=dsec_root,
+        splits=splits,
+        output_name=output_name,
+        output_suffix=output_suffix,
+        output_subdir=output_subdir,
+        overwrite=overwrite,
+        output_root=output_root,
+        height=height,
+        width=width,
+        downsample_factor=downsample_factor,
+        t_bins=t_bins,
+        accum_time=accum_time,
+        stride_time=stride_time,
+        start_time_us=start_time_us,
+        window_mode=window_mode,
+        image_root=image_root,
+        normalize=normalize,
+        output_dtype=output_dtype,
+        sync_segmentation=sync_segmentation,
+        segmentation_root=segmentation_root,
+        segmentation_subdir=segmentation_subdir,
+        segmentation_tolerance_us=segmentation_tolerance_us,
+        tmp_suffix=tmp_suffix,
+        num_processes=num_processes,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser("""Build event voxel representations from DSEC events.h5 files.""")
+    parser.add_argument("--input_path", type=Path, help="Path to input events.h5.")
+    parser.add_argument("--output_path", type=Path, help="Path where output voxel .h5 will be written.")
+    parser.add_argument("--dsec_root", type=Path, help="Path to DSEC root (contains train/test splits).")
+    parser.add_argument("--dataset_root", type=Path, help="Alias of --dsec_root for naming consistency.")
+    parser.add_argument("--splits", nargs="+", default=["train", "test"], help="Split names for root mode.")
+    parser.add_argument(
+        "--output_name",
+        type=str,
+        default=None,
+        help="Deprecated: exact output filename per sequence in root mode (e.g. voxels.h5).",
+    )
+    parser.add_argument(
+        "--output_suffix",
+        type=str,
+        default=None,
+        help="Output suffix in root mode (e.g. _voxels.h5). Scale tag (_1x/_2x) is auto-added.",
+    )
+    parser.add_argument(
+        "--output_subdir",
+        type=str,
+        default=None,
+        help="Optional output subdirectory under each target dir (e.g. voxel).",
+    )
+    parser.add_argument(
+        "--output_root",
+        type=Path,
+        default=None,
+        help="Optional output root for root mode (preserves relative split paths).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output files in root mode.",
+    )
+    parser.add_argument(
+        "--tmp_suffix",
+        type=str,
+        default=".tmp",
+        help="Temporary suffix used while writing (renamed on success).",
+    )
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=1,
+        help="Parallel workers for root mode (spawn).",
+    )
+    parser.add_argument("--input_height", type=int, default=480, help="Input event height (default: 480).")
+    parser.add_argument("--input_width", type=int, default=640, help="Input event width (default: 640).")
+    parser.add_argument("--height", dest="input_height", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--width", dest="input_width", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--downsample_factor",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="Nearest-neighbor spatial downsample factor (2 means 1/2 resolution).",
+    )
+    parser.add_argument("--t_bins", type=int, default=5, help="Number of temporal bins for voxel representation.")
+    parser.add_argument(
+        "--accum_time",
+        type=int,
+        default=50000,
+        help="Accumulation window in microseconds.",
+    )
+    parser.add_argument(
+        "--stride_time",
+        type=int,
+        default=None,
+        help="Sliding stride in microseconds (default: same as --accum_time).",
+    )
+    parser.add_argument(
+        "--start_time_us",
+        type=int,
+        default=None,
+        help="Optional fixed time origin in us for fixed windows.",
+    )
+    parser.add_argument(
+        "--window_mode",
+        choices=["fixed", "image_middle"],
+        default="fixed",
+        help="Window policy: fixed stride windows or midpoint windows from image timestamps.",
+    )
+    parser.add_argument(
+        "--image_timestamps_path",
+        type=Path,
+        default=None,
+        help="Path to timestamps.txt used when --window_mode image_middle in single-file mode.",
+    )
+    parser.add_argument(
+        "--image_root",
+        type=Path,
+        default=None,
+        help="Optional root used to resolve timestamps.txt in root mode.",
+    )
+    parser.add_argument(
+        "--normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize non-zero voxel values per sample.",
+    )
+    parser.add_argument(
+        "--output_dtype",
+        choices=["float16", "float32"],
+        default="float16",
+        help="Stored dtype for voxel tensor in output HDF5.",
+    )
+    parser.add_argument(
+        "--sync_segmentation",
+        action="store_true",
+        help="Store segmentation synchronization metadata per voxel window.",
+    )
+    parser.add_argument(
+        "--segmentation_dir",
+        type=Path,
+        default=None,
+        help="Single-file mode label directory containing <timestamp>.png files.",
+    )
+    parser.add_argument(
+        "--segmentation_root",
+        type=Path,
+        default=None,
+        help="Root mode label root used for per-sequence segmentation lookup.",
+    )
+    parser.add_argument(
+        "--segmentation_subdir",
+        type=str,
+        default="11classes_renamed",
+        help="Segmentation subdirectory name under each sequence.",
+    )
+    parser.add_argument(
+        "--segmentation_tolerance_us",
+        type=int,
+        default=0,
+        help="Timestamp tolerance used for segmentation matching.",
+    )
+    args = parser.parse_args()
+
+    stride_time = args.accum_time if args.stride_time is None else args.stride_time
+
+    is_single_mode = args.input_path is not None or args.output_path is not None
+    root_dir = args.dataset_root if args.dataset_root is not None else args.dsec_root
+    is_root_mode = root_dir is not None
+
+    if is_single_mode and is_root_mode:
+        parser.error(
+            "Use either single-file mode (--input_path/--output_path) "
+            "or root mode (--dataset_root/--dsec_root), not both."
+        )
+
+    if is_root_mode:
+        if args.output_name is not None and args.output_suffix is not None:
+            parser.error("Use either --output_name or --output_suffix, not both.")
+        process_dataset_root(
+            dataset_root=root_dir,
+            splits=args.splits,
+            output_name=args.output_name,
+            output_suffix=args.output_suffix,
+            output_subdir=args.output_subdir,
+            overwrite=args.overwrite,
+            output_root=args.output_root,
+            height=args.input_height,
+            width=args.input_width,
+            downsample_factor=args.downsample_factor,
+            t_bins=args.t_bins,
+            accum_time=args.accum_time,
+            stride_time=stride_time,
+            start_time_us=args.start_time_us,
+            window_mode=args.window_mode,
+            image_root=args.image_root,
+            normalize=args.normalize,
+            output_dtype=args.output_dtype,
+            sync_segmentation=args.sync_segmentation,
+            segmentation_root=args.segmentation_root,
+            segmentation_subdir=args.segmentation_subdir,
+            segmentation_tolerance_us=args.segmentation_tolerance_us,
+            tmp_suffix=args.tmp_suffix,
+            num_processes=args.num_processes,
+        )
+    else:
+        if args.input_path is None or args.output_path is None:
+            parser.error("Single-file mode requires both --input_path and --output_path.")
+        if args.window_mode == "image_middle" and args.image_timestamps_path is None:
+            parser.error("Single-file mode with --window_mode image_middle requires --image_timestamps_path.")
+
+        process_single_file(
+            input_path=args.input_path,
+            output_path=args.output_path,
+            height=args.input_height,
+            width=args.input_width,
+            downsample_factor=args.downsample_factor,
+            t_bins=args.t_bins,
+            accum_time=args.accum_time,
+            stride_time=stride_time,
+            start_time_us=args.start_time_us,
+            window_mode=args.window_mode,
+            image_timestamps_path=args.image_timestamps_path,
+            normalize=args.normalize,
+            output_dtype=args.output_dtype,
+            sync_segmentation=args.sync_segmentation,
+            segmentation_dir=args.segmentation_dir,
+            segmentation_tolerance_us=args.segmentation_tolerance_us,
+            show_pbar=True,
+            tmp_suffix=args.tmp_suffix,
+        )

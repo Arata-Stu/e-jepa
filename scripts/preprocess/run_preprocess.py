@@ -149,6 +149,7 @@ def _run_eventscape(cfg: DictConfig) -> None:
 
     process_dataset_root(
         dataset_root=_required_path(cfg.dataset_root, "dataset.dataset_root"),
+        splits=None if cfg.splits is None else _list_of_str(cfg.splits, "dataset.splits"),
         output_suffix=str(cfg.output_suffix),
         output_subdir=None if cfg.output_subdir is None else str(cfg.output_subdir),
         overwrite=bool(cfg.overwrite),

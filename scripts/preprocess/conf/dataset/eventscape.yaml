@@ -3,6 +3,7 @@ name: eventscape
 dataset_root: null
 output_root: null
 
+splits: null
 output_suffix: _voxels.h5
 output_subdir: null
 overwrite: false

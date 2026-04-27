@@ -1155,7 +1155,7 @@ if __name__ == "__main__":
         "--downsample_factor",
         type=int,
         choices=[1, 2],
-        default=1,
+        default=2,
         help="Nearest-neighbor spatial downsample factor (2 means 1/2 resolution).",
     )
     parser.add_argument("--t_bins", type=int, default=10, help="Number of temporal bins for voxel representation.")

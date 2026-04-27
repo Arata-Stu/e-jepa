@@ -882,26 +882,45 @@ def _worker_process_sequence(job: dict) -> tuple[str, bool, str | None]:
     return str(sequence_dir), ok, err
 
 
-def find_eventscape_sequences(dataset_root: Path) -> list[Path]:
+def find_eventscape_sequences(dataset_root: Path, splits: list[str] | None = None) -> list[Path]:
     sequences: list[Path] = []
     seen: set[Path] = set()
-    for events_data_dir in sorted(dataset_root.rglob(str(EVENTS_SUBDIR))):
-        if not events_data_dir.is_dir():
-            continue
-        if not any(events_data_dir.glob("*.npz")):
-            continue
-        sequence_dir = events_data_dir.parent.parent
-        resolved = sequence_dir.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        sequences.append(sequence_dir)
+
+    search_roots: list[Path] = []
+    if splits is None or len(splits) == 0:
+        search_roots = [dataset_root]
+    else:
+        for split in splits:
+            split_name = str(split).strip()
+            if split_name in {"", "."}:
+                base_dir = dataset_root
+            else:
+                base_dir = dataset_root / split_name
+            if not base_dir.exists():
+                print(f"[WARN] missing split directory: {base_dir}")
+                continue
+            search_roots.append(base_dir)
+
+    for root in search_roots:
+        for events_data_dir in sorted(root.rglob(str(EVENTS_SUBDIR))):
+            if not events_data_dir.is_dir():
+                continue
+            if not any(events_data_dir.glob("*.npz")):
+                continue
+            sequence_dir = events_data_dir.parent.parent
+            resolved = sequence_dir.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            sequences.append(sequence_dir)
+
     sequences.sort(key=lambda p: str(p))
     return sequences
 
 
 def process_dataset_root(
     dataset_root: Path,
+    splits: list[str] | None,
     output_suffix: str,
     output_subdir: str | None,
     overwrite: bool,
@@ -923,7 +942,7 @@ def process_dataset_root(
 
     normalized_suffix = normalized_output_suffix(output_suffix)
     normalized_subdir = normalized_output_subdir(output_subdir)
-    sequence_dirs = find_eventscape_sequences(dataset_root=dataset_root)
+    sequence_dirs = find_eventscape_sequences(dataset_root=dataset_root, splits=splits)
     if len(sequence_dirs) == 0:
         raise FileNotFoundError(f"no EventScape sequences found under {dataset_root}")
     if output_root is not None:
@@ -1002,6 +1021,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--dataset_root", type=Path, help="EventScape root (e.g., contains Town01/Town05/...)")
     parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=None,
+        help="Optional split subdirectories under dataset_root (e.g. train test). Use '.' for dataset_root itself.",
+    )
+    parser.add_argument(
         "--output_suffix",
         type=str,
         default="_voxels.h5",
@@ -1073,6 +1098,7 @@ if __name__ == "__main__":
     if is_root_mode:
         process_dataset_root(
             dataset_root=args.dataset_root,
+            splits=args.splits,
             output_suffix=args.output_suffix,
             output_subdir=args.output_subdir,
             overwrite=args.overwrite,

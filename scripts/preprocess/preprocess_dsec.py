@@ -865,8 +865,16 @@ def _resolve_segmentation_dir(
     base = segmentation_root if segmentation_root is not None else dataset_root
 
     candidates = [
+        # Sequence-local layouts
+        sequence_dir / "semantic" / segmentation_subdir,
         sequence_dir / "semantic_segmentation" / segmentation_subdir,
+        # Common split/sequence layouts under base root
+        base / split / sequence / "semantic" / segmentation_subdir,
+        base / split / sequence / "semantic_segmentation" / segmentation_subdir,
         base / split / sequence / segmentation_subdir,
+        # Global semantic directories
+        base / "semantic" / split / sequence / segmentation_subdir,
+        base / "semantic" / sequence / segmentation_subdir,
         base / "semantic_segmentation" / split / sequence / segmentation_subdir,
         base / "semantic_segmentation" / sequence / segmentation_subdir,
         base / f"{split}_semantic_segmentation" / split / sequence / segmentation_subdir,

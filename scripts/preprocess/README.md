@@ -27,8 +27,7 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset=dsec \
   dataset.dataset_root=/data/DSEC \
   dataset.output_root=/data/DSEC_voxels \
-  dataset.window_mode=image_middle \
-  dataset.image_root=/data/DSEC
+  dataset.window_mode=image_middle
 ```
 
 image middle + segmentation sync:
@@ -39,12 +38,14 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.dataset_root=/data/DSEC \
   dataset.output_root=/data/DSEC_voxels_seg \
   dataset.window_mode=image_middle \
-  dataset.image_root=/data/DSEC \
   dataset.sync_segmentation=true \
   dataset.segmentation_root=/data/DSEC \
-  dataset.segmentation_subdir=11classes_renamed \
+  dataset.segmentation_subdir=11classes \
   dataset.segmentation_tolerance_us=0
 ```
+
+`image_root` は通常不要です（`<sequence>/images/...` を自動参照）。  
+画像ディレクトリが別ルートに分離されている場合のみ `dataset.image_root=...` を指定します。
 
 ## 1MPX
 

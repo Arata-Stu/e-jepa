@@ -180,6 +180,76 @@ def _write_preview_images(
     return written_paths
 
 
+def _write_preview_video(
+    *,
+    h5f: h5py.File,
+    file_path: Path,
+    output_dir: Path,
+    dataset_root: Path | None,
+    n_samples: int,
+    explicit_indices: list[int] | None,
+    num_visualizations: int,
+    use_all_windows: bool,
+    polarity_order: str,
+    fps: float,
+) -> str | None:
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError("OpenCV is required for MP4 export. Install via `pip install opencv-python`.") from exc
+
+    if use_all_windows:
+        indices = list(range(n_samples))
+    else:
+        indices = _pick_indices(
+            n_samples=n_samples,
+            num_visualizations=num_visualizations,
+            explicit_indices=explicit_indices,
+        )
+    if len(indices) == 0:
+        return None
+
+    voxels = h5f["voxels"]
+    channels = int(voxels.shape[1])
+    split_polarity = _infer_split_polarity(h5f, channels)
+
+    relative_name = _relative_or_name(file_path, dataset_root).replace("/", "__")
+    relative_name = relative_name.replace("\\", "__")
+    stem = Path(relative_name).with_suffix("").name
+    video_dir = output_dir / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    out_path = video_dir / f"{stem}.mp4"
+
+    first_frame = _voxel_to_rgb(
+        voxel=np.asarray(voxels[indices[0]], dtype=np.float32),
+        split_polarity=split_polarity,
+        polarity_order=polarity_order,
+    )
+    height, width = int(first_frame.shape[0]), int(first_frame.shape[1])
+    writer = cv2.VideoWriter(
+        str(out_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(max(fps, 1e-6)),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"failed to open VideoWriter for {out_path}")
+
+    try:
+        writer.write(cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+        for idx in indices[1:]:
+            frame = _voxel_to_rgb(
+                voxel=np.asarray(voxels[idx], dtype=np.float32),
+                split_polarity=split_polarity,
+                polarity_order=polarity_order,
+            )
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+    return str(out_path)
+
+
 def _analyze_file(
     *,
     file_path: Path,
@@ -189,6 +259,9 @@ def _analyze_file(
     num_visualizations: int,
     explicit_indices: list[int] | None,
     polarity_order: str,
+    write_mp4: bool,
+    mp4_fps: float,
+    mp4_use_all_windows: bool,
 ) -> dict[str, Any]:
     with h5py.File(str(file_path), "r") as h5f:
         if "voxels" not in h5f:
@@ -206,6 +279,7 @@ def _analyze_file(
             windows_per_second = float(n_samples) / float(duration_s)
 
         preview_paths: list[str] = []
+        preview_video_path: str | None = None
         if with_visualization:
             preview_paths = _write_preview_images(
                 h5f=h5f,
@@ -216,6 +290,19 @@ def _analyze_file(
                 num_visualizations=num_visualizations,
                 explicit_indices=explicit_indices,
                 polarity_order=polarity_order,
+            )
+        if write_mp4:
+            preview_video_path = _write_preview_video(
+                h5f=h5f,
+                file_path=file_path,
+                output_dir=output_dir,
+                dataset_root=dataset_root,
+                n_samples=n_samples,
+                explicit_indices=explicit_indices,
+                num_visualizations=num_visualizations,
+                use_all_windows=mp4_use_all_windows,
+                polarity_order=polarity_order,
+                fps=mp4_fps,
             )
 
         result = {
@@ -236,6 +323,7 @@ def _analyze_file(
             "estimated_recording_duration_s": duration_s,
             "estimated_windows_per_second": windows_per_second,
             "preview_images": preview_paths,
+            "preview_video": preview_video_path,
         }
         return result
 
@@ -258,6 +346,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "estimated_recording_duration_s",
         "estimated_windows_per_second",
         "preview_images",
+        "preview_video",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -307,6 +396,19 @@ def main() -> None:
         help="Channel order for split polarity visualization: negpos means first-half=neg, second-half=pos.",
     )
     parser.add_argument(
+        "--write_mp4",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write MP4 preview per analyzed H5.",
+    )
+    parser.add_argument("--mp4_fps", type=float, default=20.0, help="FPS for MP4 preview.")
+    parser.add_argument(
+        "--mp4_use_all_windows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use all windows for MP4 (default uses selected visualization indices).",
+    )
+    parser.add_argument(
         "--report_json",
         type=Path,
         default=None,
@@ -351,6 +453,9 @@ def main() -> None:
                 num_visualizations=int(args.num_visualizations),
                 explicit_indices=args.visualization_indices,
                 polarity_order=str(args.polarity_order),
+                write_mp4=bool(args.write_mp4),
+                mp4_fps=float(args.mp4_fps),
+                mp4_use_all_windows=bool(args.mp4_use_all_windows),
             )
             results.append(result)
             duration_s = result["estimated_recording_duration_s"]

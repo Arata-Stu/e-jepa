@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -81,13 +82,18 @@ def _infer_split_polarity(h5f: h5py.File, channels: int) -> bool:
     return channels % 2 == 0
 
 
-def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool, polarity_order: str) -> np.ndarray:
+def _vote_score_map(
+    voxel: np.ndarray,
+    split_polarity: bool,
+    polarity_order: str,
+    vote_use_abs_for_split_polarity: bool,
+) -> np.ndarray:
     if voxel.ndim != 3:
         raise ValueError(f"voxel must be (C,H,W), got shape={voxel.shape}")
 
     channels = voxel.shape[0]
     if channels == 0:
-        return np.zeros((voxel.shape[1], voxel.shape[2], 3), dtype=np.uint8)
+        return np.zeros((voxel.shape[1], voxel.shape[2]), dtype=np.float32)
 
     if split_polarity and channels > 1 and channels % 2 == 0:
         half = channels // 2
@@ -100,6 +106,10 @@ def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool, polarity_order: str) 
         else:
             raise ValueError(f"unsupported polarity_order: {polarity_order}")
 
+        if vote_use_abs_for_split_polarity:
+            pos_bins = np.abs(pos_bins)
+            neg_bins = np.abs(neg_bins)
+
         # Majority vote per temporal bin:
         #   vote_bin > 0: positive wins this bin
         #   vote_bin < 0: negative wins this bin
@@ -109,11 +119,27 @@ def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool, polarity_order: str) 
     else:
         # Fallback for non-split polarity representations.
         vote_score = np.sign(np.asarray(voxel, dtype=np.float32)).sum(axis=0)
+    return vote_score
 
+
+def _voxel_to_rgb(
+    voxel: np.ndarray,
+    split_polarity: bool,
+    polarity_order: str,
+    vote_use_abs_for_split_polarity: bool,
+    tie_epsilon: float,
+) -> np.ndarray:
+    vote_score = _vote_score_map(
+        voxel=voxel,
+        split_polarity=split_polarity,
+        polarity_order=polarity_order,
+        vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+    )
     height, width = vote_score.shape
     img = np.full((height, width, 3), 127, dtype=np.uint8)
-    img[vote_score > 0] = 255
-    img[vote_score < 0] = 0
+    eps = float(max(0.0, tie_epsilon))
+    img[vote_score > eps] = 255
+    img[vote_score < -eps] = 0
     return img
 
 
@@ -152,6 +178,8 @@ def _write_preview_images(
     num_visualizations: int,
     explicit_indices: list[int] | None,
     polarity_order: str,
+    vote_use_abs_for_split_polarity: bool,
+    tie_epsilon: float,
 ) -> list[str]:
     try:
         from PIL import Image
@@ -178,7 +206,13 @@ def _write_preview_images(
     written_paths: list[str] = []
     for idx in indices:
         voxel = np.asarray(voxels[idx], dtype=np.float32)
-        rgb = _voxel_to_rgb(voxel=voxel, split_polarity=split_polarity, polarity_order=polarity_order)
+        rgb = _voxel_to_rgb(
+            voxel=voxel,
+            split_polarity=split_polarity,
+            polarity_order=polarity_order,
+            vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+            tie_epsilon=tie_epsilon,
+        )
         out_path = preview_dir / f"window_{idx:06d}.png"
         Image.fromarray(rgb, mode="RGB").save(out_path)
         written_paths.append(str(out_path))

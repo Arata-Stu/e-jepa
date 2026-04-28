@@ -4,11 +4,16 @@ import argparse
 import multiprocessing as mp
 import os
 from pathlib import Path
+import sys
 
 import h5py
 import hdf5plugin  # noqa: F401 (registers hdf5 plugins)
 import numpy as np
 import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.preprocess.utils import cleanup_tmp_file, get_h5_compression_flags, tmp_output_path
 

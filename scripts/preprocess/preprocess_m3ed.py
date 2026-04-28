@@ -333,7 +333,9 @@ def _load_semantic_anchor_timestamps_us(
     }
 
     if source == "auto":
-        ordered = ("semantics_ts_map", "ovc_ts_map", "semantics_ts")
+        # Prefer direct semantic timestamps first. Mapping datasets can have
+        # dataset-specific semantics and may not always be a stable anchor source.
+        ordered = ("semantics_ts", "semantics_ts_map", "ovc_ts_map")
     elif source in candidates:
         ordered = (source,)
     else:
@@ -376,7 +378,8 @@ def _load_depth_anchor_timestamps_us(
     }
 
     if source == "auto":
-        ordered = ("depth_ts_map_left_t", "depth_ts_map_left", "depth_ts")
+        # Prefer direct depth timestamps first for robust temporal anchoring.
+        ordered = ("depth_ts", "depth_ts_map_left_t", "depth_ts_map_left")
     elif source in candidates:
         ordered = (source,)
     else:
@@ -427,6 +430,55 @@ def _build_middle_windows_from_anchors(
         end_us = min(end_us, int(t_last_exclusive_us))
         windows.append((i, start_us, end_us, int(anchors[i])))
     return windows
+
+
+def _in_range_ratio(values: np.ndarray, start_us: int, end_exclusive_us: int) -> float:
+    if values.size == 0:
+        return 0.0
+    mask = (values >= int(start_us)) & (values < int(end_exclusive_us))
+    return float(np.count_nonzero(mask)) / float(values.size)
+
+
+def _align_anchor_timebase_to_events(
+    anchor_timestamps_us: np.ndarray,
+    t_first_us: int,
+    t_last_exclusive_us: int,
+    t_offset_us: int,
+) -> tuple[np.ndarray, str, int]:
+    """
+    Align anchor timestamps to event timebase when the file mixes relative/absolute
+    conventions (common in extracted M3ED variants).
+    """
+    anchors = np.asarray(anchor_timestamps_us, dtype=np.int64).reshape(-1)
+    if anchors.size == 0:
+        return anchors, "as_is", 0
+
+    candidates: list[tuple[str, np.ndarray, int]] = [("as_is", anchors, 0)]
+    if int(t_offset_us) != 0:
+        shift = int(t_offset_us)
+        candidates.append(("plus_t_offset", anchors + shift, shift))
+        candidates.append(("minus_t_offset", anchors - shift, -shift))
+
+    def _score(arr: np.ndarray) -> tuple[float, int]:
+        ratio = _in_range_ratio(arr, t_first_us, t_last_exclusive_us)
+        edge = abs(int(arr[0]) - int(t_first_us)) + abs(int(arr[-1]) - int(t_last_exclusive_us - 1))
+        return ratio, -edge
+
+    as_is_arr = anchors
+    as_is_score = _score(as_is_arr)
+    best_name, best_arr, best_shift = candidates[0]
+    best_score = as_is_score
+    for name, arr, shift in candidates[1:]:
+        sc = _score(arr)
+        if sc > best_score:
+            best_name, best_arr, best_shift = name, arr, shift
+            best_score = sc
+
+    # Be conservative: only shift when improvement is clear.
+    if best_name != "as_is":
+        if (as_is_score[0] == 0.0 and best_score[0] > 0.0) or (best_score[0] >= as_is_score[0] + 0.25):
+            return best_arr.astype(np.int64, copy=False), best_name, int(best_shift)
+    return as_is_arr.astype(np.int64, copy=False), "as_is", 0
 
 
 def _build_windows_from_start(
@@ -713,6 +765,7 @@ def process_single_file(
         with h5py.File(str(input_path), "r") as h5f:
             t_first, t_last_exclusive = _get_time_bounds_us(h5f)
             ms_idx = _load_ms_idx(h5f)
+            t_offset_us = _read_t_offset(h5f)
 
             writer = VoxelH5Writer(
                 outfile=tmp_path,
@@ -755,12 +808,16 @@ def process_single_file(
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
                 writer.h5f.attrs["num_windows_planned"] = 0
+                writer.h5f.attrs["anchor_timebase_mode"] = "as_is"
+                writer.h5f.attrs["anchor_timebase_shift_us"] = 0
                 writer.close()
                 writer = None
                 os.replace(tmp_path, output_path)
                 return
 
             time_origin_us = int(t_first) if start_time_us is None else int(start_time_us)
+            anchor_timebase_mode = "as_is"
+            anchor_timebase_shift_us = 0
             if window_mode == "fixed":
                 window_start_us = max(int(t_first), time_origin_us)
                 windows = _build_windows_from_start(
@@ -779,6 +836,12 @@ def process_single_file(
                     source=semantics_ts_source,
                     divisor=semantics_ts_divisor,
                 )
+                semantic_ts, anchor_timebase_mode, anchor_timebase_shift_us = _align_anchor_timebase_to_events(
+                    anchor_timestamps_us=semantic_ts,
+                    t_first_us=int(t_first),
+                    t_last_exclusive_us=int(t_last_exclusive),
+                    t_offset_us=int(t_offset_us),
+                )
                 windows = _build_middle_windows_from_anchors(
                     t_first_us=int(t_first),
                     t_last_exclusive_us=int(t_last_exclusive),
@@ -794,6 +857,12 @@ def process_single_file(
                     source=depth_ts_source,
                     divisor=depth_ts_divisor,
                 )
+                depth_ts, anchor_timebase_mode, anchor_timebase_shift_us = _align_anchor_timebase_to_events(
+                    anchor_timestamps_us=depth_ts,
+                    t_first_us=int(t_first),
+                    t_last_exclusive_us=int(t_last_exclusive),
+                    t_offset_us=int(t_offset_us),
+                )
                 windows = _build_middle_windows_from_anchors(
                     t_first_us=int(t_first),
                     t_last_exclusive_us=int(t_last_exclusive),
@@ -804,6 +873,8 @@ def process_single_file(
                 writer.h5f.attrs["resolved_depth_ts_source"] = resolved_source
                 writer.h5f.attrs["num_depth_timestamps"] = int(len(depth_ts))
             writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
+            writer.h5f.attrs["anchor_timebase_mode"] = anchor_timebase_mode
+            writer.h5f.attrs["anchor_timebase_shift_us"] = int(anchor_timebase_shift_us)
             writer.h5f.attrs["num_windows_planned"] = int(len(windows))
 
             voxelizer = EventVoxelGrid(

@@ -1264,7 +1264,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--segmentation_subdir",
         type=str,
-        default="11classes_renamed",
+        default="11classes",
         help="Segmentation subdirectory name under each sequence.",
     )
     parser.add_argument(

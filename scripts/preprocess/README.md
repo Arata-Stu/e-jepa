@@ -160,3 +160,26 @@ python3 scripts/preprocess/analyze_voxel_h5.py \
   --input_path /data/preprocessed_voxels/sample_voxels_2x.h5 \
   --output_dir /data/preprocessed_voxels_analysis_single
 ```
+
+## DSEC 同期デバッグ
+
+raw events と image timestamps の単位/整合を確認:
+
+```bash
+python3 scripts/preprocess/debug_dsec_preprocess.py \
+  --dataset_root /data/DSEC \
+  --split test \
+  --sequence interlaken_00_a \
+  --divisors 1 1000
+```
+
+preprocessed 出力と突き合わせ:
+
+```bash
+python3 scripts/preprocess/debug_dsec_preprocess.py \
+  --dataset_root /data/DSEC \
+  --split test \
+  --sequence interlaken_00_a \
+  --preprocessed_h5 /data/DSEC_voxels_seg/test/interlaken_00_a/events/left/events_voxels_1x.h5 \
+  --divisors 1 1000
+```

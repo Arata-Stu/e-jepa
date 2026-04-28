@@ -126,3 +126,21 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.accum_time=50000 \
   dataset.output_dtype=float16
 ```
+
+## 解析コマンド（voxel H5）
+
+dataset_root 一括解析 + 可視化:
+
+```bash
+python3 scripts/preprocess/analyze_voxel_h5.py \
+  --dataset_root /data/preprocessed_voxels \
+  --output_dir /data/preprocessed_voxels_analysis
+```
+
+単一ファイル:
+
+```bash
+python3 scripts/preprocess/analyze_voxel_h5.py \
+  --input_path /data/preprocessed_voxels/sample_voxels_2x.h5 \
+  --output_dir /data/preprocessed_voxels_analysis_single
+```

@@ -171,6 +171,19 @@ python3 scripts/preprocess/analyze_voxel_h5.py \
   --output_dir /data/preprocessed_voxels_analysis_single
 ```
 
+## 20秒分割（事前学習向け）
+
+M3ED など長尺 voxel H5 を、約20秒ごとの複数 H5 に分割:
+
+```bash
+python3 scripts/preprocess/split_voxel_h5_by_duration.py \
+  --dataset_root /data/m3ed_voxels_semantic \
+  --output_root /data/m3ed_voxels_semantic_20s \
+  --chunk_duration_s 20 \
+  --num_processes 8 \
+  --copy_batch_size 8
+```
+
 ## DSEC 同期デバッグ
 
 raw events と image timestamps の単位/整合を確認:

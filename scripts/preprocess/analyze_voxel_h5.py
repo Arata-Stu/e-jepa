@@ -304,6 +304,7 @@ def _analyze_file(
     file_path: Path,
     output_dir: Path,
     dataset_root: Path | None,
+    metadata_only: bool,
     with_visualization: bool,
     num_visualizations: int,
     explicit_indices: list[int] | None,
@@ -389,65 +390,67 @@ def _analyze_file(
         voxel_global_mean = None
         voxel_global_std = None
         voxel_nonzero_ratio = None
-        nonempty_windows = 0
-        total_values = 0
-        total_nonzero = 0
-        total_sum = 0.0
-        total_sqsum = 0.0
-        chunk_size = 16
-        for s in range(0, n_samples, chunk_size):
-            e = min(n_samples, s + chunk_size)
-            arr = np.asarray(voxels[s:e], dtype=np.float32)
-            if arr.size == 0:
-                continue
-            arr_min = float(arr.min())
-            arr_max = float(arr.max())
-            voxel_global_min = arr_min if voxel_global_min is None else min(voxel_global_min, arr_min)
-            voxel_global_max = arr_max if voxel_global_max is None else max(voxel_global_max, arr_max)
-            total_values += int(arr.size)
-            total_nonzero += int(np.count_nonzero(arr != 0))
-            total_sum += float(arr.sum())
-            total_sqsum += float(np.square(arr).sum())
-            nonempty_windows += int(np.count_nonzero(np.max(np.abs(arr), axis=(1, 2, 3)) > 0))
-        if total_values > 0:
-            voxel_global_mean = total_sum / float(total_values)
-            variance = max(total_sqsum / float(total_values) - voxel_global_mean * voxel_global_mean, 0.0)
-            voxel_global_std = math.sqrt(variance)
-            voxel_nonzero_ratio = float(total_nonzero) / float(total_values)
-
-        # Vote-map diagnostics for selected windows.
-        debug_indices = _pick_indices(
-            n_samples=n_samples,
-            num_visualizations=max(1, int(num_visualizations)),
-            explicit_indices=explicit_indices,
-        )
+        nonempty_windows = None
         debug_vote_stats: list[dict[str, Any]] = []
-        eps = float(max(0.0, tie_epsilon))
-        split_polarity = _infer_split_polarity(h5f, channels)
-        for idx in debug_indices:
-            voxel = np.asarray(voxels[idx], dtype=np.float32)
-            vote_score = _vote_score_map(
-                voxel=voxel,
-                split_polarity=split_polarity,
-                polarity_order=polarity_order,
-                vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+        if not metadata_only:
+            nonempty_windows = 0
+            total_values = 0
+            total_nonzero = 0
+            total_sum = 0.0
+            total_sqsum = 0.0
+            chunk_size = 16
+            for s in range(0, n_samples, chunk_size):
+                e = min(n_samples, s + chunk_size)
+                arr = np.asarray(voxels[s:e], dtype=np.float32)
+                if arr.size == 0:
+                    continue
+                arr_min = float(arr.min())
+                arr_max = float(arr.max())
+                voxel_global_min = arr_min if voxel_global_min is None else min(voxel_global_min, arr_min)
+                voxel_global_max = arr_max if voxel_global_max is None else max(voxel_global_max, arr_max)
+                total_values += int(arr.size)
+                total_nonzero += int(np.count_nonzero(arr != 0))
+                total_sum += float(arr.sum())
+                total_sqsum += float(np.square(arr).sum())
+                nonempty_windows += int(np.count_nonzero(np.max(np.abs(arr), axis=(1, 2, 3)) > 0))
+            if total_values > 0:
+                voxel_global_mean = total_sum / float(total_values)
+                variance = max(total_sqsum / float(total_values) - voxel_global_mean * voxel_global_mean, 0.0)
+                voxel_global_std = math.sqrt(variance)
+                voxel_nonzero_ratio = float(total_nonzero) / float(total_values)
+
+            # Vote-map diagnostics for selected windows.
+            debug_indices = _pick_indices(
+                n_samples=n_samples,
+                num_visualizations=max(1, int(num_visualizations)),
+                explicit_indices=explicit_indices,
             )
-            num_pos = int(np.count_nonzero(vote_score > eps))
-            num_neg = int(np.count_nonzero(vote_score < -eps))
-            num_bg = int(vote_score.size - num_pos - num_neg)
-            debug_vote_stats.append(
-                {
-                    "index": int(idx),
-                    "vote_pos_pixels": num_pos,
-                    "vote_neg_pixels": num_neg,
-                    "vote_bg_pixels": num_bg,
-                    "vote_min": float(vote_score.min()) if vote_score.size > 0 else 0.0,
-                    "vote_max": float(vote_score.max()) if vote_score.size > 0 else 0.0,
-                    "voxel_min": float(voxel.min()) if voxel.size > 0 else 0.0,
-                    "voxel_max": float(voxel.max()) if voxel.size > 0 else 0.0,
-                    "voxel_mean": float(voxel.mean()) if voxel.size > 0 else 0.0,
-                }
-            )
+            eps = float(max(0.0, tie_epsilon))
+            split_polarity = _infer_split_polarity(h5f, channels)
+            for idx in debug_indices:
+                voxel = np.asarray(voxels[idx], dtype=np.float32)
+                vote_score = _vote_score_map(
+                    voxel=voxel,
+                    split_polarity=split_polarity,
+                    polarity_order=polarity_order,
+                    vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+                )
+                num_pos = int(np.count_nonzero(vote_score > eps))
+                num_neg = int(np.count_nonzero(vote_score < -eps))
+                num_bg = int(vote_score.size - num_pos - num_neg)
+                debug_vote_stats.append(
+                    {
+                        "index": int(idx),
+                        "vote_pos_pixels": num_pos,
+                        "vote_neg_pixels": num_neg,
+                        "vote_bg_pixels": num_bg,
+                        "vote_min": float(vote_score.min()) if vote_score.size > 0 else 0.0,
+                        "vote_max": float(vote_score.max()) if vote_score.size > 0 else 0.0,
+                        "voxel_min": float(voxel.min()) if voxel.size > 0 else 0.0,
+                        "voxel_max": float(voxel.max()) if voxel.size > 0 else 0.0,
+                        "voxel_mean": float(voxel.mean()) if voxel.size > 0 else 0.0,
+                    }
+                )
 
         result = {
             "file": str(file_path),
@@ -471,12 +474,13 @@ def _analyze_file(
             "window_event_count_min": window_event_count_min,
             "window_event_count_max": window_event_count_max,
             "num_zero_event_windows": num_zero_event_windows,
-            "num_nonempty_voxel_windows": int(nonempty_windows),
+            "num_nonempty_voxel_windows": None if nonempty_windows is None else int(nonempty_windows),
             "voxel_global_min": voxel_global_min,
             "voxel_global_max": voxel_global_max,
             "voxel_global_mean": voxel_global_mean,
             "voxel_global_std": voxel_global_std,
             "voxel_nonzero_ratio": voxel_nonzero_ratio,
+            "metadata_only": bool(metadata_only),
             "visualization_polarity_order": polarity_order,
             "visualization_vote_use_abs_for_split_polarity": bool(vote_use_abs_for_split_polarity),
             "visualization_tie_epsilon": float(tie_epsilon),
@@ -542,6 +546,12 @@ def main() -> None:
     )
     parser.add_argument("--max_files", type=int, default=None, help="Optional cap for number of files to analyze.")
     parser.add_argument("--output_dir", type=Path, default=Path("tmp/voxel_h5_analysis"), help="Output directory.")
+    parser.add_argument(
+        "--metadata_only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fast mode: skip heavy voxel-value scans and vote-map diagnostics. Keep timestamp/sample debug.",
+    )
     parser.add_argument(
         "--with_visualization",
         action=argparse.BooleanOptionalAction,
@@ -612,6 +622,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    with_visualization = bool(args.with_visualization)
+    write_mp4 = bool(args.write_mp4)
+    if bool(args.metadata_only):
+        with_visualization = False
+        write_mp4 = False
+
     files = _select_files(
         input_path=args.input_path,
         dataset_root=args.dataset_root,
@@ -639,13 +655,14 @@ def main() -> None:
                 file_path=file_path,
                 output_dir=output_dir,
                 dataset_root=args.dataset_root,
-                with_visualization=bool(args.with_visualization),
+                metadata_only=bool(args.metadata_only),
+                with_visualization=with_visualization,
                 num_visualizations=int(args.num_visualizations),
                 explicit_indices=args.visualization_indices,
                 polarity_order=str(args.polarity_order),
                 vote_use_abs_for_split_polarity=bool(args.vote_use_abs_for_split_polarity),
                 tie_epsilon=float(args.vote_tie_epsilon),
-                write_mp4=bool(args.write_mp4),
+                write_mp4=write_mp4,
                 mp4_fps=float(args.mp4_fps),
                 mp4_use_all_windows=bool(args.mp4_use_all_windows),
                 mp4_max_frames=None if args.mp4_max_frames is None else int(args.mp4_max_frames),

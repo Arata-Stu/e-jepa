@@ -93,7 +93,7 @@ python3 scripts/preprocess/run_preprocess.py \
 
 ## EventScape
 
-想定例: `event_scape/train/Town01/<sequence>/events/data/*.npz`
+想定例: `event_scape/Town05_test/<sequence>/events/data/*.npz`
 
 全split一括:
 
@@ -104,14 +104,24 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.output_root=/data/EventScape_voxels
 ```
 
-train のみ:
+Town系 split を指定:
+
+```bash
+python3 scripts/preprocess/run_preprocess.py \
+  dataset=eventscape \
+  dataset.dataset_root=/data/EventScape \
+  dataset.output_root=/data/EventScape_voxels_town05 \
+  'dataset.splits=[Town05_test,Town05_val]'
+```
+
+Town01-03 train のみ:
 
 ```bash
 python3 scripts/preprocess/run_preprocess.py \
   dataset=eventscape \
   dataset.dataset_root=/data/EventScape \
   dataset.output_root=/data/EventScape_voxels_train \
-  dataset.splits=[train]
+  'dataset.splits=[Town01-03_train]'
 ```
 
 ## 共通上書き例

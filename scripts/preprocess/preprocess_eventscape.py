@@ -1025,7 +1025,11 @@ if __name__ == "__main__":
         "--splits",
         nargs="+",
         default=None,
-        help="Optional split subdirectories under dataset_root (e.g. train test). Use '.' for dataset_root itself.",
+        help=(
+            "Optional split subdirectories under dataset_root "
+            "(e.g. Town01-03_train Town05_val Town05_test). "
+            "Use '.' for dataset_root itself."
+        ),
     )
     parser.add_argument(
         "--output_suffix",

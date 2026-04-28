@@ -136,6 +136,7 @@ python3 scripts/preprocess/analyze_voxel_h5.py \
   --dataset_root /data/preprocessed_voxels \
   --output_dir /data/preprocessed_voxels_analysis \
   --polarity_order negpos \
+  --vote_use_abs_for_split_polarity \
   --write_mp4 \
   --mp4_fps 20
 ```

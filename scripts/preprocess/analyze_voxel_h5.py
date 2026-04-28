@@ -231,6 +231,8 @@ def _write_preview_video(
     use_all_windows: bool,
     max_frames: int | None,
     polarity_order: str,
+    vote_use_abs_for_split_polarity: bool,
+    tie_epsilon: float,
     fps: float,
 ) -> tuple[str | None, int]:
     try:
@@ -267,6 +269,8 @@ def _write_preview_video(
         voxel=np.asarray(voxels[indices[0]], dtype=np.float32),
         split_polarity=split_polarity,
         polarity_order=polarity_order,
+        vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+        tie_epsilon=tie_epsilon,
     )
     height, width = int(first_frame.shape[0]), int(first_frame.shape[1])
     writer = cv2.VideoWriter(
@@ -285,6 +289,8 @@ def _write_preview_video(
                 voxel=np.asarray(voxels[idx], dtype=np.float32),
                 split_polarity=split_polarity,
                 polarity_order=polarity_order,
+                vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+                tie_epsilon=tie_epsilon,
             )
             writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     finally:
@@ -302,6 +308,8 @@ def _analyze_file(
     num_visualizations: int,
     explicit_indices: list[int] | None,
     polarity_order: str,
+    vote_use_abs_for_split_polarity: bool,
+    tie_epsilon: float,
     write_mp4: bool,
     mp4_fps: float,
     mp4_use_all_windows: bool,
@@ -335,6 +343,8 @@ def _analyze_file(
                 num_visualizations=num_visualizations,
                 explicit_indices=explicit_indices,
                 polarity_order=polarity_order,
+                vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+                tie_epsilon=tie_epsilon,
             )
         if write_mp4:
             preview_video_path, preview_video_num_frames = _write_preview_video(
@@ -348,7 +358,95 @@ def _analyze_file(
                 use_all_windows=mp4_use_all_windows,
                 max_frames=mp4_max_frames,
                 polarity_order=polarity_order,
+                vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+                tie_epsilon=tie_epsilon,
                 fps=mp4_fps,
+            )
+
+        # Debug stats for event/window coverage and voxel value distribution.
+        window_event_count_total = None
+        window_event_count_mean = None
+        window_event_count_min = None
+        window_event_count_max = None
+        num_zero_event_windows = None
+        if "window_event_count" in h5f and len(h5f["window_event_count"]) >= n_samples:
+            event_counts = np.asarray(h5f["window_event_count"][:n_samples], dtype=np.int64)
+            if event_counts.size > 0:
+                window_event_count_total = int(event_counts.sum())
+                window_event_count_mean = float(event_counts.mean())
+                window_event_count_min = int(event_counts.min())
+                window_event_count_max = int(event_counts.max())
+                num_zero_event_windows = int(np.count_nonzero(event_counts == 0))
+            else:
+                window_event_count_total = 0
+                window_event_count_mean = 0.0
+                window_event_count_min = 0
+                window_event_count_max = 0
+                num_zero_event_windows = 0
+
+        voxel_global_min = None
+        voxel_global_max = None
+        voxel_global_mean = None
+        voxel_global_std = None
+        voxel_nonzero_ratio = None
+        nonempty_windows = 0
+        total_values = 0
+        total_nonzero = 0
+        total_sum = 0.0
+        total_sqsum = 0.0
+        chunk_size = 16
+        for s in range(0, n_samples, chunk_size):
+            e = min(n_samples, s + chunk_size)
+            arr = np.asarray(voxels[s:e], dtype=np.float32)
+            if arr.size == 0:
+                continue
+            arr_min = float(arr.min())
+            arr_max = float(arr.max())
+            voxel_global_min = arr_min if voxel_global_min is None else min(voxel_global_min, arr_min)
+            voxel_global_max = arr_max if voxel_global_max is None else max(voxel_global_max, arr_max)
+            total_values += int(arr.size)
+            total_nonzero += int(np.count_nonzero(arr != 0))
+            total_sum += float(arr.sum())
+            total_sqsum += float(np.square(arr).sum())
+            nonempty_windows += int(np.count_nonzero(np.max(np.abs(arr), axis=(1, 2, 3)) > 0))
+        if total_values > 0:
+            voxel_global_mean = total_sum / float(total_values)
+            variance = max(total_sqsum / float(total_values) - voxel_global_mean * voxel_global_mean, 0.0)
+            voxel_global_std = math.sqrt(variance)
+            voxel_nonzero_ratio = float(total_nonzero) / float(total_values)
+
+        # Vote-map diagnostics for selected windows.
+        debug_indices = _pick_indices(
+            n_samples=n_samples,
+            num_visualizations=max(1, int(num_visualizations)),
+            explicit_indices=explicit_indices,
+        )
+        debug_vote_stats: list[dict[str, Any]] = []
+        eps = float(max(0.0, tie_epsilon))
+        split_polarity = _infer_split_polarity(h5f, channels)
+        for idx in debug_indices:
+            voxel = np.asarray(voxels[idx], dtype=np.float32)
+            vote_score = _vote_score_map(
+                voxel=voxel,
+                split_polarity=split_polarity,
+                polarity_order=polarity_order,
+                vote_use_abs_for_split_polarity=vote_use_abs_for_split_polarity,
+            )
+            num_pos = int(np.count_nonzero(vote_score > eps))
+            num_neg = int(np.count_nonzero(vote_score < -eps))
+            num_bg = int(vote_score.size - num_pos - num_neg)
+            debug_vote_stats.append(
+                {
+                    "index": int(idx),
+                    "vote_pos_pixels": num_pos,
+                    "vote_neg_pixels": num_neg,
+                    "vote_bg_pixels": num_bg,
+                    "vote_min": float(vote_score.min()) if vote_score.size > 0 else 0.0,
+                    "vote_max": float(vote_score.max()) if vote_score.size > 0 else 0.0,
+                    "voxel_min": float(voxel.min()) if voxel.size > 0 else 0.0,
+                    "voxel_max": float(voxel.max()) if voxel.size > 0 else 0.0,
+                    "voxel_mean": float(voxel.mean()) if voxel.size > 0 else 0.0,
+                }
             )
 
         result = {
@@ -368,6 +466,21 @@ def _analyze_file(
             "recording_end_us": end_us,
             "estimated_recording_duration_s": duration_s,
             "estimated_windows_per_second": windows_per_second,
+            "window_event_count_total": window_event_count_total,
+            "window_event_count_mean": window_event_count_mean,
+            "window_event_count_min": window_event_count_min,
+            "window_event_count_max": window_event_count_max,
+            "num_zero_event_windows": num_zero_event_windows,
+            "num_nonempty_voxel_windows": int(nonempty_windows),
+            "voxel_global_min": voxel_global_min,
+            "voxel_global_max": voxel_global_max,
+            "voxel_global_mean": voxel_global_mean,
+            "voxel_global_std": voxel_global_std,
+            "voxel_nonzero_ratio": voxel_nonzero_ratio,
+            "visualization_polarity_order": polarity_order,
+            "visualization_vote_use_abs_for_split_polarity": bool(vote_use_abs_for_split_polarity),
+            "visualization_tie_epsilon": float(tie_epsilon),
+            "vote_debug_windows": debug_vote_stats,
             "preview_images": preview_paths,
             "preview_video": preview_video_path,
             "preview_video_num_frames": preview_video_num_frames,
@@ -392,6 +505,17 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "recording_end_us",
         "estimated_recording_duration_s",
         "estimated_windows_per_second",
+        "window_event_count_total",
+        "window_event_count_mean",
+        "window_event_count_min",
+        "window_event_count_max",
+        "num_zero_event_windows",
+        "num_nonempty_voxel_windows",
+        "voxel_global_min",
+        "voxel_global_max",
+        "voxel_global_mean",
+        "voxel_global_std",
+        "voxel_nonzero_ratio",
         "preview_images",
         "preview_video",
         "preview_video_num_frames",
@@ -442,6 +566,18 @@ def main() -> None:
         choices=["negpos", "posneg"],
         default="negpos",
         help="Channel order for split polarity visualization: negpos means first-half=neg, second-half=pos.",
+    )
+    parser.add_argument(
+        "--vote_use_abs_for_split_polarity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="For split-polarity voxels, compare abs(pos_bin) vs abs(neg_bin) per bin for majority vote.",
+    )
+    parser.add_argument(
+        "--vote_tie_epsilon",
+        type=float,
+        default=0.0,
+        help="Tie threshold for vote score. abs(score)<=epsilon is background.",
     )
     parser.add_argument(
         "--write_mp4",
@@ -507,6 +643,8 @@ def main() -> None:
                 num_visualizations=int(args.num_visualizations),
                 explicit_indices=args.visualization_indices,
                 polarity_order=str(args.polarity_order),
+                vote_use_abs_for_split_polarity=bool(args.vote_use_abs_for_split_polarity),
+                tie_epsilon=float(args.vote_tie_epsilon),
                 write_mp4=bool(args.write_mp4),
                 mp4_fps=float(args.mp4_fps),
                 mp4_use_all_windows=bool(args.mp4_use_all_windows),
@@ -520,10 +658,16 @@ def main() -> None:
                 if result.get("preview_video") is not None
                 else "off"
             )
+            zero_ev_txt = (
+                "n/a"
+                if result["num_zero_event_windows"] is None
+                else f"{result['num_zero_event_windows']}/{result['samples']}"
+            )
             print(
                 "[OK] "
                 f"{file_path} | samples={result['samples']} | "
-                f"shape={tuple(result['shape'])} | duration={duration_txt} | mp4={mp4_txt}"
+                f"shape={tuple(result['shape'])} | duration={duration_txt} | "
+                f"zero_event_windows={zero_ev_txt} | mp4={mp4_txt}"
             )
         except Exception as exc:
             print(f"[FAILED] {file_path}: {exc}")

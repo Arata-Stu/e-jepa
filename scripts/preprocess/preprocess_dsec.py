@@ -85,14 +85,18 @@ def _load_ms_to_idx(filehandle: h5py.File) -> np.ndarray | None:
 def _coarse_bounds_from_ms_to_idx(
     ms_to_idx: np.ndarray | None,
     num_events: int,
+    t_offset_us: int,
     start_us: int,
     end_us: int,
 ) -> tuple[int, int]:
     if ms_to_idx is None or ms_to_idx.size == 0:
         return 0, num_events
 
-    start_ms = max(int(start_us // 1000), 0)
-    end_ms_exclusive = max(int((end_us + 999) // 1000), start_ms + 1)
+    # ms_to_idx is indexed by relative event time (events/t), not absolute wall-clock time.
+    start_us_rel = int(start_us) - int(t_offset_us)
+    end_us_rel = int(end_us) - int(t_offset_us)
+    start_ms = max(int(start_us_rel // 1000), 0)
+    end_ms_exclusive = max(int((end_us_rel + 999) // 1000), start_ms + 1)
 
     start_ms = min(start_ms, ms_to_idx.size - 1)
     start_idx = int(ms_to_idx[start_ms])
@@ -121,16 +125,17 @@ def _extract_events_by_time(
     if num_events == 0:
         return _empty_events()
 
+    t_offset = _read_t_offset(filehandle)
     coarse_start, coarse_end = _coarse_bounds_from_ms_to_idx(
         ms_to_idx=ms_to_idx,
         num_events=num_events,
+        t_offset_us=t_offset,
         start_us=start_us,
         end_us=end_us,
     )
     if coarse_end <= coarse_start:
         return _empty_events()
 
-    t_offset = _read_t_offset(filehandle)
     t_coarse_abs = t_ds[coarse_start:coarse_end].astype(np.int64) + t_offset
     if t_coarse_abs.size == 0:
         return _empty_events()

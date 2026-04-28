@@ -48,14 +48,17 @@ def _load_ms_to_idx(h5f: h5py.File) -> np.ndarray | None:
 def _coarse_bounds_from_ms_to_idx(
     ms_to_idx: np.ndarray | None,
     num_events: int,
+    t_offset_us: int,
     start_us: int,
     end_us: int,
 ) -> tuple[int, int]:
     if ms_to_idx is None or ms_to_idx.size == 0:
         return 0, num_events
 
-    start_ms = max(int(start_us // 1000), 0)
-    end_ms_exclusive = max(int((end_us + 999) // 1000), start_ms + 1)
+    start_us_rel = int(start_us) - int(t_offset_us)
+    end_us_rel = int(end_us) - int(t_offset_us)
+    start_ms = max(int(start_us_rel // 1000), 0)
+    end_ms_exclusive = max(int((end_us_rel + 999) // 1000), start_ms + 1)
     start_ms = min(start_ms, ms_to_idx.size - 1)
     start_idx = int(ms_to_idx[start_ms])
     if end_ms_exclusive >= ms_to_idx.size:
@@ -84,6 +87,7 @@ def _count_events_in_window(
     coarse_start, coarse_end = _coarse_bounds_from_ms_to_idx(
         ms_to_idx=ms_to_idx,
         num_events=num_events,
+        t_offset_us=t_offset,
         start_us=start_us,
         end_us=end_us,
     )
@@ -158,15 +162,62 @@ def _suggest_timestamp_paths(sequence_dir: Path) -> list[Path]:
 
 
 def _resolve_sequence_events_h5(dataset_root: Path, split: str, sequence: str) -> Path:
-    candidates = [
-        dataset_root / split / sequence / "events/left/events.h5",
-        dataset_root / f"{split}_events" / sequence / "events/left/events.h5",
+    rel_candidates = [
+        Path("events/left/events.h5"),
+        Path("events_left/events.h5"),
+        Path("events/events.h5"),
+        Path("events.h5"),
     ]
+    base_candidates = [
+        dataset_root / split / sequence,
+        dataset_root / f"{split}_events" / sequence,
+        dataset_root / sequence,
+    ]
+
+    candidates: list[Path] = []
+    for base in base_candidates:
+        for rel in rel_candidates:
+            candidates.append(base / rel)
+
     for p in candidates:
         if p.exists():
             return p
+
+    # Fallback: recursive search for events.h5 that contains the sequence directory name.
+    search_roots = [
+        dataset_root / split,
+        dataset_root / f"{split}_events",
+        dataset_root,
+    ]
+    found_recursive: list[Path] = []
+    for root in search_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for p in root.rglob("events.h5"):
+            parts = set(p.parts)
+            if sequence in parts:
+                found_recursive.append(p)
+
+    if len(found_recursive) == 1:
+        return found_recursive[0]
+    if len(found_recursive) > 1:
+        found_recursive = sorted(found_recursive)
+        chosen = found_recursive[0]
+        print("[WARN] multiple events.h5 candidates found; using the first one:")
+        print(f"  -> {chosen}")
+        for extra in found_recursive[1:10]:
+            print(f"     {extra}")
+        if len(found_recursive) > 10:
+            print(f"     ... and {len(found_recursive) - 10} more")
+        return chosen
+
     tried = "\n".join([f"  - {p}" for p in candidates])
-    raise FileNotFoundError(f"events.h5 not found. tried:\n{tried}")
+    raise FileNotFoundError(
+        "events.h5 not found. tried direct candidates and recursive scan.\n"
+        f"split={split}, sequence={sequence}\n"
+        f"direct candidates:\n{tried}\n"
+        "tip: pass --events_h5 explicitly if your layout is custom."
+    )
 
 
 def _resolve_sequence_dir_from_events(events_h5: Path) -> Path:

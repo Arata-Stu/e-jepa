@@ -22,6 +22,7 @@ from scripts.preprocess.utils import (
     cleanup_tmp_file,
     ensure_scale_tag_in_filename,
     get_h5_compression_flags,
+    normalize_polarity_to_binary,
     normalized_output_subdir,
     normalized_output_suffix,
     tmp_output_path,
@@ -232,10 +233,11 @@ def _downsample_events_nearest(
     if not np.any(valid_out):
         return _empty_events()
 
+    p_bin = normalize_polarity_to_binary(p_src[valid_out], dtype=np.uint8)
     return {
         "x": x_out[valid_out],
         "y": y_out[valid_out],
-        "p": p_src[valid_out].astype(np.uint8, copy=False),
+        "p": p_bin,
         "t": t_src[valid_out].astype(np.int64, copy=False),
     }
 

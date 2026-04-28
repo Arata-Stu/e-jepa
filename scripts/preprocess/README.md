@@ -7,6 +7,7 @@ Hydra ランナー: `scripts/preprocess/run_preprocess.py`
 
 - `t_bins=10`
 - `downsample_factor`: `dsec=1`, `eventscape=1`, `1mpx=2`, `m3ed=2`
+- 極性は `{0,1}` と `{-1,+1}` の両方を受け付け、内部で `{0,1}` に正規化
 
 ## DSEC
 

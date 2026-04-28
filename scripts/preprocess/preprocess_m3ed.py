@@ -22,6 +22,7 @@ from scripts.preprocess.utils import (
     cleanup_tmp_file,
     ensure_scale_tag_in_filename,
     get_h5_compression_flags,
+    normalize_polarity_to_binary,
     normalized_output_subdir,
     normalized_output_suffix,
     tmp_output_path,
@@ -264,10 +265,10 @@ def _spatially_normalize_events(
         return _empty_events()
 
     # Supports both polarity conventions:
-    # - binary {0, 1}
-    # - signed {-1, +1}
-    # EventVoxelGrid internally maps p to signed via (2*p-1), so we normalize to {0,1}.
-    p_bin = (p_src > 0).astype(np.float32, copy=False)
+    # - binary {0,1}
+    # - signed {-1,+1}
+    # EventVoxelGrid internally maps p to signed via (2*p-1), so normalize to {0,1}.
+    p_bin = normalize_polarity_to_binary(p_src, dtype=np.float32)
 
     return {
         "x": x_out[valid_out].astype(np.float32, copy=False),

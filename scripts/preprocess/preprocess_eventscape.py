@@ -23,6 +23,7 @@ from scripts.preprocess.utils import (
     cleanup_tmp_file,
     ensure_scale_tag_in_filename,
     get_h5_compression_flags,
+    normalize_polarity_to_binary,
     normalized_output_subdir,
     normalized_output_suffix,
     tmp_output_path,
@@ -251,7 +252,7 @@ def _spatially_normalize_events(
     if not np.any(valid_out):
         return _empty_events()
 
-    p_bin = (p_src > 0).astype(np.float32, copy=False)
+    p_bin = normalize_polarity_to_binary(p_src, dtype=np.float32)
     t_out = t_src[valid_out].astype(np.int64, copy=False)
     x_out = x_out[valid_out].astype(np.float32, copy=False)
     y_out = y_out[valid_out].astype(np.float32, copy=False)

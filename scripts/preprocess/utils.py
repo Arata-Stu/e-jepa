@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import numpy as np
 
 
 def _compression_opts() -> tuple[int, int, int, int, int, int, int]:
@@ -90,3 +91,21 @@ def ensure_scale_tag_in_filename(filename: str, downsample_factor: int) -> str:
     end = match.end(2)
     new_stem = f"{stem[:start]}{tag}{stem[end:]}"
     return f"{new_stem}{suffix}"
+
+
+def normalize_polarity_to_binary(
+    polarity: np.ndarray,
+    dtype: str | np.dtype | None = None,
+) -> np.ndarray:
+    """
+    Normalize event polarity to binary convention {0,1}.
+
+    Supports common source conventions:
+    - signed {-1,+1}
+    - binary {0,1}
+    Any value > 0 becomes 1, otherwise 0.
+    """
+    arr = np.asarray(polarity)
+    bin_arr = arr > 0
+    out_dtype = np.uint8 if dtype is None else dtype
+    return bin_arr.astype(out_dtype, copy=False)

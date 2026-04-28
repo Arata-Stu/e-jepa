@@ -152,6 +152,26 @@ def _copy_dataset_slice(
         out_pos += (e - s)
 
 
+def _dataset_name_allowed(dataset_name: str, metadata_mode: str) -> bool:
+    if metadata_mode == "full":
+        return True
+    if metadata_mode != "minimal":
+        raise ValueError(f"unsupported metadata_mode: {metadata_mode}")
+
+    keep = {
+        "voxels",
+        "window_index",
+        "window_t_start_us",
+        "window_t_end_us",
+        "window_rel_start_us",
+        "window_rel_end_us",
+        "anchor_timestamp_us",
+        "anchor_rel_timestamp_us",
+        "window_event_count",
+    }
+    return dataset_name in keep
+
+
 def _create_dataset_with_fallback(
     out_h5: h5py.File,
     name: str,
@@ -177,6 +197,7 @@ def _write_chunk_file(
     chunk_index: int,
     total_chunks: int,
     chunk_duration_s: float,
+    metadata_mode: str,
 ) -> None:
     out_h5_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(out_h5_path, ".tmp")
@@ -204,11 +225,24 @@ def _write_chunk_file(
 
             src_h5.visititems(_visitor)
 
+            allowed_dataset_names = sorted([n for n in dataset_names if _dataset_name_allowed(n, metadata_mode)])
+            required_groups = set()
+            for dname in allowed_dataset_names:
+                if "/" in dname:
+                    parent = dname.rsplit("/", 1)[0]
+                    while True:
+                        required_groups.add(parent)
+                        if "/" not in parent:
+                            break
+                        parent = parent.rsplit("/", 1)[0]
+
             for gname in sorted(group_names):
+                if gname not in required_groups:
+                    continue
                 out_group = out_h5.require_group(gname)
                 _copy_attrs(src_h5[gname], out_group)
 
-            for dname in sorted(dataset_names):
+            for dname in allowed_dataset_names:
                 src_ds = src_h5[dname]
                 row_aligned = src_ds.ndim > 0 and src_ds.shape[0] == n_samples
 
@@ -264,6 +298,7 @@ def _process_one_file(
     min_windows_per_chunk: int,
     chunk_index_pad: int,
     overwrite: bool,
+    metadata_mode: str,
 ) -> tuple[str, int, int]:
     with h5py.File(str(input_path), "r") as h5f:
         n_samples = int(h5f["voxels"].shape[0])
@@ -294,6 +329,7 @@ def _process_one_file(
             chunk_index=chunk_idx,
             total_chunks=len(ranges),
             chunk_duration_s=float(chunk_duration_s),
+            metadata_mode=metadata_mode,
         )
         done += 1
 
@@ -312,6 +348,7 @@ def _worker(job: dict) -> tuple[str, bool, str | None, int, int]:
             min_windows_per_chunk=int(job["min_windows_per_chunk"]),
             chunk_index_pad=int(job["chunk_index_pad"]),
             overwrite=bool(job["overwrite"]),
+            metadata_mode=str(job["metadata_mode"]),
         )
         return file_path, True, None, n_samples, n_written
     except Exception as exc:
@@ -344,6 +381,12 @@ def main() -> None:
         type=int,
         default=8,
         help="Rows copied per I/O batch while slicing datasets (smaller uses less RAM).",
+    )
+    parser.add_argument(
+        "--metadata_mode",
+        choices=["full", "minimal"],
+        default="full",
+        help="full: copy all datasets. minimal: copy voxels and essential timing datasets only.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing split files.")
     parser.add_argument("--num_processes", type=int, default=1, help="Parallel workers.")
@@ -385,6 +428,7 @@ def main() -> None:
                 "min_windows_per_chunk": int(args.min_windows_per_chunk),
                 "chunk_index_pad": int(args.chunk_index_pad),
                 "overwrite": bool(args.overwrite),
+                "metadata_mode": str(args.metadata_mode),
             }
         )
 

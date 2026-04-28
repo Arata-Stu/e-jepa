@@ -184,6 +184,18 @@ python3 scripts/preprocess/split_voxel_h5_by_duration.py \
   --copy_batch_size 8
 ```
 
+DSEC + semantic 同期済みなどで高速化したい場合:
+
+```bash
+python3 scripts/preprocess/split_voxel_h5_by_duration.py \
+  --dataset_root /data/DSEC_voxels_seg \
+  --output_root /data/DSEC_voxels_seg_20s \
+  --chunk_duration_s 20 \
+  --num_processes 2 \
+  --copy_batch_size 32 \
+  --metadata_mode minimal
+```
+
 ## DSEC 同期デバッグ
 
 raw events と image timestamps の単位/整合を確認:

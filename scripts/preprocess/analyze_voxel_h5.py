@@ -168,6 +168,54 @@ def _relative_or_name(path: Path, root: Path | None) -> str:
         return path.name
 
 
+def _format_optional_float(value: float | None, fmt: str) -> str:
+    if value is None:
+        return "n/a"
+    return format(float(value), fmt)
+
+
+def _infer_dataset_family(file_path: Path, representation: str) -> str:
+    rep = str(representation).strip().lower()
+    if rep == "event_voxel_grid_m3ed":
+        return "m3ed"
+    if rep == "event_voxel_grid_1mpx":
+        return "1mpx"
+    if rep == "event_voxel_grid_eventscape":
+        return "eventscape"
+    if rep == "event_voxel_grid":
+        return "dsec"
+
+    lower_path = str(file_path).lower()
+    if "m3ed" in lower_path:
+        return "m3ed"
+    if "1mpx" in lower_path:
+        return "1mpx"
+    if "eventscape" in lower_path:
+        return "eventscape"
+    if "dsec" in lower_path:
+        return "dsec"
+    return "other"
+
+
+def _build_compare_oneline(result: dict[str, Any]) -> str:
+    mean_ev = result.get("window_event_count_mean")
+    nz_ratio = result.get("voxel_nonzero_ratio")
+    zero_windows = result.get("num_zero_event_windows")
+    samples = int(result.get("samples", 0))
+    dataset = str(result.get("dataset_family", "other"))
+
+    mean_ev_txt = _format_optional_float(None if mean_ev is None else float(mean_ev), ".2f")
+    nz_ratio_txt = _format_optional_float(None if nz_ratio is None else float(nz_ratio), ".6f")
+    if zero_windows is None:
+        zero_txt = "n/a"
+    else:
+        zero_txt = f"{int(zero_windows)}/{samples}"
+    return (
+        f"dataset={dataset} | voxel_nonzero_ratio={nz_ratio_txt} | "
+        f"mean_event_count={mean_ev_txt} | zero_event_windows={zero_txt}"
+    )
+
+
 def _write_preview_images(
     *,
     h5f: h5py.File,
@@ -370,7 +418,7 @@ def _analyze_file(
         window_event_count_min = None
         window_event_count_max = None
         num_zero_event_windows = None
-        if (not metadata_only) and "window_event_count" in h5f and len(h5f["window_event_count"]) >= n_samples:
+        if "window_event_count" in h5f and len(h5f["window_event_count"]) >= n_samples:
             event_counts = np.asarray(h5f["window_event_count"][:n_samples], dtype=np.int64)
             if event_counts.size > 0:
                 window_event_count_total = int(event_counts.sum())
@@ -452,10 +500,13 @@ def _analyze_file(
                     }
                 )
 
+        representation = _safe_attr(h5f.attrs, "representation", "")
+        dataset_family = _infer_dataset_family(file_path=file_path, representation=str(representation))
         result = {
             "file": str(file_path),
             "file_size_mb": round(float(file_path.stat().st_size) / (1024.0 * 1024.0), 3),
-            "representation": _safe_attr(h5f.attrs, "representation", ""),
+            "representation": representation,
+            "dataset_family": dataset_family,
             "dtype": str(voxels.dtype),
             "shape": [n_samples, channels, height, width],
             "samples": n_samples,
@@ -489,12 +540,14 @@ def _analyze_file(
             "preview_video": preview_video_path,
             "preview_video_num_frames": preview_video_num_frames,
         }
+        result["compare_oneline"] = _build_compare_oneline(result)
         return result
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     columns = [
         "file",
+        "dataset_family",
         "file_size_mb",
         "representation",
         "dtype",
@@ -520,6 +573,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "voxel_global_mean",
         "voxel_global_std",
         "voxel_nonzero_ratio",
+        "compare_oneline",
         "preview_images",
         "preview_video",
         "preview_video_num_frames",
@@ -532,6 +586,58 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             out = {k: row.get(k, "") for k in columns}
             out["preview_images"] = ";".join(row.get("preview_images", []))
             writer.writerow(out)
+
+
+def _print_compare_summary(results: list[dict[str, Any]]) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        family = str(row.get("dataset_family", "other"))
+        grouped.setdefault(family, []).append(row)
+
+    for family in sorted(grouped.keys()):
+        rows = grouped[family]
+        files = len(rows)
+        total_samples = sum(int(r.get("samples", 0)) for r in rows)
+
+        total_event_count = 0
+        total_event_windows = 0
+        for r in rows:
+            total = r.get("window_event_count_total")
+            n = int(r.get("samples", 0))
+            if total is None or n <= 0:
+                continue
+            total_event_count += int(total)
+            total_event_windows += n
+        mean_event_count = (
+            float(total_event_count) / float(total_event_windows) if total_event_windows > 0 else None
+        )
+
+        weighted_nonzero_sum = 0.0
+        weighted_nonzero_denom = 0
+        for r in rows:
+            nz = r.get("voxel_nonzero_ratio")
+            if nz is None:
+                continue
+            n = int(r.get("samples", 0))
+            c = int(r.get("channels", 0))
+            h = int(r.get("height", 0))
+            w = int(r.get("width", 0))
+            weight = n * c * h * w
+            if weight <= 0:
+                continue
+            weighted_nonzero_sum += float(nz) * float(weight)
+            weighted_nonzero_denom += weight
+        voxel_nonzero_ratio = (
+            weighted_nonzero_sum / float(weighted_nonzero_denom) if weighted_nonzero_denom > 0 else None
+        )
+
+        mean_event_txt = _format_optional_float(mean_event_count, ".2f")
+        nz_txt = _format_optional_float(voxel_nonzero_ratio, ".6f")
+        print(
+            "[COMPARE] "
+            f"dataset={family} | files={files} | samples={total_samples} | "
+            f"mean_event_count={mean_event_txt} | voxel_nonzero_ratio={nz_txt}"
+        )
 
 
 def main() -> None:
@@ -684,7 +790,7 @@ def main() -> None:
                 "[OK] "
                 f"{file_path} | samples={result['samples']} | "
                 f"shape={tuple(result['shape'])} | duration={duration_txt} | "
-                f"zero_event_windows={zero_ev_txt} | mp4={mp4_txt}"
+                f"zero_event_windows={zero_ev_txt} | compare={result['compare_oneline']} | mp4={mp4_txt}"
             )
         except Exception as exc:
             print(f"[FAILED] {file_path}: {exc}")
@@ -710,6 +816,7 @@ def main() -> None:
         f"total_estimated_duration={total_duration_txt} | "
         f"json={report_json} | csv={report_csv}"
     )
+    _print_compare_summary(results)
 
 
 if __name__ == "__main__":

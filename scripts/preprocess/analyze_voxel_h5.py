@@ -92,23 +92,28 @@ def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool, polarity_order: str) 
     if split_polarity and channels > 1 and channels % 2 == 0:
         half = channels // 2
         if polarity_order == "negpos":
-            neg_map = np.asarray(voxel[:half].sum(axis=0), dtype=np.float32)
-            pos_map = np.asarray(voxel[half:].sum(axis=0), dtype=np.float32)
+            neg_bins = np.asarray(voxel[:half], dtype=np.float32)
+            pos_bins = np.asarray(voxel[half:], dtype=np.float32)
         elif polarity_order == "posneg":
-            pos_map = np.asarray(voxel[:half].sum(axis=0), dtype=np.float32)
-            neg_map = np.asarray(voxel[half:].sum(axis=0), dtype=np.float32)
+            pos_bins = np.asarray(voxel[:half], dtype=np.float32)
+            neg_bins = np.asarray(voxel[half:], dtype=np.float32)
         else:
             raise ValueError(f"unsupported polarity_order: {polarity_order}")
-    else:
-        signed = voxel.sum(axis=0)
-        pos_map = np.clip(signed, 0.0, None).astype(np.float32, copy=False)
-        neg_map = np.clip(-signed, 0.0, None).astype(np.float32, copy=False)
 
-    img_diff = pos_map - neg_map
-    height, width = img_diff.shape
+        # Majority vote per temporal bin:
+        #   vote_bin > 0: positive wins this bin
+        #   vote_bin < 0: negative wins this bin
+        #   vote_bin = 0: tie/no-event in this bin
+        vote_bins = np.sign(pos_bins - neg_bins)
+        vote_score = vote_bins.sum(axis=0)
+    else:
+        # Fallback for non-split polarity representations.
+        vote_score = np.sign(np.asarray(voxel, dtype=np.float32)).sum(axis=0)
+
+    height, width = vote_score.shape
     img = np.full((height, width, 3), 127, dtype=np.uint8)
-    img[img_diff > 0] = 255
-    img[img_diff < 0] = 0
+    img[vote_score > 0] = 255
+    img[vote_score < 0] = 0
     return img
 
 

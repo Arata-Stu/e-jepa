@@ -370,7 +370,7 @@ def _analyze_file(
         window_event_count_min = None
         window_event_count_max = None
         num_zero_event_windows = None
-        if "window_event_count" in h5f and len(h5f["window_event_count"]) >= n_samples:
+        if (not metadata_only) and "window_event_count" in h5f and len(h5f["window_event_count"]) >= n_samples:
             event_counts = np.asarray(h5f["window_event_count"][:n_samples], dtype=np.int64)
             if event_counts.size > 0:
                 window_event_count_total = int(event_counts.sum())

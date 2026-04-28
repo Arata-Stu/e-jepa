@@ -80,7 +80,7 @@ def _infer_split_polarity(h5f: h5py.File, channels: int) -> bool:
     return channels % 2 == 0
 
 
-def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool) -> np.ndarray:
+def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool, polarity_order: str) -> np.ndarray:
     if voxel.ndim != 3:
         raise ValueError(f"voxel must be (C,H,W), got shape={voxel.shape}")
 
@@ -88,30 +88,27 @@ def _voxel_to_rgb(voxel: np.ndarray, split_polarity: bool) -> np.ndarray:
     if channels == 0:
         return np.zeros((voxel.shape[1], voxel.shape[2], 3), dtype=np.uint8)
 
-    if split_polarity and channels >= 2:
+    if split_polarity and channels > 1 and channels % 2 == 0:
         half = channels // 2
-        pos_map = np.abs(voxel[:half]).sum(axis=0)
-        neg_map = np.abs(voxel[half:]).sum(axis=0)
+        if polarity_order == "negpos":
+            neg_map = np.asarray(voxel[:half].sum(axis=0), dtype=np.float32)
+            pos_map = np.asarray(voxel[half:].sum(axis=0), dtype=np.float32)
+        elif polarity_order == "posneg":
+            pos_map = np.asarray(voxel[:half].sum(axis=0), dtype=np.float32)
+            neg_map = np.asarray(voxel[half:].sum(axis=0), dtype=np.float32)
+        else:
+            raise ValueError(f"unsupported polarity_order: {polarity_order}")
     else:
         signed = voxel.sum(axis=0)
-        pos_map = np.clip(signed, 0.0, None)
-        neg_map = np.clip(-signed, 0.0, None)
+        pos_map = np.clip(signed, 0.0, None).astype(np.float32, copy=False)
+        neg_map = np.clip(-signed, 0.0, None).astype(np.float32, copy=False)
 
-    intensity = pos_map + neg_map
-    scale = float(np.percentile(intensity, 99.0)) if intensity.size > 0 else 0.0
-    if scale <= 1e-8:
-        scale = float(intensity.max()) if intensity.size > 0 else 0.0
-    if scale <= 1e-8:
-        scale = 1.0
-
-    pos = np.clip(pos_map / scale, 0.0, 1.0)
-    neg = np.clip(neg_map / scale, 0.0, 1.0)
-    inten = np.clip(intensity / scale, 0.0, 1.0)
-
-    # Gamma for visibility.
-    rgb = np.stack([pos, 0.5 * inten, neg], axis=-1)
-    rgb = np.sqrt(np.clip(rgb, 0.0, 1.0))
-    return (rgb * 255.0).astype(np.uint8)
+    img_diff = pos_map - neg_map
+    height, width = img_diff.shape
+    img = np.full((height, width, 3), 127, dtype=np.uint8)
+    img[img_diff > 0] = 255
+    img[img_diff < 0] = 0
+    return img
 
 
 def _pick_indices(n_samples: int, num_visualizations: int, explicit_indices: list[int] | None) -> list[int]:
@@ -148,6 +145,7 @@ def _write_preview_images(
     n_samples: int,
     num_visualizations: int,
     explicit_indices: list[int] | None,
+    polarity_order: str,
 ) -> list[str]:
     try:
         from PIL import Image
@@ -174,7 +172,7 @@ def _write_preview_images(
     written_paths: list[str] = []
     for idx in indices:
         voxel = np.asarray(voxels[idx], dtype=np.float32)
-        rgb = _voxel_to_rgb(voxel=voxel, split_polarity=split_polarity)
+        rgb = _voxel_to_rgb(voxel=voxel, split_polarity=split_polarity, polarity_order=polarity_order)
         out_path = preview_dir / f"window_{idx:06d}.png"
         Image.fromarray(rgb, mode="RGB").save(out_path)
         written_paths.append(str(out_path))
@@ -189,6 +187,7 @@ def _analyze_file(
     with_visualization: bool,
     num_visualizations: int,
     explicit_indices: list[int] | None,
+    polarity_order: str,
 ) -> dict[str, Any]:
     with h5py.File(str(file_path), "r") as h5f:
         if "voxels" not in h5f:
@@ -215,6 +214,7 @@ def _analyze_file(
                 n_samples=n_samples,
                 num_visualizations=num_visualizations,
                 explicit_indices=explicit_indices,
+                polarity_order=polarity_order,
             )
 
         result = {
@@ -300,6 +300,12 @@ def main() -> None:
         help="Explicit window indices to visualize (e.g. 0 10 100).",
     )
     parser.add_argument(
+        "--polarity_order",
+        choices=["negpos", "posneg"],
+        default="negpos",
+        help="Channel order for split polarity visualization: negpos means first-half=neg, second-half=pos.",
+    )
+    parser.add_argument(
         "--report_json",
         type=Path,
         default=None,
@@ -343,6 +349,7 @@ def main() -> None:
                 with_visualization=bool(args.with_visualization),
                 num_visualizations=int(args.num_visualizations),
                 explicit_indices=args.visualization_indices,
+                polarity_order=str(args.polarity_order),
             )
             results.append(result)
             duration_s = result["estimated_recording_duration_s"]

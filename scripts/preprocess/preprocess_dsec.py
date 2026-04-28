@@ -968,6 +968,46 @@ def process_dataset_root(
     if output_root is not None:
         output_root.mkdir(parents=True, exist_ok=True)
 
+    if sync_segmentation:
+        num_with_semantic = 0
+        num_without_semantic = 0
+        by_split = {}
+
+        for record in input_records:
+            seg_dir = _resolve_segmentation_dir(
+                input_path=Path(record["input_path"]),
+                split=str(record["split"]),
+                sequence=str(record["sequence"]),
+                dataset_root=dataset_root,
+                segmentation_root=segmentation_root,
+                segmentation_subdir=segmentation_subdir,
+            )
+
+            split = str(record["split"])
+            if split not in by_split:
+                by_split[split] = {"with": 0, "without": 0}
+
+            if seg_dir is not None:
+                num_with_semantic += 1
+                by_split[split]["with"] += 1
+            else:
+                num_without_semantic += 1
+                by_split[split]["without"] += 1
+
+        print("[SEGMENTATION STATS]")
+        print(
+            f"total={len(input_records)}, "
+            f"with_semantic={num_with_semantic}, "
+            f"without_semantic={num_without_semantic}"
+        )
+
+        for split in sorted(by_split.keys()):
+            s = by_split[split]
+            print(
+                f"  split={split}: "
+                f"with={s['with']}, without={s['without']}"
+            )
+
     jobs: list[dict] = []
     num_done = 0
     num_skipped = 0

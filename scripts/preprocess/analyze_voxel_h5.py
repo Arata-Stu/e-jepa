@@ -190,9 +190,10 @@ def _write_preview_video(
     explicit_indices: list[int] | None,
     num_visualizations: int,
     use_all_windows: bool,
+    max_frames: int | None,
     polarity_order: str,
     fps: float,
-) -> str | None:
+) -> tuple[str | None, int]:
     try:
         import cv2
     except Exception as exc:
@@ -207,7 +208,10 @@ def _write_preview_video(
             explicit_indices=explicit_indices,
         )
     if len(indices) == 0:
-        return None
+        return None, 0
+
+    if max_frames is not None and int(max_frames) > 0 and len(indices) > int(max_frames):
+        indices = indices[: int(max_frames)]
 
     voxels = h5f["voxels"]
     channels = int(voxels.shape[1])
@@ -247,7 +251,7 @@ def _write_preview_video(
     finally:
         writer.release()
 
-    return str(out_path)
+    return str(out_path), len(indices)
 
 
 def _analyze_file(
@@ -262,6 +266,7 @@ def _analyze_file(
     write_mp4: bool,
     mp4_fps: float,
     mp4_use_all_windows: bool,
+    mp4_max_frames: int | None,
 ) -> dict[str, Any]:
     with h5py.File(str(file_path), "r") as h5f:
         if "voxels" not in h5f:
@@ -280,6 +285,7 @@ def _analyze_file(
 
         preview_paths: list[str] = []
         preview_video_path: str | None = None
+        preview_video_num_frames = 0
         if with_visualization:
             preview_paths = _write_preview_images(
                 h5f=h5f,
@@ -292,7 +298,7 @@ def _analyze_file(
                 polarity_order=polarity_order,
             )
         if write_mp4:
-            preview_video_path = _write_preview_video(
+            preview_video_path, preview_video_num_frames = _write_preview_video(
                 h5f=h5f,
                 file_path=file_path,
                 output_dir=output_dir,
@@ -301,6 +307,7 @@ def _analyze_file(
                 explicit_indices=explicit_indices,
                 num_visualizations=num_visualizations,
                 use_all_windows=mp4_use_all_windows,
+                max_frames=mp4_max_frames,
                 polarity_order=polarity_order,
                 fps=mp4_fps,
             )
@@ -324,6 +331,7 @@ def _analyze_file(
             "estimated_windows_per_second": windows_per_second,
             "preview_images": preview_paths,
             "preview_video": preview_video_path,
+            "preview_video_num_frames": preview_video_num_frames,
         }
         return result
 
@@ -347,6 +355,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "estimated_windows_per_second",
         "preview_images",
         "preview_video",
+        "preview_video_num_frames",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -405,8 +414,14 @@ def main() -> None:
     parser.add_argument(
         "--mp4_use_all_windows",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use all windows for MP4 (default uses selected visualization indices).",
+        default=True,
+        help="Use all windows for MP4 (default: true).",
+    )
+    parser.add_argument(
+        "--mp4_max_frames",
+        type=int,
+        default=None,
+        help="Optional cap on frames per MP4 (useful for very long sequences).",
     )
     parser.add_argument(
         "--report_json",
@@ -456,14 +471,20 @@ def main() -> None:
                 write_mp4=bool(args.write_mp4),
                 mp4_fps=float(args.mp4_fps),
                 mp4_use_all_windows=bool(args.mp4_use_all_windows),
+                mp4_max_frames=None if args.mp4_max_frames is None else int(args.mp4_max_frames),
             )
             results.append(result)
             duration_s = result["estimated_recording_duration_s"]
             duration_txt = "n/a" if duration_s is None else f"{duration_s:.3f}s"
+            mp4_txt = (
+                f"{result['preview_video_num_frames']}f"
+                if result.get("preview_video") is not None
+                else "off"
+            )
             print(
                 "[OK] "
                 f"{file_path} | samples={result['samples']} | "
-                f"shape={tuple(result['shape'])} | duration={duration_txt}"
+                f"shape={tuple(result['shape'])} | duration={duration_txt} | mp4={mp4_txt}"
             )
         except Exception as exc:
             print(f"[FAILED] {file_path}: {exc}")

@@ -140,6 +140,17 @@ python3 scripts/preprocess/analyze_voxel_h5.py \
   --mp4_fps 20
 ```
 
+長尺を制限したい場合:
+
+```bash
+python3 scripts/preprocess/analyze_voxel_h5.py \
+  --dataset_root /data/preprocessed_voxels \
+  --output_dir /data/preprocessed_voxels_analysis \
+  --write_mp4 \
+  --mp4_fps 30 \
+  --mp4_max_frames 600
+```
+
 単一ファイル:
 
 ```bash

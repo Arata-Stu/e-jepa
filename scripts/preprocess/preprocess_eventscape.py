@@ -431,7 +431,6 @@ class VoxelH5Writer:
             maxshape=(None,),
             dtype=string_dtype,
             chunks=scalar_chunks,
-            **H5_COMPRESSION_FLAGS,
         )
         self.h5f.create_dataset(
             "semantic_available",
@@ -463,7 +462,6 @@ class VoxelH5Writer:
             maxshape=(None,),
             dtype=string_dtype,
             chunks=scalar_chunks,
-            **H5_COMPRESSION_FLAGS,
         )
         self.h5f.create_dataset(
             "depth_available",
@@ -495,7 +493,6 @@ class VoxelH5Writer:
             maxshape=(None,),
             dtype=string_dtype,
             chunks=scalar_chunks,
-            **H5_COMPRESSION_FLAGS,
         )
 
     @staticmethod

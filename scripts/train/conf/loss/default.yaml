@@ -1,0 +1,8 @@
+# L1-like JEPA loss exponent (1.0 => L1).
+loss_exp: 1.0
+# Include context prediction loss branch.
+predict_all: true
+shift_by_n: 0
+# Weight predictor/context loss by mask distance.
+weight_distance_loss: true
+offset_context_loss: false

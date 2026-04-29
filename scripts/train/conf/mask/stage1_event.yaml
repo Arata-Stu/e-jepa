@@ -1,0 +1,18 @@
+# Video/event branch masks.
+# Pattern A: small-context many blocks.
+- num_blocks: 8
+  spatial_scale: [0.15, 0.15]
+  temporal_scale: [1.0, 1.0]
+  aspect_ratio: [0.75, 1.5]
+  max_temporal_keep: 1.0
+  max_keep: null
+  full_complement: false
+
+# Pattern B: large-context few blocks.
+- num_blocks: 2
+  spatial_scale: [0.7, 0.7]
+  temporal_scale: [1.0, 1.0]
+  aspect_ratio: [0.75, 1.5]
+  max_temporal_keep: 1.0
+  max_keep: null
+  full_complement: false

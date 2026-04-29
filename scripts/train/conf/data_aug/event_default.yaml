@@ -1,0 +1,8 @@
+# Basic augmentation for event voxel clips.
+random_horizontal_flip: true
+# RandomResizedCrop aspect ratio range.
+random_resize_aspect_ratio: [0.75, 1.3333333333]
+# RandomResizedCrop area scale range.
+random_resize_scale: [0.3, 1.0]
+interpolation: bilinear
+antialias: true

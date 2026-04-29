@@ -1,0 +1,28 @@
+# Event H5 loader (stage-1 video branch).
+dataset_type: eventdataset
+# One or more roots / manifests / .h5 files. Must be set from CLI or local yaml.
+datasets: []
+# Optional mixing weights aligned with `datasets`.
+datasets_weights: null
+# Frames-per-clip per dataset. [8] means pseudo-video of length 8.
+dataset_fpcs: [8]
+# Per-rank batch size (not global).
+batch_size: 8
+# Final training resolution after augmentation.
+crop_size: 224
+patch_size: 16
+# Temporal patch size used by ViT patch embedding.
+tubelet_size: 2
+fps: 4
+num_workers: 8
+persistent_workers: true
+pin_mem: true
+# Temporal subsampling stride before fpc fitting.
+frame_sample_rate: 1
+# Number of clips sampled from one sample each iteration.
+num_clips: 1
+random_clip_sampling: true
+allow_clip_overlap: false
+# Scan options for directory mode.
+file_pattern: "*.h5"
+recursive: true

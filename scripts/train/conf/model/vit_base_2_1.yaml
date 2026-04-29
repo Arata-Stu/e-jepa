@@ -1,0 +1,33 @@
+# Model/predictor core.
+compile_model: false
+use_activation_checkpointing: true
+model_name: vit_base
+pred_depth: 12
+pred_num_heads: 12
+pred_embed_dim: 384
+uniform_power: true
+use_mask_tokens: true
+zero_init_mask_tokens: true
+use_rope: true
+use_silu: false
+use_pred_silu: false
+wide_silu: true
+is_causal: false
+pred_is_causal: false
+init_type: default
+# If set (usually 1), model detects image branch by temporal length.
+img_temporal_dim_size: null
+n_registers: 0
+n_registers_predictor: 0
+has_cls_first: false
+interpolate_rope: true
+# Context-loss weight for image branch / video branch.
+lambda_value_img: 0.5
+lambda_value_vid: 0.5
+# If true, lambda ramps during training via scheduler.
+lambda_progressive: true
+normalize_predictor: false
+# Enable image/video modality embeddings.
+modality_embedding: false
+# Number of multilevel features handled by predictor/loss path.
+levels_predictor: 4

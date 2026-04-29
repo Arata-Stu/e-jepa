@@ -21,6 +21,7 @@ All preprocess outputs created by:
 - `scripts/preprocess/preprocess_dsec.py`
 - `scripts/preprocess/preprocess_1mpx.py`
 - `scripts/preprocess/preprocess_eventscape.py`
+- `scripts/preprocess/preprocess_m3ed.py`
 
 are supported.
 

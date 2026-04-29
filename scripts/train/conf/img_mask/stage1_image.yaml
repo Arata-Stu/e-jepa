@@ -1,0 +1,8 @@
+# Image-branch mask (single pattern).
+- num_blocks: 10
+  spatial_scale: [0.15, 0.15]
+  temporal_scale: [1.0, 1.0]
+  aspect_ratio: [0.75, 1.5]
+  max_temporal_keep: 1.0
+  max_keep: null
+  full_complement: false

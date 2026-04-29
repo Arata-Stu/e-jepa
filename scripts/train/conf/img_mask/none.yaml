@@ -1,0 +1,2 @@
+# Keep `img_mask` unset (image branch uses `mask` unless overridden).
+null

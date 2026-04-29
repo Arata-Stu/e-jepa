@@ -1,0 +1,23 @@
+# Main Hydra composition.
+# Switch groups from CLI, e.g.:
+#   mask=stage1_event
+#   img_data=event_h5_single_frame img_mask=stage1_image
+defaults:
+  - data: stage1_event
+  - img_data: none
+  - img_mask: none
+  - model: vit_base_2_1
+  - optimization: pretrain_default
+  - mask: stage1_event
+  - loss: default
+  - data_aug: event_default
+  - meta: default
+  - _self_
+
+# Output directory for checkpoints/logs/tensorboard.
+folder: outputs/train_stage1_event
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

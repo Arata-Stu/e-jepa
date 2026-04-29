@@ -1,0 +1,24 @@
+# Optional annealing resume path.
+is_anneal: false
+anneal_ckpt: null
+resume_anneal: false
+# Iterations per epoch. null => use dataloader length.
+ipe: null
+ipe_scale: 1.25
+# AdamW schedule.
+weight_decay: 0.04
+final_weight_decay: 0.04
+epochs: 100
+warmup: 10
+start_lr: 1.0e-4
+lr: 6.0e-4
+final_lr: 6.0e-4
+# EMA momentum range for target encoder [start, end].
+ema: [0.99925, 0.99925]
+use_radamw: false
+betas: [0.9, 0.999]
+eps: 1.0e-8
+# Optional loss outlier guard (off by default).
+loss_reg_std_mult: null
+loss_reg_num_tracking_steps: 300
+loss_reg_min_epoch: 50

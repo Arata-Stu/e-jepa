@@ -1,0 +1,23 @@
+# Precision/runtime.
+dtype: bfloat16
+seed: 239
+# Resume options.
+load_checkpoint: false
+read_checkpoint: null
+auto_resume_latest: false
+use_sdpa: true
+use_tf32: true
+# DDP communication port.
+dist_port: 37129
+tensorboard: true
+log_all_ranks: false
+# Logging/checkpoint cadence.
+log_freq: 10
+checkpoint_freq: 1
+save_every_freq: 50
+skip_batches: -1
+# Optional manual GC control.
+sync_gc: false
+gc_collect_itr_freq: 50
+# Dataloader retry count on transient read errors.
+max_loader_retries: 5

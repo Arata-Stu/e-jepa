@@ -23,5 +23,6 @@ start_time_us: null
 
 normalize: true
 output_dtype: float16
+compression_level: 1
 tmp_suffix: .tmp
 num_processes: 1

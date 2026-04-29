@@ -5,26 +5,43 @@ import re
 import numpy as np
 
 
-def _compression_opts() -> tuple[int, int, int, int, int, int, int]:
-    compression_level = 1  # {0, ..., 9}
-    shuffle = 2  # {0: none, 1: byte, 2: bit}
-    compressor_type = 5  # BLOSC_ZSTD
-    return 0, 0, 0, 0, compression_level, shuffle, compressor_type
+def _compression_opts(
+    compression_level: int = 1,
+    shuffle: int = 2,
+    compressor_type: int = 5,
+) -> tuple[int, int, int, int, int, int, int]:
+    level = int(compression_level)
+    if level < 0 or level > 9:
+        raise ValueError(f"compression_level must be in [0,9], got {compression_level}")
+    if int(shuffle) not in (0, 1, 2):
+        raise ValueError(f"shuffle must be one of {{0,1,2}}, got {shuffle}")
+    return 0, 0, 0, 0, level, int(shuffle), int(compressor_type)
 
 
-def get_h5_compression_flags() -> dict:
+def get_h5_compression_flags(
+    compression_level: int = 1,
+    shuffle: int = 2,
+    compressor_type: int = 5,
+) -> dict:
+    level = int(compression_level)
+    if level < 0 or level > 9:
+        raise ValueError(f"compression_level must be in [0,9], got {compression_level}")
     try:
         import hdf5plugin  # noqa: F401
 
         _ = hdf5plugin
         return dict(
             compression=32001,
-            compression_opts=_compression_opts(),
+            compression_opts=_compression_opts(
+                compression_level=level,
+                shuffle=shuffle,
+                compressor_type=compressor_type,
+            ),
         )
     except ImportError:
         return dict(
             compression="gzip",
-            compression_opts=1,
+            compression_opts=level,
         )
 
 

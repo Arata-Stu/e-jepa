@@ -27,7 +27,14 @@ from scripts.preprocess.utils import (
     normalized_output_suffix,
     tmp_output_path,
 )
-H5_COMPRESSION_FLAGS = get_h5_compression_flags()
+
+DEFAULT_COMPRESSION_LEVEL = 1
+H5_COMPRESSION_FLAGS = get_h5_compression_flags(compression_level=DEFAULT_COMPRESSION_LEVEL)
+
+
+def _configure_h5_compression(compression_level: int) -> None:
+    global H5_COMPRESSION_FLAGS
+    H5_COMPRESSION_FLAGS = get_h5_compression_flags(compression_level=int(compression_level))
 
 
 def _read_t_offset(filehandle: h5py.File) -> int:
@@ -466,6 +473,7 @@ def process_single_file(
     start_time_us: int | None,
     normalize: bool,
     output_dtype: str,
+    compression_level: int,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -479,6 +487,10 @@ def process_single_file(
         raise ValueError("accum_time must be > 0")
     if stride_time <= 0:
         raise ValueError("stride_time must be > 0")
+    if int(compression_level) < 0 or int(compression_level) > 9:
+        raise ValueError("compression_level must be in [0,9]")
+
+    _configure_h5_compression(compression_level=int(compression_level))
 
     resolved_input_height, resolved_input_width = _resolve_input_resolution(
         input_path=input_path,
@@ -530,6 +542,7 @@ def process_single_file(
             writer.h5f.attrs["accum_time_us"] = int(accum_time)
             writer.h5f.attrs["stride_time_us"] = int(stride_time)
             writer.h5f.attrs["normalize"] = int(normalize)
+            writer.h5f.attrs["compression_level"] = int(compression_level)
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
@@ -616,6 +629,7 @@ def _process_file_with_retry(
     start_time_us: int | None,
     normalize: bool,
     output_dtype: str,
+    compression_level: int,
     tmp_suffix: str,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -639,6 +653,7 @@ def _process_file_with_retry(
                 start_time_us=start_time_us,
                 normalize=normalize,
                 output_dtype=output_dtype,
+                compression_level=compression_level,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
@@ -676,6 +691,7 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         start_time_us=job["start_time_us"],
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
+        compression_level=job["compression_level"],
         tmp_suffix=job["tmp_suffix"],
     )
     return str(input_path), ok, err
@@ -737,12 +753,15 @@ def process_dataset_root(
     start_time_us: int | None,
     normalize: bool,
     output_dtype: str,
+    compression_level: int,
     recursive: bool,
     tmp_suffix: str,
     num_processes: int,
 ) -> None:
     if int(num_processes) < 1:
         raise ValueError("num_processes must be >= 1")
+    if int(compression_level) < 0 or int(compression_level) > 9:
+        raise ValueError("compression_level must be in [0,9]")
 
     normalized_suffix = normalized_output_suffix(output_suffix)
     normalized_subdir = normalized_output_subdir(output_subdir)
@@ -798,6 +817,7 @@ def process_dataset_root(
                 "start_time_us": start_time_us,
                 "normalize": normalize,
                 "output_dtype": output_dtype,
+                "compression_level": int(compression_level),
                 "tmp_suffix": tmp_suffix,
             }
         )
@@ -923,6 +943,12 @@ if __name__ == "__main__":
         default="float16",
         help="Stored dtype for voxel tensor in output HDF5.",
     )
+    parser.add_argument(
+        "--compression_level",
+        type=int,
+        default=DEFAULT_COMPRESSION_LEVEL,
+        help="Compression level in [0,9] for Blosc(gzip fallback). Higher is smaller but slower.",
+    )
     args = parser.parse_args()
 
     stride_time = args.accum_time if args.stride_time is None else args.stride_time
@@ -952,6 +978,7 @@ if __name__ == "__main__":
             start_time_us=args.start_time_us,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            compression_level=args.compression_level,
             recursive=args.recursive,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
@@ -975,6 +1002,7 @@ if __name__ == "__main__":
             start_time_us=args.start_time_us,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            compression_level=args.compression_level,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

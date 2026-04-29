@@ -106,6 +106,7 @@ def _run_1mpx(cfg: DictConfig) -> None:
         start_time_us=_optional_int(cfg.start_time_us),
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
+        compression_level=int(cfg.compression_level),
         recursive=bool(cfg.recursive),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),

@@ -4,7 +4,10 @@ import argparse
 import multiprocessing as mp
 import os
 from pathlib import Path
+import queue
 import sys
+import threading
+import time
 
 import h5py
 import hdf5plugin  # noqa: F401 (registers hdf5 plugins)
@@ -19,6 +22,7 @@ from scripts.preprocess.utils import cleanup_tmp_file, get_h5_compression_flags,
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
+_PROGRESS_QUEUE = None
 
 
 def _is_voxel_h5(path: Path) -> bool:
@@ -130,12 +134,47 @@ def _copy_attrs(src, dst) -> None:
         dst.attrs[key] = value
 
 
+def _progress_write(message: str) -> None:
+    tqdm.tqdm.write(message)
+
+
+def _init_worker_progress_queue(progress_queue) -> None:
+    global _PROGRESS_QUEUE
+    _PROGRESS_QUEUE = progress_queue
+
+
+def _emit_progress(message: str) -> None:
+    if _PROGRESS_QUEUE is None:
+        _progress_write(message)
+        return
+    try:
+        _PROGRESS_QUEUE.put(message)
+    except Exception:
+        _progress_write(message)
+
+
+def _progress_consumer_loop(progress_queue) -> None:
+    while True:
+        try:
+            message = progress_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        except (EOFError, OSError):
+            break
+
+        if message is None:
+            break
+        _progress_write(str(message))
+
+
 def _copy_dataset_slice(
     src_ds: h5py.Dataset,
     dst_ds: h5py.Dataset,
     src_start: int,
     src_end: int,
     copy_batch_size: int,
+    progress_interval_s: float = 0.0,
+    progress_context: str | None = None,
 ) -> None:
     if src_ds.ndim == 0:
         dst_ds[()] = src_ds[()]
@@ -144,12 +183,29 @@ def _copy_dataset_slice(
         return
 
     copy_batch_size = max(1, int(copy_batch_size))
+    total_rows = int(src_end - src_start)
+    copied_rows = 0
+    next_report_at = 0.0
+    if float(progress_interval_s) > 0:
+        next_report_at = time.monotonic() + float(progress_interval_s)
+
     out_pos = 0
     for s in range(int(src_start), int(src_end), copy_batch_size):
         e = min(int(src_end), s + copy_batch_size)
         data = src_ds[s:e]
         dst_ds[out_pos : out_pos + (e - s)] = data
         out_pos += (e - s)
+        copied_rows += (e - s)
+
+        if float(progress_interval_s) > 0:
+            now = time.monotonic()
+            if now >= next_report_at:
+                pct = 100.0 * (float(copied_rows) / float(max(1, total_rows)))
+                if progress_context is None:
+                    _emit_progress(f"[COPY] {copied_rows}/{total_rows} rows ({pct:.1f}%)")
+                else:
+                    _emit_progress(f"[COPY] {progress_context}: {copied_rows}/{total_rows} rows ({pct:.1f}%)")
+                next_report_at = now + float(progress_interval_s)
 
 
 def _dataset_name_allowed(dataset_name: str, metadata_mode: str) -> bool:
@@ -198,10 +254,23 @@ def _write_chunk_file(
     total_chunks: int,
     chunk_duration_s: float,
     metadata_mode: str,
+    progress_interval_s: float,
+    log_chunk_progress: bool,
 ) -> None:
     out_h5_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(out_h5_path, ".tmp")
     cleanup_tmp_file(tmp_path, context=f"start chunk write {out_h5_path}", strict=True)
+
+    chunk_size = int(src_end - src_start)
+    chunk_started_at = time.monotonic()
+    pid = os.getpid()
+    if bool(log_chunk_progress):
+        _emit_progress(
+            "[CHUNK START] "
+            f"pid={pid} "
+            f"{src_h5_path.name} chunk={chunk_index + 1}/{total_chunks} "
+            f"rows={chunk_size} out={out_h5_path.name}"
+        )
 
     with h5py.File(str(src_h5_path), "r") as src_h5:
         with h5py.File(str(tmp_path), "w") as out_h5:
@@ -268,12 +337,15 @@ def _write_chunk_file(
                 if src_ds.ndim == 0:
                     out_ds[()] = src_ds[()]
                 elif row_aligned:
+                    ds_progress_interval_s = float(progress_interval_s) if dname == "voxels" else 0.0
                     _copy_dataset_slice(
                         src_ds=src_ds,
                         dst_ds=out_ds,
                         src_start=src_start,
                         src_end=src_end,
                         copy_batch_size=copy_batch_size,
+                        progress_interval_s=ds_progress_interval_s,
+                        progress_context=f"pid={pid} {src_h5_path.name} chunk={chunk_index + 1}/{total_chunks} ds={dname}",
                     )
                 else:
                     out_ds[...] = src_ds[...]
@@ -287,6 +359,14 @@ def _write_chunk_file(
             out_h5.attrs["split_source_num_samples"] = int(n_samples)
 
     os.replace(tmp_path, out_h5_path)
+    if bool(log_chunk_progress):
+        elapsed = time.monotonic() - chunk_started_at
+        _emit_progress(
+            "[CHUNK DONE] "
+            f"pid={pid} "
+            f"{src_h5_path.name} chunk={chunk_index + 1}/{total_chunks} "
+            f"rows={chunk_size} elapsed={elapsed:.1f}s"
+        )
 
 
 def _process_one_file(
@@ -299,6 +379,8 @@ def _process_one_file(
     chunk_index_pad: int,
     overwrite: bool,
     metadata_mode: str,
+    progress_interval_s: float,
+    log_chunk_progress: bool,
 ) -> tuple[str, int, int]:
     with h5py.File(str(input_path), "r") as h5f:
         n_samples = int(h5f["voxels"].shape[0])
@@ -330,6 +412,8 @@ def _process_one_file(
             total_chunks=len(ranges),
             chunk_duration_s=float(chunk_duration_s),
             metadata_mode=metadata_mode,
+            progress_interval_s=float(progress_interval_s),
+            log_chunk_progress=bool(log_chunk_progress),
         )
         done += 1
 
@@ -349,6 +433,8 @@ def _worker(job: dict) -> tuple[str, bool, str | None, int, int]:
             chunk_index_pad=int(job["chunk_index_pad"]),
             overwrite=bool(job["overwrite"]),
             metadata_mode=str(job["metadata_mode"]),
+            progress_interval_s=float(job["progress_interval_s"]),
+            log_chunk_progress=bool(job["log_chunk_progress"]),
         )
         return file_path, True, None, n_samples, n_written
     except Exception as exc:
@@ -388,6 +474,18 @@ def main() -> None:
         default="full",
         help="full: copy all datasets. minimal: copy voxels and essential timing datasets only.",
     )
+    parser.add_argument(
+        "--progress_interval_s",
+        type=float,
+        default=0.0,
+        help="If >0, print row-copy progress every N seconds during dataset slicing.",
+    )
+    parser.add_argument(
+        "--log_chunk_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print chunk start/end logs (useful to see activity when each chunk is slow).",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing split files.")
     parser.add_argument("--num_processes", type=int, default=1, help="Parallel workers.")
     args = parser.parse_args()
@@ -400,6 +498,8 @@ def main() -> None:
         raise ValueError("--min_windows_per_chunk must be >= 1")
     if int(args.copy_batch_size) < 1:
         raise ValueError("--copy_batch_size must be >= 1")
+    if float(args.progress_interval_s) < 0:
+        raise ValueError("--progress_interval_s must be >= 0")
 
     input_files = _select_input_files(
         input_path=args.input_path,
@@ -429,6 +529,8 @@ def main() -> None:
                 "chunk_index_pad": int(args.chunk_index_pad),
                 "overwrite": bool(args.overwrite),
                 "metadata_mode": str(args.metadata_mode),
+                "progress_interval_s": float(args.progress_interval_s),
+                "log_chunk_progress": bool(args.log_chunk_progress),
             }
         )
 
@@ -436,13 +538,29 @@ def main() -> None:
     num_fail = 0
     total_input_samples = 0
     total_output_files = 0
+    progress_queue = None
+    progress_thread: threading.Thread | None = None
 
     if int(args.num_processes) == 1:
         iterator = (_worker(job) for job in jobs)
         pbar = tqdm.tqdm(iterator, total=len(jobs), desc="split voxel h5")
     else:
         ctx = mp.get_context("spawn")
-        pool = ctx.Pool(processes=int(args.num_processes))
+        progress_enabled = bool(args.log_chunk_progress or float(args.progress_interval_s) > 0)
+        if progress_enabled:
+            progress_queue = ctx.Queue()
+            progress_thread = threading.Thread(
+                target=_progress_consumer_loop,
+                args=(progress_queue,),
+                daemon=True,
+            )
+            progress_thread.start()
+
+        pool = ctx.Pool(
+            processes=int(args.num_processes),
+            initializer=_init_worker_progress_queue,
+            initargs=(progress_queue,),
+        )
         pbar = tqdm.tqdm(pool.imap_unordered(_worker, jobs), total=len(jobs), desc="split voxel h5")
 
     try:
@@ -458,6 +576,10 @@ def main() -> None:
         if int(args.num_processes) > 1:
             pool.close()
             pool.join()
+        if progress_queue is not None:
+            progress_queue.put(None)
+        if progress_thread is not None:
+            progress_thread.join()
 
     print(
         "[SUMMARY] "

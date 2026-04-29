@@ -184,6 +184,21 @@ python3 scripts/preprocess/split_voxel_h5_by_duration.py \
   --copy_batch_size 8
 ```
 
+copy中の進捗ログを見たい場合（N秒ごとに表示）:
+
+```bash
+python3 scripts/preprocess/split_voxel_h5_by_duration.py \
+  --dataset_root /data/m3ed_voxels_semantic \
+  --output_root /data/m3ed_voxels_semantic_20s \
+  --chunk_duration_s 20 \
+  --num_processes 1 \
+  --copy_batch_size 8 \
+  --progress_interval_s 10 \
+  --log_chunk_progress
+```
+
+`num_processes>1` の場合でもログは親プロセスで集約表示され、worker間で混線しにくい形式になります。
+
 DSEC + semantic 同期済みなどで高速化したい場合:
 
 ```bash

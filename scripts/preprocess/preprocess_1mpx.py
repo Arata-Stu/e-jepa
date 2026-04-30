@@ -156,7 +156,19 @@ def _extract_events_by_time(
 
     if ev_end_idx <= ev_start_idx:
         return _empty_events()
-    return _extract_from_h5_by_index(filehandle=filehandle, ev_start_idx=ev_start_idx, ev_end_idx=ev_end_idx)
+
+    # Fast path: avoid reading events/t twice.
+    # We already loaded coarse t range above; reuse relative bounds for x/y/p/t slices.
+    events = filehandle["events"]
+    x_coarse = np.asarray(events["x"][coarse_start:coarse_end])
+    y_coarse = np.asarray(events["y"][coarse_start:coarse_end])
+    p_coarse = np.asarray(events["p"][coarse_start:coarse_end])
+    return {
+        "x": x_coarse[rel_start:rel_end],
+        "y": y_coarse[rel_start:rel_end],
+        "p": p_coarse[rel_start:rel_end],
+        "t": t_coarse_abs[rel_start:rel_end],
+    }
 
 
 def _resolve_input_resolution(input_path: Path, input_height: int | None, input_width: int | None) -> tuple[int, int]:
@@ -484,6 +496,9 @@ def process_single_file(
     compression_level: int,
     use_trilinear: bool,
     writer_capacity_growth: str,
+    rdcc_nbytes: int,
+    rdcc_nslots: int,
+    rdcc_w0: float,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -501,6 +516,12 @@ def process_single_file(
         raise ValueError("compression_level must be in [0,9]")
     if writer_capacity_growth not in {"double", "exact"}:
         raise ValueError("writer_capacity_growth must be 'double' or 'exact'")
+    if int(rdcc_nbytes) <= 0:
+        raise ValueError("rdcc_nbytes must be > 0")
+    if int(rdcc_nslots) <= 0:
+        raise ValueError("rdcc_nslots must be > 0")
+    if float(rdcc_w0) < 0.0 or float(rdcc_w0) > 1.0:
+        raise ValueError("rdcc_w0 must be in [0,1]")
 
     _configure_h5_compression(compression_level=int(compression_level))
 
@@ -526,7 +547,13 @@ def process_single_file(
     writer = None
     pbar = None
     try:
-        with h5py.File(str(input_path), "r") as h5f:
+        with h5py.File(
+            str(input_path),
+            "r",
+            rdcc_nbytes=int(rdcc_nbytes),
+            rdcc_nslots=int(rdcc_nslots),
+            rdcc_w0=float(rdcc_w0),
+        ) as h5f:
             t_first, t_last_exclusive = _get_time_bounds_us(h5f)
             ms_to_idx = _load_ms_to_idx(h5f)
 
@@ -558,6 +585,9 @@ def process_single_file(
             writer.h5f.attrs["compression_level"] = int(compression_level)
             writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
             writer.h5f.attrs["writer_capacity_growth"] = str(writer_capacity_growth)
+            writer.h5f.attrs["rdcc_nbytes"] = int(rdcc_nbytes)
+            writer.h5f.attrs["rdcc_nslots"] = int(rdcc_nslots)
+            writer.h5f.attrs["rdcc_w0"] = float(rdcc_w0)
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
@@ -648,6 +678,9 @@ def _process_file_with_retry(
     compression_level: int,
     use_trilinear: bool,
     writer_capacity_growth: str,
+    rdcc_nbytes: int,
+    rdcc_nslots: int,
+    rdcc_w0: float,
     tmp_suffix: str,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -674,6 +707,9 @@ def _process_file_with_retry(
                 compression_level=compression_level,
                 use_trilinear=use_trilinear,
                 writer_capacity_growth=writer_capacity_growth,
+                rdcc_nbytes=rdcc_nbytes,
+                rdcc_nslots=rdcc_nslots,
+                rdcc_w0=rdcc_w0,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
@@ -714,6 +750,9 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         compression_level=job["compression_level"],
         use_trilinear=job["use_trilinear"],
         writer_capacity_growth=job["writer_capacity_growth"],
+        rdcc_nbytes=job["rdcc_nbytes"],
+        rdcc_nslots=job["rdcc_nslots"],
+        rdcc_w0=job["rdcc_w0"],
         tmp_suffix=job["tmp_suffix"],
     )
     return str(input_path), ok, err
@@ -778,6 +817,9 @@ def process_dataset_root(
     compression_level: int,
     use_trilinear: bool,
     writer_capacity_growth: str,
+    rdcc_nbytes: int,
+    rdcc_nslots: int,
+    rdcc_w0: float,
     recursive: bool,
     tmp_suffix: str,
     num_processes: int,
@@ -788,6 +830,12 @@ def process_dataset_root(
         raise ValueError("compression_level must be in [0,9]")
     if writer_capacity_growth not in {"double", "exact"}:
         raise ValueError("writer_capacity_growth must be 'double' or 'exact'")
+    if int(rdcc_nbytes) <= 0:
+        raise ValueError("rdcc_nbytes must be > 0")
+    if int(rdcc_nslots) <= 0:
+        raise ValueError("rdcc_nslots must be > 0")
+    if float(rdcc_w0) < 0.0 or float(rdcc_w0) > 1.0:
+        raise ValueError("rdcc_w0 must be in [0,1]")
 
     normalized_suffix = normalized_output_suffix(output_suffix)
     normalized_subdir = normalized_output_subdir(output_subdir)
@@ -846,6 +894,9 @@ def process_dataset_root(
                 "compression_level": int(compression_level),
                 "use_trilinear": bool(use_trilinear),
                 "writer_capacity_growth": str(writer_capacity_growth),
+                "rdcc_nbytes": int(rdcc_nbytes),
+                "rdcc_nslots": int(rdcc_nslots),
+                "rdcc_w0": float(rdcc_w0),
                 "tmp_suffix": tmp_suffix,
             }
         )
@@ -989,6 +1040,24 @@ if __name__ == "__main__":
         default="double",
         help="Dataset capacity growth policy while writing windows.",
     )
+    parser.add_argument(
+        "--rdcc_nbytes",
+        type=int,
+        default=256 * 1024 * 1024,
+        help="HDF5 raw chunk cache bytes for input reads.",
+    )
+    parser.add_argument(
+        "--rdcc_nslots",
+        type=int,
+        default=1000003,
+        help="HDF5 raw chunk cache slots for input reads (use a large prime).",
+    )
+    parser.add_argument(
+        "--rdcc_w0",
+        type=float,
+        default=0.25,
+        help="HDF5 raw chunk cache preemption policy [0,1].",
+    )
     args = parser.parse_args()
 
     stride_time = args.accum_time if args.stride_time is None else args.stride_time
@@ -1021,6 +1090,9 @@ if __name__ == "__main__":
             compression_level=args.compression_level,
             use_trilinear=args.use_trilinear,
             writer_capacity_growth=args.writer_capacity_growth,
+            rdcc_nbytes=args.rdcc_nbytes,
+            rdcc_nslots=args.rdcc_nslots,
+            rdcc_w0=args.rdcc_w0,
             recursive=args.recursive,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
@@ -1047,6 +1119,9 @@ if __name__ == "__main__":
             compression_level=args.compression_level,
             use_trilinear=args.use_trilinear,
             writer_capacity_growth=args.writer_capacity_growth,
+            rdcc_nbytes=args.rdcc_nbytes,
+            rdcc_nslots=args.rdcc_nslots,
+            rdcc_w0=args.rdcc_w0,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

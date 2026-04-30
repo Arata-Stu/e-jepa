@@ -26,5 +26,8 @@ output_dtype: float16
 compression_level: 1
 use_trilinear: true
 writer_capacity_growth: double
+rdcc_nbytes: 268435456
+rdcc_nslots: 1000003
+rdcc_w0: 0.25
 tmp_suffix: .tmp
 num_processes: 1

@@ -181,6 +181,9 @@ def main() -> None:
     parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output_dtype", choices=["float16", "float32"], default="float16")
     parser.add_argument("--tmp_suffix", type=str, default=".tmp")
+    parser.add_argument("--rdcc_nbytes", type=int, default=256 * 1024 * 1024)
+    parser.add_argument("--rdcc_nslots", type=int, default=1000003)
+    parser.add_argument("--rdcc_w0", type=float, default=0.25)
     parser.add_argument(
         "--copy_batch_size",
         type=int,
@@ -294,6 +297,9 @@ def main() -> None:
                             compression_level=int(level),
                             use_trilinear=bool(use_trilinear),
                             writer_capacity_growth=str(writer_growth),
+                            rdcc_nbytes=int(args.rdcc_nbytes),
+                            rdcc_nslots=int(args.rdcc_nslots),
+                            rdcc_w0=float(args.rdcc_w0),
                             show_progress=bool(args.show_progress),
                             tmp_suffix=str(args.tmp_suffix),
                         )

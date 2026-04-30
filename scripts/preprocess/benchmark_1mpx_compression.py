@@ -5,6 +5,7 @@ import csv
 import random
 import sys
 from pathlib import Path
+import os
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +53,73 @@ def _bytes_to_mib(value: int) -> float:
     return float(value) / (1024.0 ** 2)
 
 
+def _copy_attrs(src_obj, dst_obj) -> None:
+    for key, value in src_obj.attrs.items():
+        dst_obj.attrs[key] = value
+
+
+def _tmp_output_path(output_path: Path, tmp_suffix: str) -> Path:
+    return output_path.with_name(f"{output_path.name}{tmp_suffix}")
+
+
+def _repack_voxel_h5_with_compression(
+    src_path: Path,
+    dst_path: Path,
+    compression_level: int,
+    copy_batch_size: int,
+    tmp_suffix: str,
+) -> None:
+    import h5py
+    from scripts.preprocess.utils import get_h5_compression_flags
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _tmp_output_path(dst_path, tmp_suffix=tmp_suffix)
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    flags = get_h5_compression_flags(compression_level=int(compression_level))
+    if copy_batch_size < 1:
+        copy_batch_size = 1
+
+    with h5py.File(str(src_path), "r") as src_h5, h5py.File(str(tmp_path), "w") as dst_h5:
+        _copy_attrs(src_h5, dst_h5)
+
+        for key in src_h5.keys():
+            if key != "voxels":
+                src_h5.copy(key, dst_h5)
+
+        if "voxels" not in src_h5:
+            raise KeyError(f"'voxels' dataset not found in {src_path}")
+
+        src_voxels = src_h5["voxels"]
+        chunks = src_voxels.chunks if src_voxels.chunks is not None else True
+        dst_voxels = dst_h5.create_dataset(
+            "voxels",
+            shape=src_voxels.shape,
+            dtype=src_voxels.dtype,
+            maxshape=src_voxels.maxshape,
+            chunks=chunks,
+            compression=flags.get("compression"),
+            compression_opts=flags.get("compression_opts"),
+        )
+        _copy_attrs(src_voxels, dst_voxels)
+
+        if src_voxels.ndim == 0:
+            dst_voxels[()] = src_voxels[()]
+        elif src_voxels.ndim == 1:
+            total = int(src_voxels.shape[0])
+            for start in range(0, total, int(copy_batch_size)):
+                end = min(start + int(copy_batch_size), total)
+                dst_voxels[start:end] = src_voxels[start:end]
+        else:
+            total = int(src_voxels.shape[0])
+            for start in range(0, total, int(copy_batch_size)):
+                end = min(start + int(copy_batch_size), total)
+                dst_voxels[start:end, ...] = src_voxels[start:end, ...]
+
+    os.replace(tmp_path, dst_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("Benchmark 1MPX preprocess output size across compression levels")
     parser.add_argument("--dataset_root", type=Path, required=True, help="Root containing split directories")
@@ -67,6 +135,15 @@ def main() -> None:
         type=int,
         default=[1, 3, 5, 7, 9],
         help="Compression levels in [0,9] to compare",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["repack", "full"],
+        default="repack",
+        help=(
+            "repack: preprocess only the first compression level then recompress voxels for other levels "
+            "(much faster). full: preprocess from raw for every level (slow)."
+        ),
     )
     parser.add_argument(
         "--output_suffix",
@@ -89,6 +166,18 @@ def main() -> None:
     parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output_dtype", choices=["float16", "float32"], default="float16")
     parser.add_argument("--tmp_suffix", type=str, default=".tmp")
+    parser.add_argument(
+        "--copy_batch_size",
+        type=int,
+        default=8,
+        help="Batch size along sample dimension while repacking voxel H5.",
+    )
+    parser.add_argument(
+        "--show_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show per-file window progress in full preprocessing mode.",
+    )
     parser.add_argument("--report_csv", type=Path, default=None, help="Optional CSV output path")
     args = parser.parse_args()
 
@@ -129,21 +218,23 @@ def main() -> None:
     results: list[dict[str, float | int]] = []
     baseline_total: int | None = None
 
+    def _level_output_path(level: int, input_path: Path) -> Path:
+        rel = input_path.relative_to(args.dataset_root)
+        out_dir = args.output_root / f"level_{level}" / rel.parent
+        output_name = ensure_scale_tag_in_filename(
+            f"{input_path.stem}{args.output_suffix}",
+            downsample_factor=int(args.downsample_factor),
+        )
+        return out_dir / output_name
+
+    base_level = int(levels[0])
+
     for level in levels:
         level_total_bytes = 0
-        level_dir = args.output_root / f"level_{level}"
-        level_dir.mkdir(parents=True, exist_ok=True)
-
         print(f"[RUN] compression_level={level}")
         for input_path in selected_files:
-            rel = input_path.relative_to(args.dataset_root)
-            out_dir = level_dir / rel.parent
-            out_dir.mkdir(parents=True, exist_ok=True)
-            output_name = ensure_scale_tag_in_filename(
-                f"{input_path.stem}{args.output_suffix}",
-                downsample_factor=int(args.downsample_factor),
-            )
-            output_path = out_dir / output_name
+            output_path = _level_output_path(level=level, input_path=input_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
 
             if output_path.exists() and not bool(args.overwrite):
                 size_bytes = output_path.stat().st_size
@@ -151,25 +242,41 @@ def main() -> None:
                 print(f"  [SKIP] {output_path} ({_bytes_to_mib(size_bytes):.2f} MiB)")
                 continue
 
-            process_single_file(
-                input_path=input_path,
-                output_path=output_path,
-                input_height=int(args.input_height),
-                input_width=int(args.input_width),
-                output_height=int(args.output_height),
-                output_width=int(args.output_width),
-                downsample_factor=int(args.downsample_factor),
-                t_bins=int(args.t_bins),
-                split_polarity=bool(args.split_polarity),
-                accum_time=int(args.accum_time),
-                stride_time=int(stride_time),
-                start_time_us=None if args.start_time_us is None else int(args.start_time_us),
-                normalize=bool(args.normalize),
-                output_dtype=str(args.output_dtype),
-                compression_level=int(level),
-                show_progress=False,
-                tmp_suffix=str(args.tmp_suffix),
-            )
+            print(f"  [START] {input_path.name}")
+            if str(args.mode) == "full" or level == base_level:
+                process_single_file(
+                    input_path=input_path,
+                    output_path=output_path,
+                    input_height=int(args.input_height),
+                    input_width=int(args.input_width),
+                    output_height=int(args.output_height),
+                    output_width=int(args.output_width),
+                    downsample_factor=int(args.downsample_factor),
+                    t_bins=int(args.t_bins),
+                    split_polarity=bool(args.split_polarity),
+                    accum_time=int(args.accum_time),
+                    stride_time=int(stride_time),
+                    start_time_us=None if args.start_time_us is None else int(args.start_time_us),
+                    normalize=bool(args.normalize),
+                    output_dtype=str(args.output_dtype),
+                    compression_level=int(level),
+                    show_progress=bool(args.show_progress),
+                    tmp_suffix=str(args.tmp_suffix),
+                )
+            else:
+                base_output = _level_output_path(level=base_level, input_path=input_path)
+                if not base_output.exists():
+                    raise FileNotFoundError(
+                        "base level output missing for repack mode: "
+                        f"expected {base_output}. Run with --overwrite or keep base level outputs."
+                    )
+                _repack_voxel_h5_with_compression(
+                    src_path=base_output,
+                    dst_path=output_path,
+                    compression_level=int(level),
+                    copy_batch_size=int(args.copy_batch_size),
+                    tmp_suffix=str(args.tmp_suffix),
+                )
 
             size_bytes = output_path.stat().st_size
             level_total_bytes += size_bytes

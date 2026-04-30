@@ -6,6 +6,7 @@ import random
 import sys
 from pathlib import Path
 import os
+import time
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -137,6 +138,20 @@ def main() -> None:
         help="Compression levels in [0,9] to compare",
     )
     parser.add_argument(
+        "--trilinear_options",
+        nargs="+",
+        choices=["on", "off"],
+        default=["on"],
+        help="Compare trilinear interpolation on/off.",
+    )
+    parser.add_argument(
+        "--writer_capacity_growth_options",
+        nargs="+",
+        choices=["double", "exact"],
+        default=["double"],
+        help="Compare writer capacity growth policy.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["repack", "full"],
         default="repack",
@@ -216,11 +231,12 @@ def main() -> None:
         print(f"  - {path}")
 
     results: list[dict[str, float | int]] = []
-    baseline_total: int | None = None
 
-    def _level_output_path(level: int, input_path: Path) -> Path:
+    def _level_output_path(level: int, use_trilinear: bool, writer_growth: str, input_path: Path) -> Path:
         rel = input_path.relative_to(args.dataset_root)
-        out_dir = args.output_root / f"level_{level}" / rel.parent
+        tri_tag = "tri_on" if use_trilinear else "tri_off"
+        grow_tag = f"grow_{writer_growth}"
+        out_dir = args.output_root / tri_tag / grow_tag / f"level_{level}" / rel.parent
         output_name = ensure_scale_tag_in_filename(
             f"{input_path.stem}{args.output_suffix}",
             downsample_factor=int(args.downsample_factor),
@@ -228,92 +244,134 @@ def main() -> None:
         return out_dir / output_name
 
     base_level = int(levels[0])
+    trilinear_options = [opt == "on" for opt in args.trilinear_options]
+    writer_growth_options = [str(opt) for opt in args.writer_capacity_growth_options]
 
-    for level in levels:
-        level_total_bytes = 0
-        print(f"[RUN] compression_level={level}")
-        for input_path in selected_files:
-            output_path = _level_output_path(level=level, input_path=input_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if output_path.exists() and not bool(args.overwrite):
-                size_bytes = output_path.stat().st_size
-                level_total_bytes += size_bytes
-                print(f"  [SKIP] {output_path} ({_bytes_to_mib(size_bytes):.2f} MiB)")
-                continue
-
-            print(f"  [START] {input_path.name}")
-            if str(args.mode) == "full" or level == base_level:
-                process_single_file(
-                    input_path=input_path,
-                    output_path=output_path,
-                    input_height=int(args.input_height),
-                    input_width=int(args.input_width),
-                    output_height=int(args.output_height),
-                    output_width=int(args.output_width),
-                    downsample_factor=int(args.downsample_factor),
-                    t_bins=int(args.t_bins),
-                    split_polarity=bool(args.split_polarity),
-                    accum_time=int(args.accum_time),
-                    stride_time=int(stride_time),
-                    start_time_us=None if args.start_time_us is None else int(args.start_time_us),
-                    normalize=bool(args.normalize),
-                    output_dtype=str(args.output_dtype),
-                    compression_level=int(level),
-                    show_progress=bool(args.show_progress),
-                    tmp_suffix=str(args.tmp_suffix),
-                )
-            else:
-                base_output = _level_output_path(level=base_level, input_path=input_path)
-                if not base_output.exists():
-                    raise FileNotFoundError(
-                        "base level output missing for repack mode: "
-                        f"expected {base_output}. Run with --overwrite or keep base level outputs."
+    for use_trilinear in trilinear_options:
+        for writer_growth in writer_growth_options:
+            variant_baseline_total: int | None = None
+            print(
+                f"[VARIANT] trilinear={'on' if use_trilinear else 'off'} | "
+                f"writer_capacity_growth={writer_growth}"
+            )
+            for level in levels:
+                level_total_bytes = 0
+                level_total_seconds = 0.0
+                print(f"[RUN] compression_level={level}")
+                for input_path in selected_files:
+                    output_path = _level_output_path(
+                        level=level,
+                        use_trilinear=use_trilinear,
+                        writer_growth=writer_growth,
+                        input_path=input_path,
                     )
-                _repack_voxel_h5_with_compression(
-                    src_path=base_output,
-                    dst_path=output_path,
-                    compression_level=int(level),
-                    copy_batch_size=int(args.copy_batch_size),
-                    tmp_suffix=str(args.tmp_suffix),
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    if output_path.exists() and not bool(args.overwrite):
+                        size_bytes = output_path.stat().st_size
+                        level_total_bytes += size_bytes
+                        print(f"  [SKIP] {output_path} ({_bytes_to_mib(size_bytes):.2f} MiB)")
+                        continue
+
+                    print(f"  [START] {input_path.name}")
+                    tic = time.perf_counter()
+                    if str(args.mode) == "full" or level == base_level:
+                        process_single_file(
+                            input_path=input_path,
+                            output_path=output_path,
+                            input_height=int(args.input_height),
+                            input_width=int(args.input_width),
+                            output_height=int(args.output_height),
+                            output_width=int(args.output_width),
+                            downsample_factor=int(args.downsample_factor),
+                            t_bins=int(args.t_bins),
+                            split_polarity=bool(args.split_polarity),
+                            accum_time=int(args.accum_time),
+                            stride_time=int(stride_time),
+                            start_time_us=None if args.start_time_us is None else int(args.start_time_us),
+                            normalize=bool(args.normalize),
+                            output_dtype=str(args.output_dtype),
+                            compression_level=int(level),
+                            use_trilinear=bool(use_trilinear),
+                            writer_capacity_growth=str(writer_growth),
+                            show_progress=bool(args.show_progress),
+                            tmp_suffix=str(args.tmp_suffix),
+                        )
+                    else:
+                        base_output = _level_output_path(
+                            level=base_level,
+                            use_trilinear=use_trilinear,
+                            writer_growth=writer_growth,
+                            input_path=input_path,
+                        )
+                        if not base_output.exists():
+                            raise FileNotFoundError(
+                                "base level output missing for repack mode: "
+                                f"expected {base_output}. Run with --overwrite or keep base level outputs."
+                            )
+                        _repack_voxel_h5_with_compression(
+                            src_path=base_output,
+                            dst_path=output_path,
+                            compression_level=int(level),
+                            copy_batch_size=int(args.copy_batch_size),
+                            tmp_suffix=str(args.tmp_suffix),
+                        )
+                    toc = time.perf_counter()
+                    level_total_seconds += float(toc - tic)
+
+                    size_bytes = output_path.stat().st_size
+                    level_total_bytes += size_bytes
+                    print(
+                        f"  [OK] {output_path} ({_bytes_to_mib(size_bytes):.2f} MiB, "
+                        f"{float(toc - tic):.2f}s)"
+                    )
+
+                if variant_baseline_total is None:
+                    variant_baseline_total = level_total_bytes
+                ratio = (
+                    float(level_total_bytes) / float(variant_baseline_total)
+                    if variant_baseline_total > 0
+                    else 1.0
                 )
-
-            size_bytes = output_path.stat().st_size
-            level_total_bytes += size_bytes
-            print(f"  [OK] {output_path} ({_bytes_to_mib(size_bytes):.2f} MiB)")
-
-        if baseline_total is None:
-            baseline_total = level_total_bytes
-        ratio = (float(level_total_bytes) / float(baseline_total)) if baseline_total > 0 else 1.0
-        results.append(
-            {
-                "compression_level": int(level),
-                "num_files": int(len(selected_files)),
-                "total_bytes": int(level_total_bytes),
-                "total_gib": _bytes_to_gib(level_total_bytes),
-                "avg_mib_per_file": _bytes_to_mib(level_total_bytes) / max(len(selected_files), 1),
-                "ratio_vs_first_level": ratio,
-            }
-        )
+                results.append(
+                    {
+                        "trilinear": int(use_trilinear),
+                        "writer_capacity_growth": writer_growth,
+                        "compression_level": int(level),
+                        "num_files": int(len(selected_files)),
+                        "total_bytes": int(level_total_bytes),
+                        "total_gib": _bytes_to_gib(level_total_bytes),
+                        "avg_mib_per_file": _bytes_to_mib(level_total_bytes) / max(len(selected_files), 1),
+                        "ratio_vs_first_level": ratio,
+                        "total_elapsed_s": level_total_seconds,
+                        "avg_elapsed_s_per_file": level_total_seconds / max(len(selected_files), 1),
+                    }
+                )
 
     print("\n[SUMMARY]")
-    print("level | files | total_GiB | avg_MiB/file | ratio_vs_first_level")
+    print("tri | grow | level | files | total_GiB | avg_MiB/file | total_s | avg_s/file | ratio_vs_first_level")
     for row in results:
         print(
+            f"{int(row['trilinear']):>3} | {str(row['writer_capacity_growth']):>6} | "
             f"{row['compression_level']:>5} | {row['num_files']:>5} | "
             f"{row['total_gib']:>9.3f} | {row['avg_mib_per_file']:>12.2f} | "
+            f"{row['total_elapsed_s']:>7.1f} | {row['avg_elapsed_s_per_file']:>10.1f} | "
             f"{row['ratio_vs_first_level']:.3f}"
         )
 
     if args.report_csv is not None:
         args.report_csv.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
+            "trilinear",
+            "writer_capacity_growth",
             "compression_level",
             "num_files",
             "total_bytes",
             "total_gib",
             "avg_mib_per_file",
             "ratio_vs_first_level",
+            "total_elapsed_s",
+            "avg_elapsed_s_per_file",
         ]
         with open(args.report_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)

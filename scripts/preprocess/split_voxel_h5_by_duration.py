@@ -115,17 +115,25 @@ def _dataset_create_kwargs(src_ds: h5py.Dataset, out_shape: tuple[int, ...]) -> 
         return {}
 
     kwargs: dict = {}
+    vlen_dtype = h5py.check_dtype(vlen=src_ds.dtype)
+    is_ref_dtype = h5py.check_dtype(ref=src_ds.dtype) is not None
+    is_string_like = src_ds.dtype.kind in {"S", "U", "O"} or vlen_dtype is not None
+    dtype_allows_filter = (not is_string_like) and (not is_ref_dtype)
+
     if src_ds.ndim > 0 and src_ds.shape[0] > 0:
-        if src_ds.chunks is not None:
+        if src_ds.chunks is not None and not is_string_like:
             chunks = list(src_ds.chunks)
             chunks[0] = min(max(1, chunks[0]), max(1, out_shape[0]))
             for i in range(1, min(len(chunks), len(out_shape))):
                 chunks[i] = min(max(1, chunks[i]), max(1, out_shape[i]))
             kwargs["chunks"] = tuple(chunks[: len(out_shape)])
-        else:
+        elif not is_string_like:
             kwargs["chunks"] = True
 
-    kwargs.update(H5_COMPRESSION_FLAGS)
+    # Keep compression on heavy numeric tensors, but avoid applying plugin filters
+    # to variable-length/object/string/reference dtypes to prevent HDF5 plugin crashes.
+    if dtype_allows_filter and src_ds.name.endswith("/voxels"):
+        kwargs.update(H5_COMPRESSION_FLAGS)
     return kwargs
 
 

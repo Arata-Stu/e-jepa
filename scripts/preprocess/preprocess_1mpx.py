@@ -313,6 +313,7 @@ class VoxelH5Writer:
         width: int,
         voxel_dtype: np.dtype,
         initial_capacity: int = 256,
+        capacity_growth: str = "double",
     ):
         if outfile.exists():
             raise FileExistsError(f"output already exists: {outfile}")
@@ -320,6 +321,9 @@ class VoxelH5Writer:
         self.h5f = h5py.File(str(outfile), "a")
         self._finalizer = weakref.finalize(self, self.close_callback, self.h5f)
         self._capacity = int(initial_capacity)
+        if capacity_growth not in {"double", "exact"}:
+            raise ValueError("capacity_growth must be 'double' or 'exact'")
+        self._capacity_growth = str(capacity_growth)
         self._num_windows = 0
         self._datasets = (
             "voxels",
@@ -415,9 +419,13 @@ class VoxelH5Writer:
     def _ensure_capacity(self, needed: int):
         if needed <= self._capacity:
             return
-        new_capacity = self._capacity
-        while new_capacity < needed:
-            new_capacity *= 2
+        if self._capacity_growth == "double":
+            new_capacity = self._capacity
+            while new_capacity < needed:
+                new_capacity *= 2
+        else:
+            # Compare mode: resize only to exact required size (no geometric growth).
+            new_capacity = needed
         for dset_name in self._datasets:
             self.h5f[dset_name].resize(new_capacity, axis=0)
         self._capacity = new_capacity
@@ -474,6 +482,8 @@ def process_single_file(
     normalize: bool,
     output_dtype: str,
     compression_level: int,
+    use_trilinear: bool,
+    writer_capacity_growth: str,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -489,6 +499,8 @@ def process_single_file(
         raise ValueError("stride_time must be > 0")
     if int(compression_level) < 0 or int(compression_level) > 9:
         raise ValueError("compression_level must be in [0,9]")
+    if writer_capacity_growth not in {"double", "exact"}:
+        raise ValueError("writer_capacity_growth must be 'double' or 'exact'")
 
     _configure_h5_compression(compression_level=int(compression_level))
 
@@ -524,6 +536,7 @@ def process_single_file(
                 height=effective_output_height,
                 width=effective_output_width,
                 voxel_dtype=voxel_dtype,
+                capacity_growth=writer_capacity_growth,
             )
             writer.h5f.attrs["representation"] = "event_voxel_grid_1mpx"
             writer.h5f.attrs["source_file"] = str(input_path)
@@ -543,6 +556,8 @@ def process_single_file(
             writer.h5f.attrs["stride_time_us"] = int(stride_time)
             writer.h5f.attrs["normalize"] = int(normalize)
             writer.h5f.attrs["compression_level"] = int(compression_level)
+            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+            writer.h5f.attrs["writer_capacity_growth"] = str(writer_capacity_growth)
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
@@ -567,6 +582,7 @@ def process_single_file(
                 input_size=(t_bins, effective_output_height, effective_output_width),
                 normalize=normalize,
                 separate_polarity=split_polarity,
+                trilinear_interpolation=use_trilinear,
             )
             if show_progress:
                 pbar = tqdm.tqdm(total=len(windows), desc=input_path.name, leave=False)
@@ -630,6 +646,8 @@ def _process_file_with_retry(
     normalize: bool,
     output_dtype: str,
     compression_level: int,
+    use_trilinear: bool,
+    writer_capacity_growth: str,
     tmp_suffix: str,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -654,6 +672,8 @@ def _process_file_with_retry(
                 normalize=normalize,
                 output_dtype=output_dtype,
                 compression_level=compression_level,
+                use_trilinear=use_trilinear,
+                writer_capacity_growth=writer_capacity_growth,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
@@ -692,6 +712,8 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
         compression_level=job["compression_level"],
+        use_trilinear=job["use_trilinear"],
+        writer_capacity_growth=job["writer_capacity_growth"],
         tmp_suffix=job["tmp_suffix"],
     )
     return str(input_path), ok, err
@@ -754,6 +776,8 @@ def process_dataset_root(
     normalize: bool,
     output_dtype: str,
     compression_level: int,
+    use_trilinear: bool,
+    writer_capacity_growth: str,
     recursive: bool,
     tmp_suffix: str,
     num_processes: int,
@@ -762,6 +786,8 @@ def process_dataset_root(
         raise ValueError("num_processes must be >= 1")
     if int(compression_level) < 0 or int(compression_level) > 9:
         raise ValueError("compression_level must be in [0,9]")
+    if writer_capacity_growth not in {"double", "exact"}:
+        raise ValueError("writer_capacity_growth must be 'double' or 'exact'")
 
     normalized_suffix = normalized_output_suffix(output_suffix)
     normalized_subdir = normalized_output_subdir(output_subdir)
@@ -818,6 +844,8 @@ def process_dataset_root(
                 "normalize": normalize,
                 "output_dtype": output_dtype,
                 "compression_level": int(compression_level),
+                "use_trilinear": bool(use_trilinear),
+                "writer_capacity_growth": str(writer_capacity_growth),
                 "tmp_suffix": tmp_suffix,
             }
         )
@@ -949,6 +977,18 @@ if __name__ == "__main__":
         default=DEFAULT_COMPRESSION_LEVEL,
         help="Compression level in [0,9] for Blosc(gzip fallback). Higher is smaller but slower.",
     )
+    parser.add_argument(
+        "--use_trilinear",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use trilinear interpolation in voxelization (disable for nearest-bin assignment).",
+    )
+    parser.add_argument(
+        "--writer_capacity_growth",
+        choices=["double", "exact"],
+        default="double",
+        help="Dataset capacity growth policy while writing windows.",
+    )
     args = parser.parse_args()
 
     stride_time = args.accum_time if args.stride_time is None else args.stride_time
@@ -979,6 +1019,8 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             compression_level=args.compression_level,
+            use_trilinear=args.use_trilinear,
+            writer_capacity_growth=args.writer_capacity_growth,
             recursive=args.recursive,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
@@ -1003,6 +1045,8 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             compression_level=args.compression_level,
+            use_trilinear=args.use_trilinear,
+            writer_capacity_growth=args.writer_capacity_growth,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

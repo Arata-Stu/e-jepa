@@ -7,6 +7,14 @@ import sys
 import weakref
 from pathlib import Path
 
+# Keep CPU math libraries single-threaded per worker process.
+# This avoids heavy oversubscription when preprocessing with multiprocessing.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import h5py
 import numpy as np
 import torch
@@ -30,6 +38,7 @@ from scripts.preprocess.utils import (
 
 DEFAULT_COMPRESSION_LEVEL = 1
 H5_COMPRESSION_FLAGS = get_h5_compression_flags(compression_level=DEFAULT_COMPRESSION_LEVEL)
+MS_TO_IDX_BUILD_CHUNK_EVENTS = 5_000_000
 
 
 def _configure_h5_compression(compression_level: int) -> None:
@@ -101,12 +110,18 @@ def _coarse_bounds_from_ms_to_idx(
     num_events: int,
     start_us: int,
     end_us: int,
+    time_offset_us: int = 0,
 ) -> tuple[int, int]:
     if ms_to_idx is None or ms_to_idx.size == 0:
         return 0, num_events
 
-    start_ms = max(int(start_us // 1000), 0)
-    end_ms_exclusive = max(int((end_us + 999) // 1000), start_ms + 1)
+    rel_start_us = int(start_us) - int(time_offset_us)
+    rel_end_us = int(end_us) - int(time_offset_us)
+    if rel_end_us <= 0:
+        return 0, 0
+
+    start_ms = max(int(rel_start_us // 1000), 0)
+    end_ms_exclusive = max(int((rel_end_us + 999) // 1000), start_ms + 1)
 
     start_ms = min(start_ms, ms_to_idx.size - 1)
     start_idx = int(ms_to_idx[start_ms])
@@ -119,6 +134,35 @@ def _coarse_bounds_from_ms_to_idx(
     start_idx = max(0, min(start_idx, num_events))
     end_idx = max(0, min(end_idx, num_events))
     return start_idx, end_idx
+
+
+def _build_ms_to_idx_from_events_t(
+    filehandle: h5py.File,
+    chunk_events: int = MS_TO_IDX_BUILD_CHUNK_EVENTS,
+) -> np.ndarray:
+    t_ds = filehandle["events/t"]
+    num_events = len(t_ds)
+    if num_events == 0:
+        return np.zeros((0,), dtype="uint64")
+
+    max_t_us = int(t_ds[num_events - 1])
+    max_ms = int(max_t_us // 1000)
+    counts_per_ms = np.zeros((max_ms + 1,), dtype=np.uint64)
+    step = max(1, int(chunk_events))
+
+    for start in range(0, num_events, step):
+        end = min(start + step, num_events)
+        t_chunk = np.asarray(t_ds[start:end], dtype=np.int64)
+        if t_chunk.size == 0:
+            continue
+        ms_chunk = (t_chunk // 1000).astype(np.int64, copy=False)
+        unique_ms, unique_counts = np.unique(ms_chunk, return_counts=True)
+        counts_per_ms[unique_ms] += unique_counts.astype(np.uint64, copy=False)
+
+    ms_to_idx = np.zeros((max_ms + 2,), dtype=np.uint64)
+    ms_to_idx[1:] = counts_per_ms
+    ms_to_idx = ms_to_idx[:-1].cumsum()
+    return ms_to_idx
 
 
 def _extract_events_by_time(
@@ -135,16 +179,17 @@ def _extract_events_by_time(
     if num_events == 0:
         return _empty_events()
 
+    t_offset = _read_t_offset(filehandle)
     coarse_start, coarse_end = _coarse_bounds_from_ms_to_idx(
         ms_to_idx=ms_to_idx,
         num_events=num_events,
         start_us=start_us,
         end_us=end_us,
+        time_offset_us=t_offset,
     )
     if coarse_end <= coarse_start:
         return _empty_events()
 
-    t_offset = _read_t_offset(filehandle)
     t_coarse_abs = t_ds[coarse_start:coarse_end].astype(np.int64) + t_offset
     if t_coarse_abs.size == 0:
         return _empty_events()
@@ -556,6 +601,13 @@ def process_single_file(
         ) as h5f:
             t_first, t_last_exclusive = _get_time_bounds_us(h5f)
             ms_to_idx = _load_ms_to_idx(h5f)
+            ms_to_idx_source = "input"
+            if ms_to_idx is None:
+                ms_to_idx = _build_ms_to_idx_from_events_t(
+                    filehandle=h5f,
+                    chunk_events=MS_TO_IDX_BUILD_CHUNK_EVENTS,
+                )
+                ms_to_idx_source = "generated"
 
             writer = VoxelH5Writer(
                 outfile=tmp_path,
@@ -588,6 +640,7 @@ def process_single_file(
             writer.h5f.attrs["rdcc_nbytes"] = int(rdcc_nbytes)
             writer.h5f.attrs["rdcc_nslots"] = int(rdcc_nslots)
             writer.h5f.attrs["rdcc_w0"] = float(rdcc_w0)
+            writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1

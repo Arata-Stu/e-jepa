@@ -28,5 +28,6 @@ segmentation_tolerance_us: 0
 
 normalize: true
 output_dtype: float16
+use_trilinear: true
 tmp_suffix: .tmp
 num_processes: 1

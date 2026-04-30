@@ -7,6 +7,14 @@ import sys
 import weakref
 from pathlib import Path
 
+# Keep CPU math libraries single-threaded per worker process.
+# This avoids heavy oversubscription when preprocessing with multiprocessing.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import h5py
 import numpy as np
 import torch
@@ -30,6 +38,7 @@ from scripts.preprocess.utils import (
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
+MS_TO_IDX_BUILD_CHUNK_EVENTS = 5_000_000
 
 
 EVENT_GROUP_PATH = "prophesee/left"
@@ -106,13 +115,13 @@ def _get_time_bounds_us(filehandle: h5py.File) -> tuple[int | None, int | None]:
     return t_first, t_last_exclusive
 
 
-def _load_ms_idx(filehandle: h5py.File) -> np.ndarray | None:
+def _load_ms_idx(filehandle: h5py.File) -> tuple[np.ndarray | None, str]:
     events = _open_event_group(filehandle)
     if "ms_map_idx" in events:
-        return events["ms_map_idx"][()]
+        return events["ms_map_idx"][()], "ms_map_idx"
     if "ms_to_idx" in filehandle:
-        return filehandle["ms_to_idx"][()]
-    return None
+        return filehandle["ms_to_idx"][()], "ms_to_idx"
+    return None, "missing"
 
 
 def _coarse_bounds_from_ms_idx(
@@ -120,12 +129,18 @@ def _coarse_bounds_from_ms_idx(
     num_events: int,
     start_us: int,
     end_us: int,
+    time_offset_us: int = 0,
 ) -> tuple[int, int]:
     if ms_idx is None or ms_idx.size == 0:
         return 0, num_events
 
-    start_ms = max(int(start_us // 1000), 0)
-    end_ms_exclusive = max(int((end_us + 999) // 1000), start_ms + 1)
+    rel_start_us = int(start_us) - int(time_offset_us)
+    rel_end_us = int(end_us) - int(time_offset_us)
+    if rel_end_us <= 0:
+        return 0, 0
+
+    start_ms = max(int(rel_start_us // 1000), 0)
+    end_ms_exclusive = max(int((rel_end_us + 999) // 1000), start_ms + 1)
 
     start_ms = min(start_ms, ms_idx.size - 1)
     start_idx = int(ms_idx[start_ms])
@@ -138,6 +153,36 @@ def _coarse_bounds_from_ms_idx(
     start_idx = max(0, min(start_idx, num_events))
     end_idx = max(0, min(end_idx, num_events))
     return start_idx, end_idx
+
+
+def _build_ms_idx_from_events_t(
+    filehandle: h5py.File,
+    chunk_events: int = MS_TO_IDX_BUILD_CHUNK_EVENTS,
+) -> np.ndarray:
+    events = _open_event_group(filehandle)
+    t_ds = events["t"]
+    num_events = len(t_ds)
+    if num_events == 0:
+        return np.zeros((0,), dtype="uint64")
+
+    max_t_us = int(t_ds[num_events - 1])
+    max_ms = int(max_t_us // 1000)
+    counts_per_ms = np.zeros((max_ms + 1,), dtype=np.uint64)
+    step = max(1, int(chunk_events))
+
+    for start in range(0, num_events, step):
+        end = min(start + step, num_events)
+        t_chunk = np.asarray(t_ds[start:end], dtype=np.int64)
+        if t_chunk.size == 0:
+            continue
+        ms_chunk = (t_chunk // 1000).astype(np.int64, copy=False)
+        unique_ms, unique_counts = np.unique(ms_chunk, return_counts=True)
+        counts_per_ms[unique_ms] += unique_counts.astype(np.uint64, copy=False)
+
+    ms_idx = np.zeros((max_ms + 2,), dtype=np.uint64)
+    ms_idx[1:] = counts_per_ms
+    ms_idx = ms_idx[:-1].cumsum()
+    return ms_idx
 
 
 def _extract_events_by_time(
@@ -155,16 +200,17 @@ def _extract_events_by_time(
     if num_events == 0:
         return _empty_events()
 
+    t_offset = _read_t_offset(filehandle)
     coarse_start, coarse_end = _coarse_bounds_from_ms_idx(
         ms_idx=ms_idx,
         num_events=num_events,
         start_us=start_us,
         end_us=end_us,
+        time_offset_us=t_offset,
     )
     if coarse_end <= coarse_start:
         return _empty_events()
 
-    t_offset = _read_t_offset(filehandle)
     t_coarse_abs = t_ds[coarse_start:coarse_end].astype(np.int64) + t_offset
     if t_coarse_abs.size == 0:
         return _empty_events()
@@ -711,6 +757,7 @@ def process_single_file(
     depth_ts_divisor: int,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -764,7 +811,13 @@ def process_single_file(
     try:
         with h5py.File(str(input_path), "r") as h5f:
             t_first, t_last_exclusive = _get_time_bounds_us(h5f)
-            ms_idx = _load_ms_idx(h5f)
+            ms_idx, ms_idx_source = _load_ms_idx(h5f)
+            if ms_idx is None:
+                ms_idx = _build_ms_idx_from_events_t(
+                    filehandle=h5f,
+                    chunk_events=MS_TO_IDX_BUILD_CHUNK_EVENTS,
+                )
+                ms_idx_source = "generated"
             t_offset_us = _read_t_offset(h5f)
 
             writer = VoxelH5Writer(
@@ -792,6 +845,7 @@ def process_single_file(
             writer.h5f.attrs["accum_time_us"] = int(accum_time)
             writer.h5f.attrs["stride_time_us"] = int(stride_time)
             writer.h5f.attrs["normalize"] = int(normalize)
+            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
             writer.h5f.attrs["window_mode"] = window_mode
             writer.h5f.attrs["sync_target"] = (
                 "event_only"
@@ -804,6 +858,7 @@ def process_single_file(
             writer.h5f.attrs["semantics_ts_divisor"] = int(semantics_ts_divisor)
             writer.h5f.attrs["depth_ts_source"] = depth_ts_source
             writer.h5f.attrs["depth_ts_divisor"] = int(depth_ts_divisor)
+            writer.h5f.attrs["ms_to_idx_source"] = ms_idx_source
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
@@ -881,6 +936,7 @@ def process_single_file(
                 input_size=(t_bins, effective_output_height, effective_output_width),
                 normalize=normalize,
                 separate_polarity=split_polarity,
+                trilinear_interpolation=use_trilinear,
             )
             if show_progress:
                 pbar = tqdm.tqdm(total=len(windows), desc=input_path.name, leave=False)
@@ -948,6 +1004,7 @@ def _process_file_with_retry(
     depth_ts_divisor: int,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     tmp_suffix: str,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -976,6 +1033,7 @@ def _process_file_with_retry(
                 depth_ts_divisor=depth_ts_divisor,
                 normalize=normalize,
                 output_dtype=output_dtype,
+                use_trilinear=use_trilinear,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
@@ -1018,6 +1076,7 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         depth_ts_divisor=job["depth_ts_divisor"],
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
+        use_trilinear=job["use_trilinear"],
         tmp_suffix=job["tmp_suffix"],
     )
     return str(input_path), ok, err
@@ -1082,6 +1141,7 @@ def process_dataset_root(
     depth_ts_divisor: int,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     tmp_suffix: str,
     num_processes: int,
 ) -> None:
@@ -1149,6 +1209,7 @@ def process_dataset_root(
                 "depth_ts_divisor": depth_ts_divisor,
                 "normalize": normalize,
                 "output_dtype": output_dtype,
+                "use_trilinear": bool(use_trilinear),
                 "tmp_suffix": tmp_suffix,
             }
         )
@@ -1297,6 +1358,12 @@ if __name__ == "__main__":
         default="float16",
         help="Stored dtype for voxel tensor in output HDF5.",
     )
+    parser.add_argument(
+        "--use_trilinear",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use trilinear interpolation in voxelization (disable for nearest-bin assignment).",
+    )
     args = parser.parse_args()
 
     stride_time = args.accum_time if args.stride_time is None else args.stride_time
@@ -1340,6 +1407,7 @@ if __name__ == "__main__":
             depth_ts_divisor=args.depth_ts_divisor,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            use_trilinear=args.use_trilinear,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
         )
@@ -1367,6 +1435,7 @@ if __name__ == "__main__":
             depth_ts_divisor=args.depth_ts_divisor,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            use_trilinear=args.use_trilinear,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

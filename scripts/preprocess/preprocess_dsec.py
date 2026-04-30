@@ -7,6 +7,14 @@ import sys
 import weakref
 from pathlib import Path
 
+# Keep CPU math libraries single-threaded per worker process.
+# This avoids heavy oversubscription when preprocessing with multiprocessing.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import h5py
 import numpy as np
 import torch
@@ -30,6 +38,7 @@ from scripts.preprocess.utils import (
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
+MS_TO_IDX_BUILD_CHUNK_EVENTS = 5_000_000
 
 
 def _empty_events() -> dict[str, np.ndarray]:
@@ -95,6 +104,8 @@ def _coarse_bounds_from_ms_to_idx(
     # ms_to_idx is indexed by relative event time (events/t), not absolute wall-clock time.
     start_us_rel = int(start_us) - int(t_offset_us)
     end_us_rel = int(end_us) - int(t_offset_us)
+    if end_us_rel <= 0:
+        return 0, 0
     start_ms = max(int(start_us_rel // 1000), 0)
     end_ms_exclusive = max(int((end_us_rel + 999) // 1000), start_ms + 1)
 
@@ -109,6 +120,35 @@ def _coarse_bounds_from_ms_to_idx(
     start_idx = max(0, min(start_idx, num_events))
     end_idx = max(0, min(end_idx, num_events))
     return start_idx, end_idx
+
+
+def _build_ms_to_idx_from_events_t(
+    filehandle: h5py.File,
+    chunk_events: int = MS_TO_IDX_BUILD_CHUNK_EVENTS,
+) -> np.ndarray:
+    t_ds = filehandle["events/t"]
+    num_events = len(t_ds)
+    if num_events == 0:
+        return np.zeros((0,), dtype="uint64")
+
+    max_t_us = int(t_ds[num_events - 1])
+    max_ms = int(max_t_us // 1000)
+    counts_per_ms = np.zeros((max_ms + 1,), dtype=np.uint64)
+    step = max(1, int(chunk_events))
+
+    for start in range(0, num_events, step):
+        end = min(start + step, num_events)
+        t_chunk = np.asarray(t_ds[start:end], dtype=np.int64)
+        if t_chunk.size == 0:
+            continue
+        ms_chunk = (t_chunk // 1000).astype(np.int64, copy=False)
+        unique_ms, unique_counts = np.unique(ms_chunk, return_counts=True)
+        counts_per_ms[unique_ms] += unique_counts.astype(np.uint64, copy=False)
+
+    ms_to_idx = np.zeros((max_ms + 2,), dtype=np.uint64)
+    ms_to_idx[1:] = counts_per_ms
+    ms_to_idx = ms_to_idx[:-1].cumsum()
+    return ms_to_idx
 
 
 def _extract_events_by_time(
@@ -531,6 +571,7 @@ def process_single_file(
     image_timestamps_path: Path | None,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     sync_segmentation: bool,
     segmentation_dir: Path | None,
     segmentation_tolerance_us: int,
@@ -574,6 +615,13 @@ def process_single_file(
         with h5py.File(str(input_path), "r") as h5f:
             t_first, t_last_exclusive = _get_time_bounds_us(h5f)
             ms_to_idx = _load_ms_to_idx(h5f)
+            ms_to_idx_source = "input"
+            if ms_to_idx is None:
+                ms_to_idx = _build_ms_to_idx_from_events_t(
+                    filehandle=h5f,
+                    chunk_events=MS_TO_IDX_BUILD_CHUNK_EVENTS,
+                )
+                ms_to_idx_source = "generated"
 
             writer = VoxelH5Writer(
                 outfile=tmp_path,
@@ -599,10 +647,12 @@ def process_single_file(
             writer.h5f.attrs["accum_time_us"] = int(accum_time)
             writer.h5f.attrs["stride_time_us"] = int(stride_time)
             writer.h5f.attrs["normalize"] = int(normalize)
+            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
             writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
             writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
             writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
             writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
+            writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
@@ -640,6 +690,7 @@ def process_single_file(
                 input_size=(t_bins, output_height, output_width),
                 normalize=normalize,
                 separate_polarity=split_polarity,
+                trilinear_interpolation=use_trilinear,
             )
 
             if show_pbar:
@@ -713,6 +764,7 @@ def _process_file_with_retry(
     image_timestamps_path: Path | None,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     sync_segmentation: bool,
     segmentation_dir: Path | None,
     segmentation_tolerance_us: int,
@@ -739,6 +791,7 @@ def _process_file_with_retry(
                 image_timestamps_path=image_timestamps_path,
                 normalize=normalize,
                 output_dtype=output_dtype,
+                use_trilinear=use_trilinear,
                 sync_segmentation=sync_segmentation,
                 segmentation_dir=segmentation_dir,
                 segmentation_tolerance_us=segmentation_tolerance_us,
@@ -781,6 +834,7 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         image_timestamps_path=image_timestamps_path,
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
+        use_trilinear=job["use_trilinear"],
         sync_segmentation=job["sync_segmentation"],
         segmentation_dir=segmentation_dir,
         segmentation_tolerance_us=job["segmentation_tolerance_us"],
@@ -939,6 +993,7 @@ def process_dataset_root(
     image_root: Path | None,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     sync_segmentation: bool,
     segmentation_root: Path | None,
     segmentation_subdir: str,
@@ -1078,6 +1133,7 @@ def process_dataset_root(
                 "image_timestamps_path": str(image_timestamps_path) if image_timestamps_path is not None else None,
                 "normalize": bool(normalize),
                 "output_dtype": output_dtype,
+                "use_trilinear": bool(use_trilinear),
                 "sync_segmentation": bool(sync_segmentation),
                 "segmentation_dir": str(segmentation_dir) if segmentation_dir is not None else None,
                 "segmentation_tolerance_us": int(segmentation_tolerance_us),
@@ -1130,6 +1186,7 @@ def process_dsec_root(
     image_root: Path | None,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     sync_segmentation: bool,
     segmentation_root: Path | None,
     segmentation_subdir: str,
@@ -1161,6 +1218,7 @@ def process_dsec_root(
         image_root=image_root,
         normalize=normalize,
         output_dtype=output_dtype,
+        use_trilinear=use_trilinear,
         sync_segmentation=sync_segmentation,
         segmentation_root=segmentation_root,
         segmentation_subdir=segmentation_subdir,
@@ -1285,6 +1343,12 @@ if __name__ == "__main__":
         help="Stored dtype for voxel tensor in output HDF5.",
     )
     parser.add_argument(
+        "--use_trilinear",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use trilinear interpolation in voxelization (disable for nearest-bin assignment).",
+    )
+    parser.add_argument(
         "--sync_segmentation",
         action="store_true",
         help="Store segmentation synchronization metadata per voxel window.",
@@ -1350,6 +1414,7 @@ if __name__ == "__main__":
             image_root=args.image_root,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            use_trilinear=args.use_trilinear,
             sync_segmentation=args.sync_segmentation,
             segmentation_root=args.segmentation_root,
             segmentation_subdir=args.segmentation_subdir,
@@ -1378,6 +1443,7 @@ if __name__ == "__main__":
             image_timestamps_path=args.image_timestamps_path,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            use_trilinear=args.use_trilinear,
             sync_segmentation=args.sync_segmentation,
             segmentation_dir=args.segmentation_dir,
             segmentation_tolerance_us=args.segmentation_tolerance_us,

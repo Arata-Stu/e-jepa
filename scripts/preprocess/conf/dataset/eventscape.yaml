@@ -19,5 +19,6 @@ split_polarity: true
 
 normalize: true
 output_dtype: float16
+use_trilinear: true
 tmp_suffix: .tmp
 num_processes: 1

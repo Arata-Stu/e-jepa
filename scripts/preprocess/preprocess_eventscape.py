@@ -8,6 +8,14 @@ import sys
 import weakref
 from pathlib import Path
 
+# Keep CPU math libraries single-threaded per worker process.
+# This avoids heavy oversubscription when preprocessing with multiprocessing.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import h5py
 import numpy as np
 import torch
@@ -637,6 +645,7 @@ def process_sequence(
     split_polarity: bool,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -704,6 +713,8 @@ def process_sequence(
         writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
         writer.h5f.attrs["window_mode"] = "event_file"
         writer.h5f.attrs["normalize"] = int(normalize)
+        writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+        writer.h5f.attrs["ms_to_idx_source"] = "not_applicable_npz"
         writer.h5f.attrs["num_event_files"] = int(len(event_files))
         writer.h5f.attrs["num_semantic_files"] = int(len(semantic_by_idx))
         writer.h5f.attrs["num_depth_files"] = int(len(depth_by_idx))
@@ -714,6 +725,7 @@ def process_sequence(
             input_size=(t_bins, effective_output_height, effective_output_width),
             normalize=normalize,
             separate_polarity=split_polarity,
+            trilinear_interpolation=use_trilinear,
         )
         if show_progress:
             pbar = tqdm.tqdm(total=len(event_files), desc=sequence_dir.name, leave=False)
@@ -821,6 +833,7 @@ def _process_sequence_with_retry(
     split_polarity: bool,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     tmp_suffix: str,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -841,6 +854,7 @@ def _process_sequence_with_retry(
                 split_polarity=split_polarity,
                 normalize=normalize,
                 output_dtype=output_dtype,
+                use_trilinear=use_trilinear,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
@@ -875,6 +889,7 @@ def _worker_process_sequence(job: dict) -> tuple[str, bool, str | None]:
         split_polarity=job["split_polarity"],
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
+        use_trilinear=job["use_trilinear"],
         tmp_suffix=job["tmp_suffix"],
     )
     return str(sequence_dir), ok, err
@@ -932,6 +947,7 @@ def process_dataset_root(
     split_polarity: bool,
     normalize: bool,
     output_dtype: str,
+    use_trilinear: bool,
     tmp_suffix: str,
     num_processes: int,
 ) -> None:
@@ -980,6 +996,7 @@ def process_dataset_root(
                 "split_polarity": bool(split_polarity),
                 "normalize": bool(normalize),
                 "output_dtype": output_dtype,
+                "use_trilinear": bool(use_trilinear),
                 "tmp_suffix": tmp_suffix,
             }
         )
@@ -1090,6 +1107,12 @@ if __name__ == "__main__":
         default="float16",
         help="Stored dtype for voxel tensor in output HDF5.",
     )
+    parser.add_argument(
+        "--use_trilinear",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use trilinear interpolation in voxelization (disable for nearest-bin assignment).",
+    )
     args = parser.parse_args()
 
     is_single_mode = args.input_path is not None or args.output_path is not None
@@ -1114,6 +1137,7 @@ if __name__ == "__main__":
             split_polarity=args.split_polarity,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            use_trilinear=args.use_trilinear,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
         )
@@ -1133,6 +1157,7 @@ if __name__ == "__main__":
             split_polarity=args.split_polarity,
             normalize=args.normalize,
             output_dtype=args.output_dtype,
+            use_trilinear=args.use_trilinear,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

@@ -27,5 +27,6 @@ depth_ts_divisor: 1
 
 normalize: true
 output_dtype: float16
+use_trilinear: true
 tmp_suffix: .tmp
 num_processes: 1

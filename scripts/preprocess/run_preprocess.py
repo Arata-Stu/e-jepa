@@ -74,6 +74,7 @@ def _run_dsec(cfg: DictConfig) -> None:
         image_root=_optional_path(cfg.image_root),
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
+        use_trilinear=bool(cfg.use_trilinear),
         sync_segmentation=bool(cfg.sync_segmentation),
         segmentation_root=_optional_path(cfg.segmentation_root),
         segmentation_subdir=str(cfg.segmentation_subdir),
@@ -145,6 +146,7 @@ def _run_m3ed(cfg: DictConfig) -> None:
         depth_ts_divisor=int(cfg.depth_ts_divisor),
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
+        use_trilinear=bool(cfg.use_trilinear),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),
     )
@@ -169,6 +171,7 @@ def _run_eventscape(cfg: DictConfig) -> None:
         split_polarity=bool(cfg.split_polarity),
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
+        use_trilinear=bool(cfg.use_trilinear),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),
     )

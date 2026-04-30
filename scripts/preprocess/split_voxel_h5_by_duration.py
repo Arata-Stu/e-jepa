@@ -264,6 +264,7 @@ def _write_chunk_file(
     metadata_mode: str,
     progress_interval_s: float,
     log_chunk_progress: bool,
+    log_dataset_progress: bool,
 ) -> None:
     out_h5_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(out_h5_path, ".tmp")
@@ -322,6 +323,12 @@ def _write_chunk_file(
             for dname in allowed_dataset_names:
                 src_ds = src_h5[dname]
                 row_aligned = src_ds.ndim > 0 and src_ds.shape[0] == n_samples
+                if bool(log_dataset_progress):
+                    _emit_progress(
+                        "[DATASET START] "
+                        f"pid={pid} {src_h5_path.name} chunk={chunk_index + 1}/{total_chunks} "
+                        f"name={dname} dtype={src_ds.dtype} row_aligned={int(row_aligned)}"
+                    )
 
                 if row_aligned:
                     out_shape = (int(src_end - src_start),) + tuple(src_ds.shape[1:])
@@ -357,6 +364,11 @@ def _write_chunk_file(
                     )
                 else:
                     out_ds[...] = src_ds[...]
+                if bool(log_dataset_progress):
+                    _emit_progress(
+                        "[DATASET DONE] "
+                        f"pid={pid} {src_h5_path.name} chunk={chunk_index + 1}/{total_chunks} name={dname}"
+                    )
 
             out_h5.attrs["split_parent_file"] = str(src_h5_path)
             out_h5.attrs["split_chunk_index"] = int(chunk_index)
@@ -389,6 +401,7 @@ def _process_one_file(
     metadata_mode: str,
     progress_interval_s: float,
     log_chunk_progress: bool,
+    log_dataset_progress: bool,
 ) -> tuple[str, int, int]:
     with h5py.File(str(input_path), "r") as h5f:
         n_samples = int(h5f["voxels"].shape[0])
@@ -422,6 +435,7 @@ def _process_one_file(
             metadata_mode=metadata_mode,
             progress_interval_s=float(progress_interval_s),
             log_chunk_progress=bool(log_chunk_progress),
+            log_dataset_progress=bool(log_dataset_progress),
         )
         done += 1
 
@@ -443,6 +457,7 @@ def _worker(job: dict) -> tuple[str, bool, str | None, int, int]:
             metadata_mode=str(job["metadata_mode"]),
             progress_interval_s=float(job["progress_interval_s"]),
             log_chunk_progress=bool(job["log_chunk_progress"]),
+            log_dataset_progress=bool(job["log_dataset_progress"]),
         )
         return file_path, True, None, n_samples, n_written
     except Exception as exc:
@@ -494,6 +509,12 @@ def main() -> None:
         default=False,
         help="Print chunk start/end logs (useful to see activity when each chunk is slow).",
     )
+    parser.add_argument(
+        "--log_dataset_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print dataset-level start/end logs inside each chunk (useful for crash localization).",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing split files.")
     parser.add_argument("--num_processes", type=int, default=1, help="Parallel workers.")
     args = parser.parse_args()
@@ -539,6 +560,7 @@ def main() -> None:
                 "metadata_mode": str(args.metadata_mode),
                 "progress_interval_s": float(args.progress_interval_s),
                 "log_chunk_progress": bool(args.log_chunk_progress),
+                "log_dataset_progress": bool(args.log_dataset_progress),
             }
         )
 
@@ -554,7 +576,9 @@ def main() -> None:
         pbar = tqdm.tqdm(iterator, total=len(jobs), desc="split voxel h5")
     else:
         ctx = mp.get_context("spawn")
-        progress_enabled = bool(args.log_chunk_progress or float(args.progress_interval_s) > 0)
+        progress_enabled = bool(
+            args.log_chunk_progress or args.log_dataset_progress or float(args.progress_interval_s) > 0
+        )
         if progress_enabled:
             progress_queue = ctx.Queue()
             progress_thread = threading.Thread(

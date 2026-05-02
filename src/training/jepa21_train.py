@@ -18,6 +18,7 @@ from src.datasets.data_manager import init_data
 from src.datasets.transforms import make_event_transforms
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
+from src.models.vision_transformer import VIT_EMBED_DIMS
 from src.models.utils.masks_dist import compute_mask_distance
 from src.models.utils.modules import Lambda_LinearWarmupHold
 from src.training.jepa21_utils import (
@@ -61,6 +62,15 @@ def _resolve_interpolation(mode: str):
     return lookup[key]
 
 
+def _to_hw_tuple(value, field_name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        v = int(value)
+        return (v, v)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (int(value[0]), int(value[1]))
+    raise ValueError(f"{field_name} must be int or [H, W], got: {value}")
+
+
 def _is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
@@ -75,15 +85,19 @@ def _setup_device() -> torch.device:
 
 
 def _encoder_embed_dim(model_name: str) -> int:
-    if model_name == "vit_base":
-        return 768
-    if model_name == "vit_large":
-        return 1024
-    if model_name == "vit_giant_xformers":
-        return 1408
-    if model_name == "vit_gigantic_xformers":
-        return 1664
-    raise ValueError(f"unsupported model_name for embed dim inference: {model_name}")
+    aliases = {
+        "vit_large_rope": "vit_large",
+        "vit_giant_xformers": "vit_giant",
+        "vit_gigantic_xformers": "vit_gigantic",
+    }
+    canonical_name = aliases.get(model_name, model_name)
+    if canonical_name in VIT_EMBED_DIMS:
+        return int(VIT_EMBED_DIMS[canonical_name])
+    supported = sorted(set(VIT_EMBED_DIMS.keys()) | set(aliases.keys()))
+    raise ValueError(
+        f"unsupported model_name for embed dim inference: {model_name}. "
+        f"Supported: {supported}"
+    )
 
 
 def _maybe_ddp(model: torch.nn.Module, find_unused_parameters: bool = False):
@@ -258,7 +272,7 @@ def main(args, resume_preempt: bool = False):
     batch_size = int(cfgs_data.get("batch_size", 8))
     tubelet_size = int(cfgs_data.get("tubelet_size", 2))
     fps = cfgs_data.get("fps", None)
-    crop_size = int(cfgs_data.get("crop_size", 224))
+    crop_size = _to_hw_tuple(cfgs_data.get("crop_size", 224), "data.crop_size")
     patch_size = int(cfgs_data.get("patch_size", 16))
     pin_mem = bool(cfgs_data.get("pin_mem", True))
     num_workers = int(cfgs_data.get("num_workers", 4))
@@ -284,6 +298,23 @@ def main(args, resume_preempt: bool = False):
     interpolation = _resolve_interpolation(str(cfgs_data_aug.get("interpolation", "bilinear")))
     antialias = bool(cfgs_data_aug.get("antialias", True))
     preserve_input_size = bool(cfgs_data_aug.get("preserve_input_size", False))
+    pad_to_hw_raw = cfgs_data_aug.get("pad_to_hw", None)
+    pad_to_hw = None
+    if pad_to_hw_raw is not None:
+        if not isinstance(pad_to_hw_raw, (list, tuple)) or len(pad_to_hw_raw) != 2:
+            raise ValueError("data_aug.pad_to_hw must be [H, W] or null")
+        pad_to_hw = (int(pad_to_hw_raw[0]), int(pad_to_hw_raw[1]))
+    pad_value = float(cfgs_data_aug.get("pad_value", 0.0))
+    allowed_input_hw_raw = cfgs_data_aug.get("allowed_input_hw", None)
+    allowed_input_hw = None
+    if allowed_input_hw_raw is not None:
+        allowed_input_hw = set()
+        for hw in allowed_input_hw_raw:
+            if not isinstance(hw, (list, tuple)) or len(hw) != 2:
+                raise ValueError(
+                    "data_aug.allowed_input_hw must be a list of [H, W] pairs"
+                )
+            allowed_input_hw.add((int(hw[0]), int(hw[1])))
 
     # -- Loss params
     loss_exp = float(cfgs_loss.get("loss_exp", 1.0))
@@ -379,7 +410,10 @@ def main(args, resume_preempt: bool = False):
             batch_size = video_total_batch_size // num_video_ranks
 
             if rank < img_world_size:
-                crop_size = int(cfgs_img_data.get("crop_size", crop_size))
+                crop_size = _to_hw_tuple(
+                    cfgs_img_data.get("crop_size", crop_size),
+                    "img_data.crop_size",
+                )
                 if img_temporal_dim_size is not None:
                     if img_dataset_fpcs[0] != 1:
                         raise NotImplementedError(
@@ -423,6 +457,8 @@ def main(args, resume_preempt: bool = False):
         interpolation=interpolation,
         antialias=antialias,
         apply_random_resized_crop=not preserve_input_size,
+        pad_to_hw=pad_to_hw,
+        pad_value=pad_value,
     )
 
     mask_collator = MaskCollator(
@@ -616,7 +652,12 @@ def main(args, resume_preempt: bool = False):
 
     trailing_losses = []
     embed_dim_encoder = _encoder_embed_dim(model_name)
-    grid_size = crop_size // patch_size
+    if crop_size[0] % patch_size != 0 or crop_size[1] % patch_size != 0:
+        raise ValueError(
+            f"crop_size={crop_size} must be divisible by patch_size={patch_size}"
+        )
+    grid_h = crop_size[0] // patch_size
+    grid_w = crop_size[1] // patch_size
 
     for epoch in range(start_epoch, num_epochs):
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
@@ -678,6 +719,14 @@ def main(args, resume_preempt: bool = False):
                         f"but batch clip has C={clip_in_chans}. "
                         "Please set model.in_chans to match the preprocessed voxel channel count."
                     )
+                if preserve_input_size and allowed_input_hw:
+                    clip_h = int(clip.shape[-2])
+                    clip_w = int(clip.shape[-1])
+                    if (clip_h, clip_w) not in allowed_input_hw:
+                        raise ValueError(
+                            f"Unexpected input resolution HxW=({clip_h},{clip_w}). "
+                            f"Allowed values: {sorted(allowed_input_hw)}"
+                        )
 
             if sync_gc and (itr + 1) % gc_collect_itr_freq == 0:
                 gc.collect()
@@ -772,8 +821,9 @@ def main(args, resume_preempt: bool = False):
                         distance_weights = compute_mask_distance(
                             masks_pred,
                             masks_enc,
-                            grid_size,
-                            offset_context_loss,
+                            offset_context_loss=offset_context_loss,
+                            h_patches=grid_h,
+                            w_patches=grid_w,
                         )
                         d_weights = distance_weights if weight_distance_loss else None
                         loss_context = loss_fn(

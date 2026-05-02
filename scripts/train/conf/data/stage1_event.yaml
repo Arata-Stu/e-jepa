@@ -4,12 +4,12 @@ dataset_type: eventdataset
 datasets: []
 # Optional mixing weights aligned with `datasets`.
 datasets_weights: null
-# Frames-per-clip per dataset. [8] means pseudo-video of length 8.
-dataset_fpcs: [8]
+# Frames-per-clip per dataset. [16] means pseudo-video of length 16.
+dataset_fpcs: [16]
 # Per-rank batch size (not global).
 batch_size: 8
-# Final training resolution after augmentation.
-crop_size: 224
+# Final model/mask spatial size [H, W] after augmentation/padding.
+crop_size: [480, 640]
 patch_size: 16
 # Temporal patch size used by ViT patch embedding.
 tubelet_size: 2

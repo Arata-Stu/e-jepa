@@ -2,9 +2,15 @@
 random_horizontal_flip: true
 # Keep native HxW (no crop/resize). Useful for geometry-sensitive downstream tasks.
 preserve_input_size: true
+# Letterbox target [H, W]. Example: 640x360 -> (pad) -> 640x480.
+pad_to_hw: [480, 640]
+pad_value: 0.0
+# Allowed final input resolutions [H, W] after augmentation/padding.
+allowed_input_hw:
+  - [480, 640]
 # RandomResizedCrop aspect ratio range.
 random_resize_aspect_ratio: [0.75, 1.3333333333]
 # RandomResizedCrop area scale range.
-random_resize_scale: [0.3, 1.0]
+random_resize_scale: [0.8, 1.2]
 interpolation: bilinear
 antialias: true

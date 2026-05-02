@@ -62,6 +62,10 @@ torchrun --nproc_per_node=4 scripts/train/run_train.py \
 - `model.in_chans` must match voxel channels (`C` in `/voxels`).
   - default preprocess (`t_bins=10`, `split_polarity=true`) => `C=20` so use `model.in_chans=20`.
 - `data_aug.preserve_input_size=true` なら crop/resize を無効化し、入力の解像度とアスペクト比を維持します。
+  - default は `data_aug.pad_to_hw=[480,640]`（HxW）で letterbox padding を適用し、
+    `data_aug.allowed_input_hw=[[480,640]]` を検証します。
+- `data.crop_size=[480,640]`（HxW）を model/mask 側の基準グリッドとして使います。
+  これにより、padding 後の入力サイズと mask/model のトークングリッドが一致します。
 - `img_data.enabled=true` のとき、`vjepa2.1` と同様に rank split を有効化:
   - image rank は `img_data` 設定 (`dataset_fpcs=[1]` など) を使用
   - image rank で `img_mask` が指定されていれば `img_mask` を適用

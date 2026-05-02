@@ -1,0 +1,29 @@
+# Event H5 loader for MAE pretraining.
+dataset_type: eventdataset
+# One or more roots / manifests / .h5 files. Must be set from CLI or local yaml.
+datasets: []
+# Optional mixing weights aligned with `datasets`.
+datasets_weights: null
+# MAE currently expects one temporal length across all datasets.
+dataset_fpcs: [16]
+# Per-rank batch size (not global).
+batch_size: 8
+# Final model spatial size [H, W] after augmentation/padding.
+crop_size: [480, 640]
+patch_size: 16
+# Temporal patch size used by ViT patch embedding.
+tubelet_size: 2
+fps: 4
+num_workers: 8
+persistent_workers: true
+pin_mem: true
+# Temporal subsampling stride before fpc fitting.
+frame_sample_rate: 1
+# Number of clips sampled from one sample each iteration.
+num_clips: 1
+random_clip_sampling: true
+allow_clip_overlap: false
+# Scan options for directory mode.
+file_pattern: "*.h5"
+recursive: true
+

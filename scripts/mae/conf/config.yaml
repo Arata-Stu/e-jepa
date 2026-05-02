@@ -1,0 +1,17 @@
+# MAE pretraining (event voxel).
+defaults:
+  - data: stage1_event
+  - model: vit_base_mae
+  - optimization: mae_default
+  - data_aug: event_default
+  - meta: default
+  - _self_
+
+# Output directory for checkpoints/logs/tensorboard.
+folder: outputs/train_stage1_mae
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+

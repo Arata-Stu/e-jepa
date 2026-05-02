@@ -1,5 +1,7 @@
 # Basic augmentation for event voxel clips.
 random_horizontal_flip: true
+# Keep native HxW (no crop/resize). Useful for geometry-sensitive downstream tasks.
+preserve_input_size: true
 # RandomResizedCrop aspect ratio range.
 random_resize_aspect_ratio: [0.75, 1.3333333333]
 # RandomResizedCrop area scale range.

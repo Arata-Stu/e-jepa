@@ -214,6 +214,7 @@ def main(args, resume_preempt: bool = False):
         cfgs_model.get("use_activation_checkpointing", False)
     )
     model_name = str(cfgs_model.get("model_name", "vit_base"))
+    in_chans = int(cfgs_model.get("in_chans", 3))
     pred_depth = int(cfgs_model.get("pred_depth", 12))
     pred_num_heads = cfgs_model.get("pred_num_heads", None)
     if pred_num_heads is not None:
@@ -282,6 +283,7 @@ def main(args, resume_preempt: bool = False):
     random_horizontal_flip = bool(cfgs_data_aug.get("random_horizontal_flip", True))
     interpolation = _resolve_interpolation(str(cfgs_data_aug.get("interpolation", "bilinear")))
     antialias = bool(cfgs_data_aug.get("antialias", True))
+    preserve_input_size = bool(cfgs_data_aug.get("preserve_input_size", False))
 
     # -- Loss params
     loss_exp = float(cfgs_loss.get("loss_exp", 1.0))
@@ -420,6 +422,7 @@ def main(args, resume_preempt: bool = False):
         crop_size=crop_size,
         interpolation=interpolation,
         antialias=antialias,
+        apply_random_resized_crop=not preserve_input_size,
     )
 
     mask_collator = MaskCollator(
@@ -432,6 +435,7 @@ def main(args, resume_preempt: bool = False):
 
     encoder, predictor = init_video_model(
         device=device,
+        in_chans=in_chans,
         patch_size=patch_size,
         max_num_frames=int(max(model_fpcs)),
         tubelet_size=model_tubelet_size,
@@ -664,6 +668,16 @@ def main(args, resume_preempt: bool = False):
 
             clips, masks_enc, masks_pred = all_clips, all_masks_enc, all_masks_pred
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+
+            # Fail fast with a clear message when model/input channel configs mismatch.
+            for clip in clips:
+                clip_in_chans = int(clip.shape[1])
+                if clip_in_chans != in_chans:
+                    raise ValueError(
+                        f"Input channel mismatch: model.in_chans={in_chans}, "
+                        f"but batch clip has C={clip_in_chans}. "
+                        "Please set model.in_chans to match the preprocessed voxel channel count."
+                    )
 
             if sync_gc and (itr + 1) % gc_collect_itr_freq == 0:
                 gc.collect()

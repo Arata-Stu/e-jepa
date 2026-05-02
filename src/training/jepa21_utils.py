@@ -148,6 +148,7 @@ def load_checkpoint(
 
 def init_video_model(
     device,
+    in_chans=3,
     patch_size=16,
     max_num_frames=16,
     tubelet_size=2,
@@ -181,6 +182,7 @@ def init_video_model(
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
+        in_chans=in_chans,
         num_frames=max_num_frames,
         tubelet_size=tubelet_size,
         uniform_power=uniform_power,

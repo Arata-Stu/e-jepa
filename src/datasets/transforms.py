@@ -33,6 +33,7 @@ class EventVideoTransform:
         crop_size: int | tuple[int, int] = 224,
         interpolation: InterpolationMode = InterpolationMode.BILINEAR,
         antialias: bool = True,
+        apply_random_resized_crop: bool = True,
     ):
         self.random_horizontal_flip = bool(random_horizontal_flip)
         self.random_resize_aspect_ratio = random_resize_aspect_ratio
@@ -40,6 +41,7 @@ class EventVideoTransform:
         self.crop_size = _to_hw_tuple(crop_size)
         self.interpolation = interpolation
         self.antialias = antialias
+        self.apply_random_resized_crop = bool(apply_random_resized_crop)
 
     def __call__(self, buffer: torch.Tensor) -> torch.Tensor:
         if not torch.is_tensor(buffer):
@@ -50,20 +52,30 @@ class EventVideoTransform:
 
         # [T,H,W,C] -> [T,C,H,W]
         buffer = buffer.permute(0, 3, 1, 2).contiguous()
-        # Sample crop params from one frame and apply consistently across time.
-        i, j, th, tw = tv_transforms.RandomResizedCrop.get_params(
-            img=buffer[0],
-            scale=self.random_resize_scale,
-            ratio=self.random_resize_aspect_ratio,
-        )
-        cropped = buffer[:, :, i : i + th, j : j + tw]
-        resized = F.interpolate(
-            cropped,
-            size=self.crop_size,
-            mode=self.interpolation.value,
-            align_corners=False if self.interpolation in (InterpolationMode.BILINEAR, InterpolationMode.BICUBIC) else None,
-            antialias=self.antialias if self.interpolation in (InterpolationMode.BILINEAR, InterpolationMode.BICUBIC) else False,
-        )
+        if self.apply_random_resized_crop:
+            # Sample crop params from one frame and apply consistently across time.
+            i, j, th, tw = tv_transforms.RandomResizedCrop.get_params(
+                img=buffer[0],
+                scale=self.random_resize_scale,
+                ratio=self.random_resize_aspect_ratio,
+            )
+            cropped = buffer[:, :, i : i + th, j : j + tw]
+            resized = F.interpolate(
+                cropped,
+                size=self.crop_size,
+                mode=self.interpolation.value,
+                align_corners=False
+                if self.interpolation
+                in (InterpolationMode.BILINEAR, InterpolationMode.BICUBIC)
+                else None,
+                antialias=self.antialias
+                if self.interpolation
+                in (InterpolationMode.BILINEAR, InterpolationMode.BICUBIC)
+                else False,
+            )
+        else:
+            # Keep native spatial resolution/aspect ratio.
+            resized = buffer
 
         if self.random_horizontal_flip and torch.rand(1).item() < 0.5:
             resized = torch.flip(resized, dims=[3])  # Flip width.
@@ -80,6 +92,7 @@ def make_event_transforms(
     crop_size: int | tuple[int, int] = 224,
     interpolation: InterpolationMode = InterpolationMode.BILINEAR,
     antialias: bool = True,
+    apply_random_resized_crop: bool = True,
 ) -> EventVideoTransform:
     return EventVideoTransform(
         random_horizontal_flip=random_horizontal_flip,
@@ -88,4 +101,5 @@ def make_event_transforms(
         crop_size=crop_size,
         interpolation=interpolation,
         antialias=antialias,
+        apply_random_resized_crop=apply_random_resized_crop,
     )

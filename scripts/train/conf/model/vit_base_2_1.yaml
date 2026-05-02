@@ -2,6 +2,8 @@
 compile_model: false
 use_activation_checkpointing: true
 model_name: vit_base
+# Input channels for voxel grid. For split_polarity + t_bins=10, set 20.
+in_chans: 20
 pred_depth: 12
 pred_num_heads: 12
 pred_embed_dim: 384

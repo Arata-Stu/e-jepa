@@ -1,0 +1,9 @@
+# Optimizer / schedule.
+epochs: 20
+lr: 1.0e-3
+encoder_lr: 1.0e-4
+min_lr: 1.0e-6
+weight_decay: 1.0e-4
+warmup_epochs: 1
+clip_grad: 1.0
+

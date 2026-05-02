@@ -1,0 +1,18 @@
+# Runtime / logging.
+dtype: bfloat16
+seed: 239
+use_tf32: true
+dist_port: 37139
+tensorboard: true
+log_all_ranks: false
+
+# Resume.
+load_checkpoint: false
+read_checkpoint: null
+auto_resume_latest: false
+
+# Console / checkpoint cadence.
+log_freq: 20
+checkpoint_freq: 1
+save_every_freq: 10
+

@@ -1,0 +1,15 @@
+# Downstream dense-task training (linear probe / fine-tune).
+defaults:
+  - task: dsec_semantic
+  - model: vit_base_linear_probe
+  - optimization: default
+  - meta: default
+  - _self_
+
+folder: outputs/downstream
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+

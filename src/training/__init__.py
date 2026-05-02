@@ -1,3 +1,3 @@
-from .jepa21_train import main
+from scripts.train.train import main
 
 __all__ = ["main"]

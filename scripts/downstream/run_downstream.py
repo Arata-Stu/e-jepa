@@ -17,14 +17,12 @@ def _save_resolved_config(cfg: DictConfig) -> None:
     rank = int(os.environ.get("RANK", "0"))
     if rank != 0:
         return
-
     folder = cfg.get("folder", None)
     if folder is None:
         return
-
     output_dir = Path(str(folder))
     output_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = output_dir / "params-train-resolved.yaml"
+    cfg_path = output_dir / "params-downstream-resolved.yaml"
     cfg_path.write_text(OmegaConf.to_yaml(cfg, resolve=True), encoding="utf-8")
 
 
@@ -32,10 +30,10 @@ def _save_resolved_config(cfg: DictConfig) -> None:
 def main(cfg: DictConfig) -> None:
     _save_resolved_config(cfg)
 
-    from scripts.train.train import main as train_main
+    from scripts.downstream.train import main as train_main
 
     args = OmegaConf.to_container(cfg, resolve=True)
-    train_main(args=args, resume_preempt=False)
+    train_main(args=args)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ ipe_scale: 1.25
 # AdamW schedule.
 weight_decay: 0.04
 final_weight_decay: 0.04
-epochs: 100
+epochs: 1000
 warmup: 10
 start_lr: 1.0e-4
 lr: 6.0e-4

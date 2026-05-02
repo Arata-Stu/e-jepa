@@ -1,0 +1,33 @@
+name: m3ed_depth
+dataset_kind: m3ed
+target: depth
+
+# Preprocessed voxel H5 roots.
+train_roots: []
+val_roots: []
+file_pattern: "*.h5"
+recursive: true
+
+# Input clip sampling around each labeled anchor window.
+clip_num_frames: 2
+clip_frame_stride: 1
+
+# Loader.
+batch_size: 4
+num_workers: 4
+pin_mem: true
+persistent_workers: true
+
+# Depth settings.
+depth_scale: 1.0
+depth_valid_min: 0.0
+depth_valid_max: 1000000000.0
+
+# Unused in depth mode but kept for config compatibility.
+num_classes: 0
+ignore_index: 255
+infer_num_classes_max_samples: 256
+
+# Common settings.
+require_labels: true
+

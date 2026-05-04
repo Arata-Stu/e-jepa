@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import csv
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -134,6 +135,7 @@ class EventVideoDataset(torch.utils.data.Dataset):
         file_pattern: str = "*.h5",
         recursive: bool = True,
         require_voxels_key: bool = True,
+        max_open_h5_files: int = 32,
     ):
         if isinstance(data_paths, (str, Path)):
             data_paths = [data_paths]
@@ -154,6 +156,7 @@ class EventVideoDataset(torch.utils.data.Dataset):
         self.shared_transform = shared_transform
         self.random_clip_sampling = bool(random_clip_sampling)
         self.allow_clip_overlap = bool(allow_clip_overlap)
+        self.max_open_h5_files = max(1, int(max_open_h5_files))
 
         if dataset_fpcs is None:
             self.dataset_fpcs = [int(frames_per_clip) for _ in self.data_paths]
@@ -193,11 +196,11 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 self.sample_weights += [float(dw) / float(ns)] * int(ns)
 
         # Worker-local lazy cache. We intentionally avoid sharing handles.
-        self._h5_cache: dict[str, h5py.File] = {}
+        self._h5_cache: OrderedDict[str, h5py.File] = OrderedDict()
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_h5_cache"] = {}
+        state["_h5_cache"] = OrderedDict()
         return state
 
     def __del__(self):
@@ -215,9 +218,20 @@ class EventVideoDataset(torch.utils.data.Dataset):
 
     def _get_h5(self, sample_path: str) -> h5py.File:
         h5f = self._h5_cache.get(sample_path)
-        if h5f is None:
-            h5f = h5py.File(sample_path, "r")
-            self._h5_cache[sample_path] = h5f
+        if h5f is not None:
+            self._h5_cache.move_to_end(sample_path, last=True)
+            return h5f
+
+        h5f = h5py.File(sample_path, "r")
+        self._h5_cache[sample_path] = h5f
+        self._h5_cache.move_to_end(sample_path, last=True)
+
+        while len(self._h5_cache) > self.max_open_h5_files:
+            old_key, old_h5 = self._h5_cache.popitem(last=False)
+            try:
+                old_h5.close()
+            except Exception:
+                pass
         return h5f
 
     @staticmethod
@@ -400,6 +414,7 @@ def make_eventdataset(
     pin_mem: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int | None = None,
+    max_open_h5_files: int = 32,
     file_pattern: str = "*.h5",
     recursive: bool = True,
     require_voxels_key: bool = True,
@@ -418,6 +433,7 @@ def make_eventdataset(
         file_pattern=file_pattern,
         recursive=recursive,
         require_voxels_key=require_voxels_key,
+        max_open_h5_files=max_open_h5_files,
     )
 
     if datasets_weights is not None:

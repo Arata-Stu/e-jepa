@@ -18,6 +18,8 @@ num_workers: 8
 persistent_workers: true
 # Dataloader prefetch per worker. null => framework default (usually 2).
 prefetch_factor: null
+# Max opened HDF5 files per dataloader worker (LRU cache).
+max_open_h5_files: 32
 pin_mem: true
 # Temporal subsampling stride before fpc fitting.
 frame_sample_rate: 1

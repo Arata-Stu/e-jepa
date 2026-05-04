@@ -32,6 +32,7 @@ def init_data(
     datasets_weights=None,
     persistent_workers=False,
     prefetch_factor=None,
+    max_open_h5_files=32,
     deterministic=True,  # Kept for compatibility.
     log_dir=None,  # Kept for compatibility.
     file_pattern="*.h5",
@@ -66,6 +67,7 @@ def init_data(
             pin_mem=pin_mem,
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
+            max_open_h5_files=max_open_h5_files,
             file_pattern=file_pattern,
             recursive=recursive,
             require_voxels_key=require_voxels_key,

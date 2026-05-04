@@ -284,6 +284,9 @@ def main(args, resume_preempt: bool = False):
         prefetch_factor = int(prefetch_factor)
         if prefetch_factor < 1:
             raise ValueError("data.prefetch_factor must be >= 1 or null")
+    max_open_h5_files = int(cfgs_data.get("max_open_h5_files", 32))
+    if max_open_h5_files < 1:
+        raise ValueError("data.max_open_h5_files must be >= 1")
     num_clips = int(cfgs_data.get("num_clips", 1))
     random_clip_sampling = bool(cfgs_data.get("random_clip_sampling", True))
     allow_clip_overlap = bool(cfgs_data.get("allow_clip_overlap", False))
@@ -539,6 +542,7 @@ def main(args, resume_preempt: bool = False):
         pin_mem=pin_mem,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        max_open_h5_files=max_open_h5_files,
         file_pattern=file_pattern,
         recursive=recursive,
     )

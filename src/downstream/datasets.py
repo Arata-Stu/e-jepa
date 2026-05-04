@@ -5,6 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
+try:
+    import hdf5plugin  # noqa: F401
+except ImportError as exc:
+    raise ImportError(
+        "hdf5plugin is required to load voxel HDF5 datasets. "
+        "Please install dependencies (e.g. `pip install -r requirements.txt`)."
+    ) from exc
+
 import h5py
 import numpy as np
 import torch

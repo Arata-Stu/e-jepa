@@ -6,7 +6,7 @@ model_name: vit_tiny
 in_chans: 20
 
 # Predictor is also downsized for tiny backbone.
-pred_depth: 6
+pred_depth: 12
 pred_num_heads: 3
 pred_embed_dim: 192
 

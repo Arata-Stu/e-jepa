@@ -62,20 +62,42 @@ class VisionTransformerPredictor(nn.Module):
         self.chop_last_n_tokens = chop_last_n_tokens
         self.has_cls_first = has_cls_first
 
-        if depth == 4:
-            all_hierarchical_layers = [0, 1, 2, 3]
-        elif depth == 8:
-            all_hierarchical_layers = [1, 3, 5, 7]
-        elif depth == 12:
-            all_hierarchical_layers = [2, 5, 8, 11]
-        elif depth == 20:
-            all_hierarchical_layers = [4, 9, 14, 19]
-        elif depth == 24:
-            all_hierarchical_layers = [4, 11, 17, 23]
-        elif depth == 40:
-            all_hierarchical_layers = [9, 19, 29, 39]
+        # Predictor distillation taps.
+        # Keep explicit presets where available, and fall back to an evenly
+        # spaced selection for unsupported depths (e.g. depth=6 for ViT-Tiny).
+        layer_presets = {
+            4: [0, 1, 2, 3],
+            6: [1, 2, 4, 5],
+            8: [1, 3, 5, 7],
+            12: [2, 5, 8, 11],
+            20: [4, 9, 14, 19],
+            24: [4, 11, 17, 23],
+            40: [9, 19, 29, 39],
+        }
+        if depth in layer_presets:
+            all_hierarchical_layers = layer_presets[depth]
+        else:
+            n_layers = min(4, int(depth))
+            if n_layers <= 0:
+                raise ValueError(f"depth must be >= 1, got {depth}")
+            step = (depth - 1) / float(max(n_layers - 1, 1))
+            all_hierarchical_layers = sorted(
+                {int(round(i * step)) for i in range(n_layers)}
+            )
+            # Guard against accidental dedup for very small/odd depths.
+            if len(all_hierarchical_layers) < n_layers:
+                all_hierarchical_layers = list(range(depth - n_layers, depth))
 
-        n_output_distillation = kwargs.get("n_output_distillation", len(all_hierarchical_layers))
+        n_output_distillation = int(
+            kwargs.get("n_output_distillation", len(all_hierarchical_layers))
+        )
+        if n_output_distillation < 1 or n_output_distillation > len(
+            all_hierarchical_layers
+        ):
+            raise ValueError(
+                "n_output_distillation must be in [1, len(hierarchical_layers)], "
+                f"got {n_output_distillation} for depth={depth}"
+            )
         self.hierarchical_layers = all_hierarchical_layers[-n_output_distillation:]
 
         act_layer_mlp = nn.SiLU if use_silu else nn.GELU

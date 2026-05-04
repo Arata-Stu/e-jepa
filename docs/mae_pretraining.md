@@ -13,6 +13,22 @@
   - `model.loss_type=l1` (MAE)
 - Keep augmentation and dataset setup aligned with JEPA config for ablation.
 
+## Unified launcher (1GPU / multi-GPU 共通)
+
+`scripts/launch_pretrain.py` を使うと、同じ起動形式で GPU 数を自動検出して `torchrun` します。
+
+```bash
+python3 scripts/launch_pretrain.py mae \
+  folder=outputs/stage1_mae_dsec_auto \
+  data.datasets=[/data/DSEC_voxels/train] \
+  data.dataset_fpcs=[16] \
+  data.batch_size=8
+```
+
+- 1GPU 環境: `nproc_per_node=1` で実行
+- 複数GPU環境: `nproc_per_node=<GPU数>` で実行
+- 明示指定したい場合: `--nproc-per-node 4` など
+
 ## Single GPU example
 
 ```bash

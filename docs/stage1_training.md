@@ -86,3 +86,14 @@ torchrun --nproc_per_node=4 scripts/train/run_train.py \
   - image rank は `img_data` 設定 (`dataset_fpcs=[1]` など) を使用
   - image rank で `img_mask` が指定されていれば `img_mask` を適用
   - video rank は通常の `data` と `mask` を継続使用
+- `meta.use_tqdm=true` で、stepごとの logger 出力を抑えて tqdm 進捗表示に切り替えられます。
+
+## ViT Tiny preset
+
+`model=vit_tiny_2_1` を指定すると、ViT-Tiny + 軽量predictor設定に切り替えられます。
+
+```bash
+python3 scripts/train/run_train.py \
+  model=vit_tiny_2_1 \
+  folder=outputs/stage1_tiny
+```

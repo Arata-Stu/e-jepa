@@ -16,6 +16,8 @@ tubelet_size: 2
 fps: 4
 num_workers: 8
 persistent_workers: true
+# Dataloader prefetch per worker. null => framework default (usually 2).
+prefetch_factor: null
 pin_mem: true
 # Temporal subsampling stride before fpc fitting.
 frame_sample_rate: 1
@@ -26,4 +28,3 @@ allow_clip_overlap: false
 # Scan options for directory mode.
 file_pattern: "*.h5"
 recursive: true
-

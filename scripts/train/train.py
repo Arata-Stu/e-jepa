@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
+from tqdm import tqdm
 
 from src.datasets.data_manager import init_data
 from src.datasets.transforms import make_event_transforms
@@ -155,6 +156,7 @@ def main(args, resume_preempt: bool = False):
     which_dtype = cfgs_meta.get("dtype", "float32")
     dtype, mixed_precision = _to_dtype(which_dtype)
     log_freq = int(cfgs_meta.get("log_freq", 10))
+    use_tqdm = bool(cfgs_meta.get("use_tqdm", False))
     checkpoint_freq = int(cfgs_meta.get("checkpoint_freq", 1))
     save_every_freq = int(cfgs_meta.get("save_every_freq", -1))
     skip_batches = int(cfgs_meta.get("skip_batches", -1))
@@ -277,6 +279,11 @@ def main(args, resume_preempt: bool = False):
     pin_mem = bool(cfgs_data.get("pin_mem", True))
     num_workers = int(cfgs_data.get("num_workers", 4))
     persistent_workers = bool(cfgs_data.get("persistent_workers", True))
+    prefetch_factor = cfgs_data.get("prefetch_factor", None)
+    if prefetch_factor is not None:
+        prefetch_factor = int(prefetch_factor)
+        if prefetch_factor < 1:
+            raise ValueError("data.prefetch_factor must be >= 1 or null")
     num_clips = int(cfgs_data.get("num_clips", 1))
     random_clip_sampling = bool(cfgs_data.get("random_clip_sampling", True))
     allow_clip_overlap = bool(cfgs_data.get("allow_clip_overlap", False))
@@ -531,6 +538,7 @@ def main(args, resume_preempt: bool = False):
         num_workers=num_workers,
         pin_mem=pin_mem,
         persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         file_pattern=file_pattern,
         recursive=recursive,
     )
@@ -661,6 +669,14 @@ def main(args, resume_preempt: bool = False):
 
     for epoch in range(start_epoch, num_epochs):
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+        pbar = None
+        if rank == 0 and use_tqdm:
+            pbar = tqdm(
+                total=ipe,
+                desc=f"Epoch {epoch + 1}/{num_epochs}",
+                dynamic_ncols=True,
+                leave=True,
+            )
 
         if data_sampler is not None and hasattr(data_sampler, "set_epoch"):
             data_sampler.set_epoch(epoch)
@@ -909,17 +925,27 @@ def main(args, resume_preempt: bool = False):
                 tb_writer.add_scalar("time/gpu_ms", gpu_etime_ms, global_step)
                 tb_writer.add_scalar("time/data_ms", data_elapsed_time_ms, global_step)
 
-            if (
-                itr % log_freq == 0
-                or itr == ipe - 1
-                or np.isnan(loss)
-                or np.isinf(loss)
-            ):
-                max_mem_mb = (
-                    torch.cuda.max_memory_allocated() / (1024.0**2)
-                    if torch.cuda.is_available()
-                    else 0.0
+            max_mem_mb = (
+                torch.cuda.max_memory_allocated() / (1024.0**2)
+                if torch.cuda.is_available()
+                else 0.0
+            )
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(
+                    loss=f"{loss_meter.avg:.4f}",
+                    lr=f"{new_lr:.2e}",
+                    wd=f"{new_wd:.2e}",
+                    mem=f"{max_mem_mb:.0f}MB",
+                    iter=f"{iter_time_meter.avg:.0f}ms",
+                    gpu=f"{gpu_time_meter.avg:.0f}ms",
+                    data=f"{data_elapsed_time_meter.avg:.0f}ms",
                 )
+
+            if (
+                (itr % log_freq == 0 or itr == ipe - 1 or np.isnan(loss) or np.isinf(loss))
+                and not use_tqdm
+            ):
                 logger.info(
                     "[%d, %5d] loss: %.4f masks: %s [wd: %.2e] [lr: %.2e] [mem: %.2f MB] [iter: %.1f ms] [gpu: %.1f ms] [data: %.1f ms]"
                     % (
@@ -940,6 +966,9 @@ def main(args, resume_preempt: bool = False):
 
             if np.isnan(loss) or np.isinf(loss):
                 raise RuntimeError("Loss became NaN/Inf")
+
+        if pbar is not None:
+            pbar.close()
 
         if tb_writer is not None:
             tb_writer.add_scalar("epoch/loss_avg", loss_meter.avg, epoch + 1)

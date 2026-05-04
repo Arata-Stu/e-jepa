@@ -62,6 +62,7 @@ torchrun --nproc_per_node=4 scripts/mae/run_mae.py \
   - `meta.read_checkpoint=/path/to/latest_mae.pth.tar`
   - or `meta.auto_resume_latest=true`
 - Current implementation is video-branch only (`model.img_temporal_dim_size` must be `null`).
+- `meta.use_tqdm=true` で、stepごとの logger 出力を抑えて tqdm 進捗表示に切り替えられます。
 
 ## Downstream with MAE encoder
 

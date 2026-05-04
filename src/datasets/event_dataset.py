@@ -399,6 +399,7 @@ def make_eventdataset(
     num_workers: int = 10,
     pin_mem: bool = True,
     persistent_workers: bool = True,
+    prefetch_factor: int | None = None,
     file_pattern: str = "*.h5",
     recursive: bool = True,
     require_voxels_key: bool = True,
@@ -434,8 +435,8 @@ def make_eventdataset(
             shuffle=True,
         )
 
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
+    dataloader_kwargs = dict(
+        dataset=dataset,
         collate_fn=collator,
         sampler=sampler,
         batch_size=batch_size,
@@ -444,4 +445,8 @@ def make_eventdataset(
         num_workers=num_workers,
         persistent_workers=(num_workers > 0) and persistent_workers,
     )
+    if num_workers > 0 and prefetch_factor is not None:
+        dataloader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
+    data_loader = torch.utils.data.DataLoader(**dataloader_kwargs)
     return dataset, data_loader, sampler

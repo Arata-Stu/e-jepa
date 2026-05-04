@@ -13,6 +13,8 @@ tensorboard: true
 log_all_ranks: false
 # Logging/checkpoint cadence.
 log_freq: 10
+# Use tqdm progress bar instead of per-step logger.info output.
+use_tqdm: false
 checkpoint_freq: 1
 save_every_freq: 50
 skip_batches: -1

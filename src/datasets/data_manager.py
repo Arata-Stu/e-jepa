@@ -31,6 +31,7 @@ def init_data(
     filter_long_videos=int(1e9),  # Kept for compatibility.
     datasets_weights=None,
     persistent_workers=False,
+    prefetch_factor=None,
     deterministic=True,  # Kept for compatibility.
     log_dir=None,  # Kept for compatibility.
     file_pattern="*.h5",
@@ -64,6 +65,7 @@ def init_data(
             num_workers=num_workers,
             pin_mem=pin_mem,
             persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
             file_pattern=file_pattern,
             recursive=recursive,
             require_voxels_key=require_voxels_key,

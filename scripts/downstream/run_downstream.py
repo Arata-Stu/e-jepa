@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 
@@ -28,6 +29,7 @@ def _save_resolved_config(cfg: DictConfig) -> None:
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    cfg.folder = HydraConfig.get().runtime.output_dir
     _save_resolved_config(cfg)
 
     from scripts.downstream.train import main as train_main

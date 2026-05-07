@@ -6,10 +6,10 @@ defaults:
   - meta: default
   - _self_
 
+# Base output directory for checkpoints/logs/tensorboard.
 folder: outputs/downstream
 
 hydra:
   run:
-    dir: .
+    dir: ${folder}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   output_subdir: null
-

@@ -219,6 +219,7 @@ class _FileMeta:
     # DSEC
     segmentation_dir: Path | None = None
     segmentation_relpaths: tuple[str, ...] = ()
+    embedded_segmentation_dataset_path: str | None = None
     # M3ED
     source_h5: Path | None = None
     window_index: np.ndarray | None = None
@@ -335,13 +336,12 @@ class EventDenseTaskDataset(Dataset):
             all_indices = np.arange(num_windows, dtype=np.int64)
 
             if self.dataset_kind == "dsec":
-                if "segmentation_relpath" not in h5f:
-                    return None, np.empty((0,), dtype=np.int64)
-                seg_rel = h5f["segmentation_relpath"][()]
-                relpaths = tuple(_decode_h5_string(v).strip() for v in seg_rel.tolist())
-                if len(relpaths) != num_windows:
-                    return None, np.empty((0,), dtype=np.int64)
-
+                embedded_seg_ds_path = None
+                embedded_label_ds_path = _load_h5_attr_str(h5f, "embedded_label_dataset", default="")
+                if embedded_label_ds_path == "embedded_segmentation" and embedded_label_ds_path in h5f:
+                    embedded_ds = h5f[embedded_label_ds_path]
+                    if embedded_ds.ndim >= 3 and int(embedded_ds.shape[0]) == num_windows:
+                        embedded_seg_ds_path = embedded_label_ds_path
                 if "segmentation_available" in h5f:
                     avail = np.asarray(h5f["segmentation_available"][()], dtype=np.int64).reshape(-1)
                     if avail.shape[0] != num_windows:
@@ -349,26 +349,39 @@ class EventDenseTaskDataset(Dataset):
                 else:
                     avail = np.ones((num_windows,), dtype=np.int64)
 
-                seg_dir_s = _load_h5_attr_str(h5f, "segmentation_dir", default="")
-                seg_dir = Path(seg_dir_s).expanduser() if seg_dir_s else None
+                relpaths: tuple[str, ...] = ()
+                seg_dir = None
                 valid = []
-                for idx in range(num_windows):
-                    if int(avail[idx]) <= 0:
-                        continue
-                    rel = relpaths[idx]
-                    if rel == "":
-                        continue
-                    if seg_dir is None:
-                        continue
-                    if not (seg_dir / rel).exists():
-                        continue
-                    valid.append(idx)
+                if embedded_seg_ds_path is not None:
+                    valid = [idx for idx in range(num_windows) if int(avail[idx]) > 0]
+                else:
+                    if "segmentation_relpath" not in h5f:
+                        return None, np.empty((0,), dtype=np.int64)
+                    seg_rel = h5f["segmentation_relpath"][()]
+                    relpaths = tuple(_decode_h5_string(v).strip() for v in seg_rel.tolist())
+                    if len(relpaths) != num_windows:
+                        return None, np.empty((0,), dtype=np.int64)
+
+                    seg_dir_s = _load_h5_attr_str(h5f, "segmentation_dir", default="")
+                    seg_dir = Path(seg_dir_s).expanduser() if seg_dir_s else None
+                    for idx in range(num_windows):
+                        if int(avail[idx]) <= 0:
+                            continue
+                        rel = relpaths[idx]
+                        if rel == "":
+                            continue
+                        if seg_dir is None:
+                            continue
+                        if not (seg_dir / rel).exists():
+                            continue
+                        valid.append(idx)
 
                 meta = _FileMeta(
                     preprocessed_h5=h5_path,
                     num_windows=num_windows,
                     segmentation_dir=seg_dir,
                     segmentation_relpaths=relpaths,
+                    embedded_segmentation_dataset_path=embedded_seg_ds_path,
                 )
                 return meta, np.asarray(valid, dtype=np.int64)
 
@@ -512,11 +525,14 @@ class EventDenseTaskDataset(Dataset):
         clip_cthw = torch.from_numpy(clip_tchw).permute(1, 0, 2, 3).contiguous()  # [C,T,H,W]
 
         if self.dataset_kind == "dsec":
-            assert meta.segmentation_dir is not None
-            rel = meta.segmentation_relpaths[int(center_window)]
-            label_path = meta.segmentation_dir / rel
-            with Image.open(str(label_path)) as img:
-                label_np = np.asarray(img)
+            if meta.embedded_segmentation_dataset_path is not None:
+                label_np = np.asarray(pre_h5[meta.embedded_segmentation_dataset_path][int(center_window)])
+            else:
+                assert meta.segmentation_dir is not None
+                rel = meta.segmentation_relpaths[int(center_window)]
+                label_path = meta.segmentation_dir / rel
+                with Image.open(str(label_path)) as img:
+                    label_np = np.asarray(img)
             label_np = _squeeze_to_hw(label_np, target="semantic")
             label = torch.from_numpy(label_np.astype(np.int64, copy=False))
             label = _resize_label_to_hw(label, target_h=h, target_w=w, target="semantic")

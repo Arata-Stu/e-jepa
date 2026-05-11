@@ -19,6 +19,7 @@ import h5py
 import numpy as np
 import torch
 import tqdm
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -391,6 +392,22 @@ def _match_segmentation_timestamp(
     return available, matched_ts, delta_us, relpath
 
 
+def _load_segmentation_label(segmentation_dir: Path, relpath: str) -> np.ndarray:
+    label_path = segmentation_dir / relpath
+    with Image.open(str(label_path)) as img:
+        label = np.asarray(img)
+    if label.ndim == 2:
+        return label
+    if label.ndim == 3 and label.shape[0] == 1:
+        return label[0]
+    if label.ndim == 3 and label.shape[-1] == 1:
+        return label[..., 0]
+    raise ValueError(
+        f"Unsupported DSEC segmentation shape={label.shape} at {label_path}. "
+        "Expected class-index map (H,W) or singleton-channel variant."
+    )
+
+
 def _compute_activity_metadata(
     voxel: np.ndarray,
     *,
@@ -445,6 +462,9 @@ class VoxelH5Writer:
         width: int,
         voxel_dtype: np.dtype,
         with_segmentation_meta: bool = False,
+        with_embedded_segmentation: bool = False,
+        embedded_segmentation_shape: tuple[int, int] = (1, 1),
+        embedded_segmentation_dtype: np.dtype = np.uint8,
         activity_grid_shape: tuple[int, ...] = (1, 1, 1),
         initial_capacity: int = 256,
     ):
@@ -457,6 +477,7 @@ class VoxelH5Writer:
         self._capacity = int(initial_capacity)
         self._num_windows = 0
         self._with_segmentation_meta = bool(with_segmentation_meta)
+        self._with_embedded_segmentation = bool(with_embedded_segmentation)
         self._datasets: list[str] = [
             "voxels",
             "window_t_start_us",
@@ -535,6 +556,17 @@ class VoxelH5Writer:
             chunks=(1,) + tuple(activity_grid_shape),
             **H5_COMPRESSION_FLAGS,
         )
+        if self._with_embedded_segmentation:
+            seg_h, seg_w = embedded_segmentation_shape
+            self.h5f.create_dataset(
+                "embedded_segmentation",
+                shape=(self._capacity, int(seg_h), int(seg_w)),
+                maxshape=(None, int(seg_h), int(seg_w)),
+                dtype=embedded_segmentation_dtype,
+                chunks=(1, min(int(seg_h), 256), min(int(seg_w), 256)),
+                **H5_COMPRESSION_FLAGS,
+            )
+            self._datasets.append("embedded_segmentation")
 
         if self._with_segmentation_meta:
             string_dtype = h5py.string_dtype(encoding="utf-8")
@@ -604,6 +636,7 @@ class VoxelH5Writer:
         activity_score: float,
         active_pixel_ratio: float,
         activity_grid: np.ndarray,
+        embedded_segmentation: np.ndarray | None = None,
         segmentation_available: int = 0,
         segmentation_timestamp_us: int = -1,
         segmentation_time_delta_us: int = -1,
@@ -620,6 +653,10 @@ class VoxelH5Writer:
         self.h5f["window_activity_score"][idx] = float(activity_score)
         self.h5f["window_active_pixel_ratio"][idx] = float(active_pixel_ratio)
         self.h5f["window_activity_grid"][idx] = activity_grid
+        if self._with_embedded_segmentation:
+            if embedded_segmentation is None:
+                raise ValueError("embedded_segmentation is required when with_embedded_segmentation=True")
+            self.h5f["embedded_segmentation"][idx] = embedded_segmentation
         if self._with_segmentation_meta:
             self.h5f["segmentation_available"][idx] = int(segmentation_available)
             self.h5f["segmentation_timestamp_us"][idx] = int(segmentation_timestamp_us)
@@ -721,42 +758,41 @@ def process_single_file(
                 )
                 ms_to_idx_source = "generated"
 
-            writer = VoxelH5Writer(
-                outfile=tmp_path,
-                t_bins=voxel_channels,
-                height=output_height,
-                width=output_width,
-                voxel_dtype=voxel_dtype,
-                with_segmentation_meta=sync_segmentation,
-                activity_grid_shape=activity_grid_shape,
-            )
-            writer.h5f.attrs["representation"] = "event_voxel_grid"
-            writer.h5f.attrs["source_file"] = str(input_path)
-            writer.h5f.attrs["input_height"] = int(height)
-            writer.h5f.attrs["input_width"] = int(width)
-            writer.h5f.attrs["height"] = int(output_height)
-            writer.h5f.attrs["width"] = int(output_width)
-            writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
-            writer.h5f.attrs["spatial_resize_mode"] = "nearest"
-            writer.h5f.attrs["t_bins"] = int(t_bins)
-            writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
-            writer.h5f.attrs["split_polarity"] = int(split_polarity)
-            writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
-            writer.h5f.attrs["window_mode"] = window_mode
-            writer.h5f.attrs["accum_time_us"] = int(accum_time)
-            writer.h5f.attrs["stride_time_us"] = int(stride_time)
-            writer.h5f.attrs["normalize"] = int(normalize)
-            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
-            writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
-            writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
-            writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
-            writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
-            writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
-            writer.h5f.attrs["activity_mode"] = str(activity_mode)
-            writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
-            writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
-
             if t_first is None or t_last_exclusive is None:
+                writer = VoxelH5Writer(
+                    outfile=tmp_path,
+                    t_bins=voxel_channels,
+                    height=output_height,
+                    width=output_width,
+                    voxel_dtype=voxel_dtype,
+                    with_segmentation_meta=sync_segmentation,
+                    activity_grid_shape=activity_grid_shape,
+                )
+                writer.h5f.attrs["representation"] = "event_voxel_grid"
+                writer.h5f.attrs["source_file"] = str(input_path)
+                writer.h5f.attrs["input_height"] = int(height)
+                writer.h5f.attrs["input_width"] = int(width)
+                writer.h5f.attrs["height"] = int(output_height)
+                writer.h5f.attrs["width"] = int(output_width)
+                writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
+                writer.h5f.attrs["spatial_resize_mode"] = "nearest"
+                writer.h5f.attrs["t_bins"] = int(t_bins)
+                writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
+                writer.h5f.attrs["split_polarity"] = int(split_polarity)
+                writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
+                writer.h5f.attrs["window_mode"] = window_mode
+                writer.h5f.attrs["accum_time_us"] = int(accum_time)
+                writer.h5f.attrs["stride_time_us"] = int(stride_time)
+                writer.h5f.attrs["normalize"] = int(normalize)
+                writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+                writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
+                writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
+                writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
+                writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
+                writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
+                writer.h5f.attrs["activity_mode"] = str(activity_mode)
+                writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
+                writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
                 writer.h5f.attrs["time_origin_us"] = -1
                 writer.close()
                 writer = None
@@ -787,6 +823,58 @@ def process_single_file(
                 seg_timestamps, seg_relpaths = _load_segmentation_index(segmentation_dir)
             else:
                 seg_timestamps, seg_relpaths = np.empty((0,), dtype=np.int64), []
+
+            embedded_segmentation_shape: tuple[int, int] | None = None
+            embedded_segmentation_dtype: np.dtype | None = None
+            if sync_segmentation and segmentation_dir is not None:
+                for rel in seg_relpaths:
+                    if not rel:
+                        continue
+                    sample_label = _load_segmentation_label(segmentation_dir, rel)
+                    embedded_segmentation_shape = tuple(int(v) for v in sample_label.shape)
+                    embedded_segmentation_dtype = sample_label.dtype
+                    break
+
+            writer = VoxelH5Writer(
+                outfile=tmp_path,
+                t_bins=voxel_channels,
+                height=output_height,
+                width=output_width,
+                voxel_dtype=voxel_dtype,
+                with_segmentation_meta=sync_segmentation,
+                with_embedded_segmentation=embedded_segmentation_shape is not None,
+                embedded_segmentation_shape=embedded_segmentation_shape or (1, 1),
+                embedded_segmentation_dtype=(embedded_segmentation_dtype if embedded_segmentation_dtype is not None else np.uint8),
+                activity_grid_shape=activity_grid_shape,
+            )
+            writer.h5f.attrs["representation"] = "event_voxel_grid"
+            writer.h5f.attrs["source_file"] = str(input_path)
+            writer.h5f.attrs["input_height"] = int(height)
+            writer.h5f.attrs["input_width"] = int(width)
+            writer.h5f.attrs["height"] = int(output_height)
+            writer.h5f.attrs["width"] = int(output_width)
+            writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
+            writer.h5f.attrs["spatial_resize_mode"] = "nearest"
+            writer.h5f.attrs["t_bins"] = int(t_bins)
+            writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
+            writer.h5f.attrs["split_polarity"] = int(split_polarity)
+            writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
+            writer.h5f.attrs["window_mode"] = window_mode
+            writer.h5f.attrs["accum_time_us"] = int(accum_time)
+            writer.h5f.attrs["stride_time_us"] = int(stride_time)
+            writer.h5f.attrs["normalize"] = int(normalize)
+            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+            writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
+            writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
+            writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
+            writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
+            writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
+            writer.h5f.attrs["activity_mode"] = str(activity_mode)
+            writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
+            writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
+            if embedded_segmentation_shape is not None:
+                writer.h5f.attrs["embedded_label_dataset"] = "embedded_segmentation"
+                writer.h5f.attrs["embedded_label_source_path"] = str(segmentation_dir)
 
             voxelizer = EventVoxelGrid(
                 input_size=(t_bins, output_height, output_width),
@@ -825,6 +913,7 @@ def process_single_file(
                 seg_timestamp = -1
                 seg_delta = -1
                 seg_relpath = ""
+                embedded_segmentation = None
                 if sync_segmentation:
                     seg_available, seg_timestamp, seg_delta, seg_relpath = _match_segmentation_timestamp(
                         anchor_us=anchor_us_int,
@@ -832,6 +921,20 @@ def process_single_file(
                         seg_relpaths=seg_relpaths,
                         tolerance_us=segmentation_tolerance_us,
                     )
+                    if seg_available and segmentation_dir is not None and embedded_segmentation_shape is not None:
+                        embedded_segmentation = _load_segmentation_label(segmentation_dir, seg_relpath)
+                        if embedded_segmentation.shape != embedded_segmentation_shape:
+                            raise ValueError(
+                                "Inconsistent DSEC segmentation shape: "
+                                f"expected {embedded_segmentation_shape}, got {embedded_segmentation.shape} "
+                                f"for {segmentation_dir / seg_relpath}"
+                            )
+                    elif embedded_segmentation_shape is not None:
+                        embedded_segmentation = np.full(
+                            embedded_segmentation_shape,
+                            fill_value=255,
+                            dtype=embedded_segmentation_dtype if embedded_segmentation_dtype is not None else np.uint8,
+                        )
                 writer.add_window(
                     voxel=voxel,
                     t_start_us=start_us_int,
@@ -841,6 +944,7 @@ def process_single_file(
                     activity_score=activity_score,
                     active_pixel_ratio=active_pixel_ratio,
                     activity_grid=activity_grid,
+                    embedded_segmentation=embedded_segmentation,
                     segmentation_available=seg_available,
                     segmentation_timestamp_us=seg_timestamp,
                     segmentation_time_delta_us=seg_delta,

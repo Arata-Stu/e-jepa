@@ -64,6 +64,9 @@ python3 scripts/preprocess/run_preprocess.py \
 `image_root` は通常不要です（`<sequence>/images/...` を自動参照）。  
 画像ディレクトリが別ルートに分離されている場合のみ `dataset.image_root=...` を指定します。
 
+`dataset.sync_segmentation=true` のときは、同期 metadata だけでなく `embedded_segmentation` も同じ H5 に保存します。  
+さらに `activity_mode=full|light` で `window_activity_*` metadata も保存されます。
+
 ## 1MPX
 
 ```bash

@@ -235,6 +235,11 @@ def _dataset_name_allowed(dataset_name: str, metadata_mode: str) -> bool:
         "window_activity_score",
         "window_active_pixel_ratio",
         "window_activity_grid",
+        "embedded_segmentation",
+        "segmentation_available",
+        "segmentation_timestamp_us",
+        "segmentation_time_delta_us",
+        "segmentation_relpath",
     }
     return dataset_name in keep
 

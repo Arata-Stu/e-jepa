@@ -232,6 +232,9 @@ def _dataset_name_allowed(dataset_name: str, metadata_mode: str) -> bool:
         "anchor_timestamp_us",
         "anchor_rel_timestamp_us",
         "window_event_count",
+        "window_activity_score",
+        "window_active_pixel_ratio",
+        "window_activity_grid",
     }
     return dataset_name in keep
 
@@ -440,6 +443,36 @@ def _process_one_file(
         done += 1
 
     return str(input_path), int(n_samples), int(done)
+
+
+def split_voxel_h5_file(
+    *,
+    input_path: Path,
+    output_base_path: Path,
+    chunk_duration_s: float = 20.0,
+    copy_batch_size: int = 8,
+    min_windows_per_chunk: int = 1,
+    chunk_index_pad: int = 4,
+    overwrite: bool = False,
+    metadata_mode: str = "full",
+    progress_interval_s: float = 0.0,
+    log_chunk_progress: bool = False,
+    log_dataset_progress: bool = False,
+) -> tuple[int, int]:
+    _, n_samples, n_written = _process_one_file(
+        input_path=input_path,
+        output_base_path=output_base_path,
+        chunk_duration_s=float(chunk_duration_s),
+        copy_batch_size=int(copy_batch_size),
+        min_windows_per_chunk=int(min_windows_per_chunk),
+        chunk_index_pad=int(chunk_index_pad),
+        overwrite=bool(overwrite),
+        metadata_mode=str(metadata_mode),
+        progress_interval_s=float(progress_interval_s),
+        log_chunk_progress=bool(log_chunk_progress),
+        log_dataset_progress=bool(log_dataset_progress),
+    )
+    return int(n_samples), int(n_written)
 
 
 def _worker(job: dict) -> tuple[str, bool, str | None, int, int]:

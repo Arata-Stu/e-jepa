@@ -79,8 +79,21 @@ def _run_dsec(cfg: DictConfig) -> None:
         segmentation_root=_optional_path(cfg.segmentation_root),
         segmentation_subdir=str(cfg.segmentation_subdir),
         segmentation_tolerance_us=int(cfg.segmentation_tolerance_us),
+        activity_mode=str(cfg.activity_mode),
+        activity_spatial_patch_size=int(cfg.activity_spatial_patch_size),
+        activity_temporal_patch_size=int(cfg.activity_temporal_patch_size),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),
+        split_chunk_duration_s=None if cfg.split_chunk_duration_s is None else float(cfg.split_chunk_duration_s),
+        split_output_root=_optional_path(cfg.split_output_root),
+        split_copy_batch_size=int(cfg.split_copy_batch_size),
+        split_min_windows_per_chunk=int(cfg.split_min_windows_per_chunk),
+        split_chunk_index_pad=int(cfg.split_chunk_index_pad),
+        split_metadata_mode=str(cfg.split_metadata_mode),
+        split_progress_interval_s=float(cfg.split_progress_interval_s),
+        split_log_chunk_progress=bool(cfg.split_log_chunk_progress),
+        split_log_dataset_progress=bool(cfg.split_log_dataset_progress),
+        split_delete_source_after_success=bool(cfg.split_delete_source_after_success),
     )
 
 
@@ -116,6 +129,16 @@ def _run_1mpx(cfg: DictConfig) -> None:
         recursive=bool(cfg.recursive),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),
+        split_chunk_duration_s=None if cfg.split_chunk_duration_s is None else float(cfg.split_chunk_duration_s),
+        split_output_root=_optional_path(cfg.split_output_root),
+        split_copy_batch_size=int(cfg.split_copy_batch_size),
+        split_min_windows_per_chunk=int(cfg.split_min_windows_per_chunk),
+        split_chunk_index_pad=int(cfg.split_chunk_index_pad),
+        split_metadata_mode=str(cfg.split_metadata_mode),
+        split_progress_interval_s=float(cfg.split_progress_interval_s),
+        split_log_chunk_progress=bool(cfg.split_log_chunk_progress),
+        split_log_dataset_progress=bool(cfg.split_log_dataset_progress),
+        split_delete_source_after_success=bool(cfg.split_delete_source_after_success),
     )
 
 
@@ -147,8 +170,21 @@ def _run_m3ed(cfg: DictConfig) -> None:
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
         use_trilinear=bool(cfg.use_trilinear),
+        activity_mode=str(cfg.activity_mode),
+        activity_spatial_patch_size=int(cfg.activity_spatial_patch_size),
+        activity_temporal_patch_size=int(cfg.activity_temporal_patch_size),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),
+        split_chunk_duration_s=None if cfg.split_chunk_duration_s is None else float(cfg.split_chunk_duration_s),
+        split_output_root=_optional_path(cfg.split_output_root),
+        split_copy_batch_size=int(cfg.split_copy_batch_size),
+        split_min_windows_per_chunk=int(cfg.split_min_windows_per_chunk),
+        split_chunk_index_pad=int(cfg.split_chunk_index_pad),
+        split_metadata_mode=str(cfg.split_metadata_mode),
+        split_progress_interval_s=float(cfg.split_progress_interval_s),
+        split_log_chunk_progress=bool(cfg.split_log_chunk_progress),
+        split_log_dataset_progress=bool(cfg.split_log_dataset_progress),
+        split_delete_source_after_success=bool(cfg.split_delete_source_after_success),
     )
 
 
@@ -172,6 +208,9 @@ def _run_eventscape(cfg: DictConfig) -> None:
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
         use_trilinear=bool(cfg.use_trilinear),
+        activity_mode=str(cfg.activity_mode),
+        activity_spatial_patch_size=int(cfg.activity_spatial_patch_size),
+        activity_temporal_patch_size=int(cfg.activity_temporal_patch_size),
         tmp_suffix=str(cfg.tmp_suffix),
         num_processes=int(cfg.num_processes),
     )

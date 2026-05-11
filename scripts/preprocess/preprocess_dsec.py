@@ -35,10 +35,12 @@ from scripts.preprocess.utils import (
     normalized_output_suffix,
     tmp_output_path,
 )
+from scripts.preprocess.split_voxel_h5_by_duration import split_voxel_h5_file
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
 MS_TO_IDX_BUILD_CHUNK_EVENTS = 5_000_000
+ACTIVITY_MODES = {"full", "light"}
 
 
 def _empty_events() -> dict[str, np.ndarray]:
@@ -389,6 +391,51 @@ def _match_segmentation_timestamp(
     return available, matched_ts, delta_us, relpath
 
 
+def _compute_activity_metadata(
+    voxel: np.ndarray,
+    *,
+    temporal_bins: int,
+    split_polarity: bool,
+    spatial_patch_size: int,
+    temporal_patch_size: int,
+    activity_mode: str,
+) -> tuple[np.ndarray, float, float]:
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
+    channels, height, width = voxel.shape
+    if split_polarity:
+        activity_volume = np.abs(voxel).reshape(2, temporal_bins, height, width).sum(axis=0)
+    else:
+        activity_volume = np.abs(voxel)
+    nonzero_voxel_ratio = float(np.count_nonzero(activity_volume) / float(max(1, activity_volume.size)))
+    active_pixel_ratio = float(np.count_nonzero(activity_volume.sum(axis=0) > 0) / float(max(1, height * width)))
+    if activity_mode == "light":
+        spatial_volume = activity_volume.sum(axis=0, dtype=np.float32)
+        hp = (height + spatial_patch_size - 1) // spatial_patch_size
+        wp = (width + spatial_patch_size - 1) // spatial_patch_size
+        padded = np.pad(
+            spatial_volume,
+            ((0, hp * spatial_patch_size - height), (0, wp * spatial_patch_size - width)),
+            mode="constant",
+        )
+        grid = padded.reshape(hp, spatial_patch_size, wp, spatial_patch_size).sum(axis=(1, 3))
+        return grid.astype(np.float16, copy=False), nonzero_voxel_ratio, active_pixel_ratio
+    tp = (temporal_bins + temporal_patch_size - 1) // temporal_patch_size
+    hp = (height + spatial_patch_size - 1) // spatial_patch_size
+    wp = (width + spatial_patch_size - 1) // spatial_patch_size
+    padded = np.pad(
+        activity_volume,
+        (
+            (0, tp * temporal_patch_size - temporal_bins),
+            (0, hp * spatial_patch_size - height),
+            (0, wp * spatial_patch_size - width),
+        ),
+        mode="constant",
+    )
+    grid = padded.reshape(tp, temporal_patch_size, hp, spatial_patch_size, wp, spatial_patch_size).sum(axis=(1, 3, 5))
+    return grid.astype(np.float16, copy=False), nonzero_voxel_ratio, active_pixel_ratio
+
+
 class VoxelH5Writer:
     def __init__(
         self,
@@ -398,6 +445,7 @@ class VoxelH5Writer:
         width: int,
         voxel_dtype: np.dtype,
         with_segmentation_meta: bool = False,
+        activity_grid_shape: tuple[int, ...] = (1, 1, 1),
         initial_capacity: int = 256,
     ):
         if outfile.exists():
@@ -415,6 +463,9 @@ class VoxelH5Writer:
             "window_t_end_us",
             "window_event_count",
             "anchor_timestamp_us",
+            "window_activity_score",
+            "window_active_pixel_ratio",
+            "window_activity_grid",
         ]
 
         voxel_chunks = (1, t_bins, min(height, 64), min(width, 64))
@@ -458,6 +509,30 @@ class VoxelH5Writer:
             maxshape=(None,),
             dtype="i8",
             chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_activity_score",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_active_pixel_ratio",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_activity_grid",
+            shape=(self._capacity,) + tuple(activity_grid_shape),
+            maxshape=(None,) + tuple(activity_grid_shape),
+            dtype="f2",
+            chunks=(1,) + tuple(activity_grid_shape),
             **H5_COMPRESSION_FLAGS,
         )
 
@@ -526,6 +601,9 @@ class VoxelH5Writer:
         t_end_us: int,
         event_count: int,
         anchor_timestamp_us: int,
+        activity_score: float,
+        active_pixel_ratio: float,
+        activity_grid: np.ndarray,
         segmentation_available: int = 0,
         segmentation_timestamp_us: int = -1,
         segmentation_time_delta_us: int = -1,
@@ -539,6 +617,9 @@ class VoxelH5Writer:
         self.h5f["window_t_end_us"][idx] = int(t_end_us)
         self.h5f["window_event_count"][idx] = int(event_count)
         self.h5f["anchor_timestamp_us"][idx] = int(anchor_timestamp_us)
+        self.h5f["window_activity_score"][idx] = float(activity_score)
+        self.h5f["window_active_pixel_ratio"][idx] = float(active_pixel_ratio)
+        self.h5f["window_activity_grid"][idx] = activity_grid
         if self._with_segmentation_meta:
             self.h5f["segmentation_available"][idx] = int(segmentation_available)
             self.h5f["segmentation_timestamp_us"][idx] = int(segmentation_timestamp_us)
@@ -572,6 +653,9 @@ def process_single_file(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     sync_segmentation: bool,
     segmentation_dir: Path | None,
     segmentation_tolerance_us: int,
@@ -594,6 +678,8 @@ def process_single_file(
         raise ValueError(f"unsupported window_mode: {window_mode}")
     if window_mode == "image_middle" and image_timestamps_path is None:
         raise ValueError("window_mode=image_middle requires image_timestamps_path")
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
 
     output_height, output_width = _resolve_output_resolution(
         input_height=height,
@@ -602,6 +688,18 @@ def process_single_file(
     )
     voxel_channels = int(t_bins) * (2 if split_polarity else 1)
     voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
+    activity_grid_shape = (
+        (
+            (int(t_bins) + int(activity_temporal_patch_size) - 1) // int(activity_temporal_patch_size),
+            (int(output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+            (int(output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+        )
+        if activity_mode == "full"
+        else (
+            (int(output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+            (int(output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+        )
+    )
     if sync_segmentation and (segmentation_dir is None or not segmentation_dir.exists()):
         print(f"[WARN] segmentation directory unavailable for {input_path}; metadata will be marked unavailable.")
 
@@ -630,6 +728,7 @@ def process_single_file(
                 width=output_width,
                 voxel_dtype=voxel_dtype,
                 with_segmentation_meta=sync_segmentation,
+                activity_grid_shape=activity_grid_shape,
             )
             writer.h5f.attrs["representation"] = "event_voxel_grid"
             writer.h5f.attrs["source_file"] = str(input_path)
@@ -653,6 +752,9 @@ def process_single_file(
             writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
             writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
             writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
+            writer.h5f.attrs["activity_mode"] = str(activity_mode)
+            writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
+            writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
 
             if t_first is None or t_last_exclusive is None:
                 writer.h5f.attrs["time_origin_us"] = -1
@@ -711,6 +813,14 @@ def process_single_file(
                     downsample_factor=downsample_factor,
                 )
                 voxel = voxel.astype(voxel_dtype, copy=False)
+                activity_grid, activity_score, active_pixel_ratio = _compute_activity_metadata(
+                    voxel=voxel,
+                    temporal_bins=int(t_bins),
+                    split_polarity=bool(split_polarity),
+                    spatial_patch_size=int(activity_spatial_patch_size),
+                    temporal_patch_size=int(activity_temporal_patch_size),
+                    activity_mode=str(activity_mode),
+                )
                 seg_available = 0
                 seg_timestamp = -1
                 seg_delta = -1
@@ -728,6 +838,9 @@ def process_single_file(
                     t_end_us=end_us_int,
                     event_count=len(events["t"]),
                     anchor_timestamp_us=anchor_us_int,
+                    activity_score=activity_score,
+                    active_pixel_ratio=active_pixel_ratio,
+                    activity_grid=activity_grid,
                     segmentation_available=seg_available,
                     segmentation_timestamp_us=seg_timestamp,
                     segmentation_time_delta_us=seg_delta,
@@ -765,10 +878,24 @@ def _process_file_with_retry(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     sync_segmentation: bool,
     segmentation_dir: Path | None,
     segmentation_tolerance_us: int,
     tmp_suffix: str,
+    split_chunk_duration_s: float | None,
+    split_output_path: Path | None,
+    split_copy_batch_size: int,
+    split_min_windows_per_chunk: int,
+    split_chunk_index_pad: int,
+    split_metadata_mode: str,
+    split_progress_interval_s: float,
+    split_log_chunk_progress: bool,
+    split_log_dataset_progress: bool,
+    split_delete_source_after_success: bool,
+    overwrite: bool,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
     if not cleanup_tmp_file(tmp_path=stale_tmp_path, context=f"resume prep for {input_path}", strict=False):
@@ -792,12 +919,33 @@ def _process_file_with_retry(
                 normalize=normalize,
                 output_dtype=output_dtype,
                 use_trilinear=use_trilinear,
+                activity_mode=activity_mode,
+                activity_spatial_patch_size=activity_spatial_patch_size,
+                activity_temporal_patch_size=activity_temporal_patch_size,
                 sync_segmentation=sync_segmentation,
                 segmentation_dir=segmentation_dir,
                 segmentation_tolerance_us=segmentation_tolerance_us,
                 show_pbar=False,
                 tmp_suffix=tmp_suffix,
             )
+            if split_chunk_duration_s is not None and float(split_chunk_duration_s) > 0:
+                if split_output_path is None:
+                    raise ValueError("split_output_path must be provided when split_chunk_duration_s is set")
+                split_voxel_h5_file(
+                    input_path=output_path,
+                    output_base_path=split_output_path,
+                    chunk_duration_s=float(split_chunk_duration_s),
+                    copy_batch_size=int(split_copy_batch_size),
+                    min_windows_per_chunk=int(split_min_windows_per_chunk),
+                    chunk_index_pad=int(split_chunk_index_pad),
+                    overwrite=bool(overwrite),
+                    metadata_mode=str(split_metadata_mode),
+                    progress_interval_s=float(split_progress_interval_s),
+                    log_chunk_progress=bool(split_log_chunk_progress),
+                    log_dataset_progress=bool(split_log_dataset_progress),
+                )
+                if bool(split_delete_source_after_success):
+                    output_path.unlink(missing_ok=True)
             return True, None
         except Exception as exc:
             if attempt == 1:
@@ -835,10 +983,24 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
         use_trilinear=job["use_trilinear"],
+        activity_mode=job["activity_mode"],
+        activity_spatial_patch_size=job["activity_spatial_patch_size"],
+        activity_temporal_patch_size=job["activity_temporal_patch_size"],
         sync_segmentation=job["sync_segmentation"],
         segmentation_dir=segmentation_dir,
         segmentation_tolerance_us=job["segmentation_tolerance_us"],
         tmp_suffix=job["tmp_suffix"],
+        split_chunk_duration_s=job["split_chunk_duration_s"],
+        split_output_path=None if job["split_output_path"] is None else Path(job["split_output_path"]),
+        split_copy_batch_size=job["split_copy_batch_size"],
+        split_min_windows_per_chunk=job["split_min_windows_per_chunk"],
+        split_chunk_index_pad=job["split_chunk_index_pad"],
+        split_metadata_mode=job["split_metadata_mode"],
+        split_progress_interval_s=job["split_progress_interval_s"],
+        split_log_chunk_progress=job["split_log_chunk_progress"],
+        split_log_dataset_progress=job["split_log_dataset_progress"],
+        split_delete_source_after_success=job["split_delete_source_after_success"],
+        overwrite=job["overwrite"],
     )
     return str(input_path), ok, err
 
@@ -976,6 +1138,21 @@ def _build_output_path(
     return output_dir / output_filename
 
 
+def _build_split_output_path(
+    output_path: Path,
+    dataset_root: Path,
+    output_root: Path | None,
+    split_output_root: Path | None,
+) -> Path:
+    if split_output_root is None:
+        return output_path
+    if output_root is not None:
+        relative_output = output_path.relative_to(output_root)
+    else:
+        relative_output = output_path.relative_to(dataset_root)
+    return split_output_root / relative_output
+
+
 def process_dataset_root(
     dataset_root: Path,
     splits: list[str],
@@ -994,12 +1171,25 @@ def process_dataset_root(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     sync_segmentation: bool,
     segmentation_root: Path | None,
     segmentation_subdir: str,
     segmentation_tolerance_us: int,
     tmp_suffix: str,
     num_processes: int,
+    split_chunk_duration_s: float | None,
+    split_output_root: Path | None,
+    split_copy_batch_size: int,
+    split_min_windows_per_chunk: int,
+    split_chunk_index_pad: int,
+    split_metadata_mode: str,
+    split_progress_interval_s: float,
+    split_log_chunk_progress: bool,
+    split_log_dataset_progress: bool,
+    split_delete_source_after_success: bool,
     output_suffix: str | None = None,
     output_subdir: str | None = None,
     start_time_us: int | None = None,
@@ -1008,6 +1198,20 @@ def process_dataset_root(
         raise ValueError("num_processes must be >= 1")
     if output_name is not None and output_suffix is not None:
         raise ValueError("use either output_name or output_suffix, not both")
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
+    if split_chunk_duration_s is not None and float(split_chunk_duration_s) <= 0:
+        raise ValueError("split_chunk_duration_s must be > 0 when provided")
+    if int(split_copy_batch_size) < 1:
+        raise ValueError("split_copy_batch_size must be >= 1")
+    if int(split_min_windows_per_chunk) < 1:
+        raise ValueError("split_min_windows_per_chunk must be >= 1")
+    if int(split_chunk_index_pad) < 1:
+        raise ValueError("split_chunk_index_pad must be >= 1")
+    if str(split_metadata_mode) not in {"full", "minimal"}:
+        raise ValueError("split_metadata_mode must be one of {'full', 'minimal'}")
+    if float(split_progress_interval_s) < 0:
+        raise ValueError("split_progress_interval_s must be >= 0")
 
     normalized_suffix = normalized_output_suffix(output_suffix) if output_suffix is not None else None
     normalized_subdir = normalized_output_subdir(output_subdir)
@@ -1022,6 +1226,8 @@ def process_dataset_root(
         raise FileNotFoundError(f"No events.h5 found under root={dataset_root}, splits={splits}")
     if output_root is not None:
         output_root.mkdir(parents=True, exist_ok=True)
+    if split_output_root is not None:
+        split_output_root.mkdir(parents=True, exist_ok=True)
 
     if sync_segmentation:
         num_with_semantic = 0
@@ -1085,6 +1291,14 @@ def process_dataset_root(
             else:
                 num_skipped += 1
                 continue
+        split_output_path = None
+        if split_chunk_duration_s is not None and float(split_chunk_duration_s) > 0:
+            split_output_path = _build_split_output_path(
+                output_path=output_path,
+                dataset_root=dataset_root,
+                output_root=output_root,
+                split_output_root=split_output_root,
+            )
 
         image_timestamps_path: Path | None = None
         if window_mode == "image_middle":
@@ -1134,10 +1348,24 @@ def process_dataset_root(
                 "normalize": bool(normalize),
                 "output_dtype": output_dtype,
                 "use_trilinear": bool(use_trilinear),
+                "activity_mode": str(activity_mode),
+                "activity_spatial_patch_size": int(activity_spatial_patch_size),
+                "activity_temporal_patch_size": int(activity_temporal_patch_size),
                 "sync_segmentation": bool(sync_segmentation),
                 "segmentation_dir": str(segmentation_dir) if segmentation_dir is not None else None,
                 "segmentation_tolerance_us": int(segmentation_tolerance_us),
                 "tmp_suffix": tmp_suffix,
+                "split_chunk_duration_s": split_chunk_duration_s,
+                "split_output_path": None if split_output_path is None else str(split_output_path),
+                "split_copy_batch_size": int(split_copy_batch_size),
+                "split_min_windows_per_chunk": int(split_min_windows_per_chunk),
+                "split_chunk_index_pad": int(split_chunk_index_pad),
+                "split_metadata_mode": str(split_metadata_mode),
+                "split_progress_interval_s": float(split_progress_interval_s),
+                "split_log_chunk_progress": bool(split_log_chunk_progress),
+                "split_log_dataset_progress": bool(split_log_dataset_progress),
+                "split_delete_source_after_success": bool(split_delete_source_after_success),
+                "overwrite": bool(overwrite),
             }
         )
 
@@ -1187,12 +1415,25 @@ def process_dsec_root(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     sync_segmentation: bool,
     segmentation_root: Path | None,
     segmentation_subdir: str,
     segmentation_tolerance_us: int,
     tmp_suffix: str,
     num_processes: int,
+    split_chunk_duration_s: float | None = None,
+    split_output_root: Path | None = None,
+    split_copy_batch_size: int = 8,
+    split_min_windows_per_chunk: int = 1,
+    split_chunk_index_pad: int = 4,
+    split_metadata_mode: str = "full",
+    split_progress_interval_s: float = 0.0,
+    split_log_chunk_progress: bool = False,
+    split_log_dataset_progress: bool = False,
+    split_delete_source_after_success: bool = False,
     output_suffix: str | None = None,
     output_subdir: str | None = None,
     start_time_us: int | None = None,
@@ -1219,12 +1460,25 @@ def process_dsec_root(
         normalize=normalize,
         output_dtype=output_dtype,
         use_trilinear=use_trilinear,
+        activity_mode=activity_mode,
+        activity_spatial_patch_size=activity_spatial_patch_size,
+        activity_temporal_patch_size=activity_temporal_patch_size,
         sync_segmentation=sync_segmentation,
         segmentation_root=segmentation_root,
         segmentation_subdir=segmentation_subdir,
         segmentation_tolerance_us=segmentation_tolerance_us,
         tmp_suffix=tmp_suffix,
         num_processes=num_processes,
+        split_chunk_duration_s=split_chunk_duration_s,
+        split_output_root=split_output_root,
+        split_copy_batch_size=split_copy_batch_size,
+        split_min_windows_per_chunk=split_min_windows_per_chunk,
+        split_chunk_index_pad=split_chunk_index_pad,
+        split_metadata_mode=split_metadata_mode,
+        split_progress_interval_s=split_progress_interval_s,
+        split_log_chunk_progress=split_log_chunk_progress,
+        split_log_dataset_progress=split_log_dataset_progress,
+        split_delete_source_after_success=split_delete_source_after_success,
     )
 
 
@@ -1276,6 +1530,69 @@ if __name__ == "__main__":
         default=1,
         help="Parallel workers for root mode (spawn).",
     )
+    parser.add_argument(
+        "--split_chunk_duration_s",
+        type=float,
+        default=None,
+        help="Optional: after writing each voxel H5, immediately split it into duration-based chunks.",
+    )
+    parser.add_argument(
+        "--split_output_root",
+        type=Path,
+        default=None,
+        help="Optional output root for split chunk files. Default writes chunks alongside the unsplit output.",
+    )
+    parser.add_argument("--split_copy_batch_size", type=int, default=8, help="Split row-copy batch size.")
+    parser.add_argument(
+        "--split_min_windows_per_chunk",
+        type=int,
+        default=1,
+        help="Drop split chunks with fewer than this number of windows.",
+    )
+    parser.add_argument(
+        "--split_chunk_index_pad",
+        type=int,
+        default=4,
+        help="Zero-padding width for split chunk suffix `_partXXXX`.",
+    )
+    parser.add_argument(
+        "--split_metadata_mode",
+        choices=["full", "minimal"],
+        default="full",
+        help="Metadata copy mode for split chunk files.",
+    )
+    parser.add_argument(
+        "--split_progress_interval_s",
+        type=float,
+        default=0.0,
+        help="If >0, print progress every N seconds while copying split chunk rows.",
+    )
+    parser.add_argument(
+        "--split_log_chunk_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print split chunk start/end logs.",
+    )
+    parser.add_argument(
+        "--split_log_dataset_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print split dataset copy logs.",
+    )
+    parser.add_argument(
+        "--split_delete_source_after_success",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Delete the unsplit voxel H5 after split chunks are successfully created.",
+    )
+    parser.add_argument(
+        "--activity_mode",
+        choices=["full", "light"],
+        default="full",
+        help="Activity metadata layout saved per window.",
+    )
+    parser.add_argument("--activity_spatial_patch_size", type=int, default=16, help="Spatial patch size for activity metadata.")
+    parser.add_argument("--activity_temporal_patch_size", type=int, default=2, help="Temporal patch size for full activity metadata.")
     parser.add_argument("--input_height", type=int, default=480, help="Input event height (default: 480).")
     parser.add_argument("--input_width", type=int, default=640, help="Input event width (default: 640).")
     parser.add_argument("--height", dest="input_height", type=int, help=argparse.SUPPRESS)
@@ -1415,12 +1732,25 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            activity_mode=args.activity_mode,
+            activity_spatial_patch_size=args.activity_spatial_patch_size,
+            activity_temporal_patch_size=args.activity_temporal_patch_size,
             sync_segmentation=args.sync_segmentation,
             segmentation_root=args.segmentation_root,
             segmentation_subdir=args.segmentation_subdir,
             segmentation_tolerance_us=args.segmentation_tolerance_us,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
+            split_chunk_duration_s=args.split_chunk_duration_s,
+            split_output_root=args.split_output_root,
+            split_copy_batch_size=args.split_copy_batch_size,
+            split_min_windows_per_chunk=args.split_min_windows_per_chunk,
+            split_chunk_index_pad=args.split_chunk_index_pad,
+            split_metadata_mode=args.split_metadata_mode,
+            split_progress_interval_s=args.split_progress_interval_s,
+            split_log_chunk_progress=args.split_log_chunk_progress,
+            split_log_dataset_progress=args.split_log_dataset_progress,
+            split_delete_source_after_success=args.split_delete_source_after_success,
         )
     else:
         if args.input_path is None or args.output_path is None:
@@ -1444,6 +1774,9 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            activity_mode=args.activity_mode,
+            activity_spatial_patch_size=args.activity_spatial_patch_size,
+            activity_temporal_patch_size=args.activity_temporal_patch_size,
             sync_segmentation=args.sync_segmentation,
             segmentation_dir=args.segmentation_dir,
             segmentation_tolerance_us=args.segmentation_tolerance_us,

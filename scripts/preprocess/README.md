@@ -21,6 +21,22 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.splits=[train,test]
 ```
 
+前処理と同時に 20 秒 chunk も作る:
+
+```bash
+python3 scripts/preprocess/run_preprocess.py \
+  dataset=dsec \
+  dataset.dataset_root=/data/DSEC \
+  dataset.output_root=/data/DSEC_voxels_seg \
+  dataset.window_mode=image_middle \
+  dataset.sync_segmentation=true \
+  dataset.segmentation_subdir=11classes \
+  dataset.segmentation_tolerance_us=0 \
+  dataset.split_chunk_duration_s=20 \
+  dataset.split_output_root=/data/DSEC_voxels_seg_20s \
+  dataset.split_delete_source_after_success=true
+```
+
 image middle:
 
 ```bash
@@ -57,6 +73,18 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.output_root=/data/1mpx_voxels
 ```
 
+前処理と同時に 20 秒 chunk も作る:
+
+```bash
+python3 scripts/preprocess/run_preprocess.py \
+  dataset=1mpx \
+  dataset.dataset_root=/data/1mpx \
+  dataset.output_root=/data/1mpx_voxels \
+  dataset.split_chunk_duration_s=20 \
+  dataset.split_output_root=/data/1mpx_voxels_20s \
+  dataset.split_delete_source_after_success=true
+```
+
 split 指定:
 
 ```bash
@@ -78,6 +106,21 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.output_root=/data/m3ed_voxels_semantic \
   dataset.window_mode=semantics_middle \
   dataset.output_suffix=_voxels_semantic.h5
+```
+
+前処理と同時に 20 秒 chunk も作る:
+
+```bash
+python3 scripts/preprocess/run_preprocess.py \
+  dataset=m3ed \
+  dataset.dataset_root=/data/m3ed_left_event \
+  dataset.output_root=/data/m3ed_voxels_semantic \
+  dataset.window_mode=semantics_middle \
+  dataset.output_suffix=_voxels_semantic.h5 \
+  dataset.activity_mode=full \
+  dataset.split_chunk_duration_s=20 \
+  dataset.split_output_root=/data/m3ed_voxels_semantic_20s \
+  dataset.split_delete_source_after_success=true
 ```
 
 event + depth:
@@ -103,6 +146,8 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.dataset_root=/data/EventScape \
   dataset.output_root=/data/EventScape_voxels
 ```
+
+`dsec` / `eventscape` も `activity` メタデータを保存します。`dataset.activity_mode=full|light` で切り替えでき、デフォルトは `full` です。
 
 Town系 split を指定:
 
@@ -198,6 +243,12 @@ python3 scripts/preprocess/split_voxel_h5_by_duration.py \
 ```
 
 `num_processes>1` の場合でもログは親プロセスで集約表示され、worker間で混線しにくい形式になります。
+
+`dsec` / `m3ed` / `1mpx` では `dataset.split_chunk_duration_s=20` を `run_preprocess.py` に渡すと、各 voxel H5 を書いた直後に自動分割できます。`dataset.split_delete_source_after_success=true` を付けると、分割成功後に長尺の元 H5 を削除して二重保管を避けられます。
+
+activity メタデータは `dataset.activity_mode=full|light` で切り替えられます。デフォルトは `full` で、`full` は時空間 token-grid、`light` は空間 grid のみを保存します。
+
+`m3ed` の `semantics_middle` / `depth_middle` では、対応する annotation も前処理 H5 に埋め込まれます。これにより、split 後 H5 だけでも downstream 学習を完結できます。
 
 DSEC + semantic 同期済みなどで高速化したい場合:
 

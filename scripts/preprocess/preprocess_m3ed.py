@@ -35,10 +35,12 @@ from scripts.preprocess.utils import (
     normalized_output_suffix,
     tmp_output_path,
 )
+from scripts.preprocess.split_voxel_h5_by_duration import split_voxel_h5_file
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
 MS_TO_IDX_BUILD_CHUNK_EVENTS = 5_000_000
+ACTIVITY_MODES = {"full", "light"}
 
 
 EVENT_GROUP_PATH = "prophesee/left"
@@ -583,6 +585,158 @@ def _validate_sync_mode_args(
     raise ValueError(f"unsupported window_mode: {window_mode}")
 
 
+def _compute_activity_metadata(
+    voxel: np.ndarray,
+    *,
+    temporal_bins: int,
+    split_polarity: bool,
+    spatial_patch_size: int,
+    temporal_patch_size: int,
+    activity_mode: str,
+) -> tuple[np.ndarray, float, float]:
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
+    if temporal_bins <= 0:
+        raise ValueError("temporal_bins must be > 0")
+    if spatial_patch_size <= 0 or temporal_patch_size <= 0:
+        raise ValueError("activity patch sizes must be > 0")
+
+    channels, height, width = voxel.shape
+    if split_polarity:
+        if channels != temporal_bins * 2:
+            raise ValueError(
+                f"Expected channels={temporal_bins * 2} for split polarity, got {channels}"
+            )
+        activity_volume = np.abs(voxel).reshape(2, temporal_bins, height, width).sum(axis=0)
+    else:
+        if channels != temporal_bins:
+            raise ValueError(f"Expected channels={temporal_bins}, got {channels}")
+        activity_volume = np.abs(voxel)
+
+    nonzero_voxel_ratio = float(np.count_nonzero(activity_volume) / float(max(1, activity_volume.size)))
+    active_pixel_ratio = float(
+        np.count_nonzero(activity_volume.sum(axis=0) > 0) / float(max(1, height * width))
+    )
+
+    if activity_mode == "light":
+        spatial_volume = activity_volume.sum(axis=0, dtype=np.float32)
+        hp = (height + spatial_patch_size - 1) // spatial_patch_size
+        wp = (width + spatial_patch_size - 1) // spatial_patch_size
+        padded = np.pad(
+            spatial_volume,
+            ((0, hp * spatial_patch_size - height), (0, wp * spatial_patch_size - width)),
+            mode="constant",
+        )
+        grid = padded.reshape(hp, spatial_patch_size, wp, spatial_patch_size).sum(axis=(1, 3))
+        return grid.astype(np.float16, copy=False), nonzero_voxel_ratio, active_pixel_ratio
+
+    tp = (temporal_bins + temporal_patch_size - 1) // temporal_patch_size
+    hp = (height + spatial_patch_size - 1) // spatial_patch_size
+    wp = (width + spatial_patch_size - 1) // spatial_patch_size
+    padded = np.pad(
+        activity_volume,
+        (
+            (0, tp * temporal_patch_size - temporal_bins),
+            (0, hp * spatial_patch_size - height),
+            (0, wp * spatial_patch_size - width),
+        ),
+        mode="constant",
+    )
+    grid = padded.reshape(
+        tp,
+        temporal_patch_size,
+        hp,
+        spatial_patch_size,
+        wp,
+        spatial_patch_size,
+    ).sum(axis=(1, 3, 5))
+    return grid.astype(np.float16, copy=False), nonzero_voxel_ratio, active_pixel_ratio
+
+
+def _find_first_matching_dataset(
+    h5f: h5py.File,
+    *,
+    candidates: tuple[str, ...],
+    length0: int,
+    min_ndim: int = 3,
+) -> str | None:
+    for path in candidates:
+        if path not in h5f:
+            continue
+        ds = h5f[path]
+        if isinstance(ds, h5py.Dataset) and ds.ndim >= min_ndim and int(ds.shape[0]) == int(length0):
+            return path
+    return None
+
+
+def _find_recursive_dataset_with_length(
+    h5f: h5py.File,
+    *,
+    group_prefix: str,
+    length0: int,
+    min_ndim: int = 3,
+) -> str | None:
+    if group_prefix not in h5f:
+        return None
+    root = h5f[group_prefix]
+    if not isinstance(root, h5py.Group):
+        return None
+    stack: list[tuple[str, h5py.Group]] = [(group_prefix, root)]
+    while stack:
+        prefix, group = stack.pop()
+        for key in group.keys():
+            full = f"{prefix}/{key}"
+            obj = group[key]
+            if isinstance(obj, h5py.Group):
+                stack.append((full, obj))
+            elif isinstance(obj, h5py.Dataset) and obj.ndim >= min_ndim and int(obj.shape[0]) == int(length0):
+                return full
+    return None
+
+
+def _resolve_embedded_label_source(
+    *,
+    filehandle: h5py.File,
+    target: str,
+    label_length: int,
+) -> tuple[str | None, str | None]:
+    if label_length <= 0:
+        return None, None
+    if target == "semantic":
+        candidates = (
+            "semantics/class_id",
+            "semantics/labels",
+            "semantics/label",
+            "semantics/data",
+            "semantics/image",
+        )
+        group_prefix = "semantics"
+        embedded_name = "embedded_semantics"
+    else:
+        candidates = (
+            "depth_gt/depth",
+            "depth_gt/depth_map",
+            "depth_gt/data",
+            "depth_gt/image",
+        )
+        group_prefix = "depth_gt"
+        embedded_name = "embedded_depth"
+    path = _find_first_matching_dataset(
+        filehandle,
+        candidates=candidates,
+        length0=int(label_length),
+        min_ndim=3,
+    )
+    if path is None:
+        path = _find_recursive_dataset_with_length(
+            filehandle,
+            group_prefix=group_prefix,
+            length0=int(label_length),
+            min_ndim=3,
+        )
+    return path, (embedded_name if path is not None else None)
+
+
 class VoxelH5Writer:
     def __init__(
         self,
@@ -591,6 +745,11 @@ class VoxelH5Writer:
         height: int,
         width: int,
         voxel_dtype: np.dtype,
+        activity_mode: str,
+        activity_grid_shape: tuple[int, ...],
+        embedded_label_name: str | None = None,
+        embedded_label_shape: tuple[int, ...] | None = None,
+        embedded_label_dtype=None,
         initial_capacity: int = 256,
     ):
         if outfile.exists():
@@ -610,7 +769,12 @@ class VoxelH5Writer:
             "anchor_timestamp_us",
             "anchor_rel_timestamp_us",
             "window_event_count",
+            "window_activity_score",
+            "window_active_pixel_ratio",
+            "window_activity_grid",
         )
+        self._activity_mode = str(activity_mode)
+        self._embedded_label_name = None if embedded_label_name is None else str(embedded_label_name)
 
         voxel_chunks = (1, t_bins, min(height, 64), min(width, 64))
         scalar_chunks = (min(self._capacity, 4096),)
@@ -686,6 +850,44 @@ class VoxelH5Writer:
             chunks=scalar_chunks,
             **H5_COMPRESSION_FLAGS,
         )
+        self.h5f.create_dataset(
+            "window_activity_score",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_active_pixel_ratio",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_activity_grid",
+            shape=(self._capacity,) + tuple(activity_grid_shape),
+            maxshape=(None,) + tuple(activity_grid_shape),
+            dtype="f2",
+            chunks=(1,) + tuple(activity_grid_shape),
+            **H5_COMPRESSION_FLAGS,
+        )
+        if (
+            self._embedded_label_name is not None
+            and embedded_label_shape is not None
+            and embedded_label_dtype is not None
+        ):
+            self.h5f.create_dataset(
+                self._embedded_label_name,
+                shape=(self._capacity,) + tuple(embedded_label_shape),
+                maxshape=(None,) + tuple(embedded_label_shape),
+                dtype=embedded_label_dtype,
+                chunks=(1,) + tuple(embedded_label_shape),
+                **H5_COMPRESSION_FLAGS,
+            )
+            self._datasets = self._datasets + (self._embedded_label_name,)
 
     @staticmethod
     def close_callback(h5f: h5py.File):
@@ -712,6 +914,10 @@ class VoxelH5Writer:
         anchor_timestamp_us: int,
         anchor_rel_timestamp_us: int,
         event_count: int,
+        activity_score: float,
+        active_pixel_ratio: float,
+        activity_grid: np.ndarray,
+        embedded_label: np.ndarray | None = None,
     ):
         idx = self._num_windows
         self._ensure_capacity(idx + 1)
@@ -725,6 +931,11 @@ class VoxelH5Writer:
         self.h5f["anchor_timestamp_us"][idx] = int(anchor_timestamp_us)
         self.h5f["anchor_rel_timestamp_us"][idx] = int(anchor_rel_timestamp_us)
         self.h5f["window_event_count"][idx] = int(event_count)
+        self.h5f["window_activity_score"][idx] = float(activity_score)
+        self.h5f["window_active_pixel_ratio"][idx] = float(active_pixel_ratio)
+        self.h5f["window_activity_grid"][idx] = activity_grid
+        if self._embedded_label_name is not None and embedded_label is not None:
+            self.h5f[self._embedded_label_name][idx] = embedded_label
         self._num_windows += 1
 
     def _trim(self):
@@ -758,6 +969,9 @@ def process_single_file(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -779,6 +993,8 @@ def process_single_file(
         raise ValueError("semantics_ts_divisor must be > 0")
     if int(depth_ts_divisor) <= 0:
         raise ValueError("depth_ts_divisor must be > 0")
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
     _validate_sync_mode_args(
         window_mode=window_mode,
         semantics_ts_source=semantics_ts_source,
@@ -801,6 +1017,18 @@ def process_single_file(
     )
     voxel_channels = int(t_bins) * (2 if split_polarity else 1)
     voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
+    activity_grid_shape = (
+        (
+            (int(t_bins) + int(activity_temporal_patch_size) - 1) // int(activity_temporal_patch_size),
+            (int(effective_output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+            (int(effective_output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+        )
+        if activity_mode == "full"
+        else (
+            (int(effective_output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+            (int(effective_output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+        )
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -820,47 +1048,47 @@ def process_single_file(
                 ms_idx_source = "generated"
             t_offset_us = _read_t_offset(h5f)
 
-            writer = VoxelH5Writer(
-                outfile=tmp_path,
-                t_bins=voxel_channels,
-                height=effective_output_height,
-                width=effective_output_width,
-                voxel_dtype=voxel_dtype,
-            )
-            writer.h5f.attrs["representation"] = "event_voxel_grid_m3ed"
-            writer.h5f.attrs["source_file"] = str(input_path)
-            writer.h5f.attrs["source_event_group"] = EVENT_GROUP_PATH
-            writer.h5f.attrs["input_height"] = int(resolved_input_height)
-            writer.h5f.attrs["input_width"] = int(resolved_input_width)
-            writer.h5f.attrs["requested_output_height"] = int(output_height)
-            writer.h5f.attrs["requested_output_width"] = int(output_width)
-            writer.h5f.attrs["height"] = int(effective_output_height)
-            writer.h5f.attrs["width"] = int(effective_output_width)
-            writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
-            writer.h5f.attrs["spatial_resize_mode"] = "nearest"
-            writer.h5f.attrs["t_bins"] = int(t_bins)
-            writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
-            writer.h5f.attrs["split_polarity"] = int(split_polarity)
-            writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
-            writer.h5f.attrs["accum_time_us"] = int(accum_time)
-            writer.h5f.attrs["stride_time_us"] = int(stride_time)
-            writer.h5f.attrs["normalize"] = int(normalize)
-            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
-            writer.h5f.attrs["window_mode"] = window_mode
-            writer.h5f.attrs["sync_target"] = (
-                "event_only"
-                if window_mode == "fixed"
-                else "semantic"
-                if window_mode == "semantics_middle"
-                else "depth"
-            )
-            writer.h5f.attrs["semantics_ts_source"] = semantics_ts_source
-            writer.h5f.attrs["semantics_ts_divisor"] = int(semantics_ts_divisor)
-            writer.h5f.attrs["depth_ts_source"] = depth_ts_source
-            writer.h5f.attrs["depth_ts_divisor"] = int(depth_ts_divisor)
-            writer.h5f.attrs["ms_to_idx_source"] = ms_idx_source
-
             if t_first is None or t_last_exclusive is None:
+                writer = VoxelH5Writer(
+                    outfile=tmp_path,
+                    t_bins=voxel_channels,
+                    height=effective_output_height,
+                    width=effective_output_width,
+                    voxel_dtype=voxel_dtype,
+                    activity_mode=activity_mode,
+                    activity_grid_shape=activity_grid_shape,
+                )
+                writer.h5f.attrs["representation"] = "event_voxel_grid_m3ed"
+                writer.h5f.attrs["source_file"] = str(input_path)
+                writer.h5f.attrs["source_event_group"] = EVENT_GROUP_PATH
+                writer.h5f.attrs["input_height"] = int(resolved_input_height)
+                writer.h5f.attrs["input_width"] = int(resolved_input_width)
+                writer.h5f.attrs["requested_output_height"] = int(output_height)
+                writer.h5f.attrs["requested_output_width"] = int(output_width)
+                writer.h5f.attrs["height"] = int(effective_output_height)
+                writer.h5f.attrs["width"] = int(effective_output_width)
+                writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
+                writer.h5f.attrs["spatial_resize_mode"] = "nearest"
+                writer.h5f.attrs["t_bins"] = int(t_bins)
+                writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
+                writer.h5f.attrs["split_polarity"] = int(split_polarity)
+                writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
+                writer.h5f.attrs["accum_time_us"] = int(accum_time)
+                writer.h5f.attrs["stride_time_us"] = int(stride_time)
+                writer.h5f.attrs["normalize"] = int(normalize)
+                writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+                writer.h5f.attrs["window_mode"] = window_mode
+                writer.h5f.attrs["sync_target"] = "event_only"
+                writer.h5f.attrs["semantics_ts_source"] = semantics_ts_source
+                writer.h5f.attrs["semantics_ts_divisor"] = int(semantics_ts_divisor)
+                writer.h5f.attrs["depth_ts_source"] = depth_ts_source
+                writer.h5f.attrs["depth_ts_divisor"] = int(depth_ts_divisor)
+                writer.h5f.attrs["ms_to_idx_source"] = ms_idx_source
+                writer.h5f.attrs["activity_mode"] = str(activity_mode)
+                writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
+                writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
+                writer.h5f.attrs["embedded_label_dataset"] = ""
+                writer.h5f.attrs["embedded_label_source_path"] = ""
                 writer.h5f.attrs["time_origin_us"] = -1
                 writer.h5f.attrs["num_windows_planned"] = 0
                 writer.h5f.attrs["anchor_timebase_mode"] = "as_is"
@@ -873,6 +1101,10 @@ def process_single_file(
             time_origin_us = int(t_first) if start_time_us is None else int(start_time_us)
             anchor_timebase_mode = "as_is"
             anchor_timebase_shift_us = 0
+            embedded_label_source_path = None
+            embedded_label_name = None
+            embedded_label_shape = None
+            embedded_label_dtype = None
             if window_mode == "fixed":
                 window_start_us = max(int(t_first), time_origin_us)
                 windows = _build_windows_from_start(
@@ -906,6 +1138,11 @@ def process_single_file(
                 writer.h5f.attrs["num_semantic_timestamps"] = int(len(semantic_ts))
                 writer.h5f.attrs["resolved_depth_ts_source"] = ""
                 writer.h5f.attrs["num_depth_timestamps"] = 0
+                embedded_label_source_path, embedded_label_name = _resolve_embedded_label_source(
+                    filehandle=h5f,
+                    target="semantic",
+                    label_length=int(len(semantic_ts)),
+                )
             else:
                 depth_ts, resolved_source = _load_depth_anchor_timestamps_us(
                     filehandle=h5f,
@@ -927,6 +1164,81 @@ def process_single_file(
                 writer.h5f.attrs["num_semantic_timestamps"] = 0
                 writer.h5f.attrs["resolved_depth_ts_source"] = resolved_source
                 writer.h5f.attrs["num_depth_timestamps"] = int(len(depth_ts))
+                embedded_label_source_path, embedded_label_name = _resolve_embedded_label_source(
+                    filehandle=h5f,
+                    target="depth",
+                    label_length=int(len(depth_ts)),
+                )
+            if embedded_label_source_path is not None:
+                label_ds = h5f[embedded_label_source_path]
+                embedded_label_shape = tuple(int(v) for v in label_ds.shape[1:])
+                embedded_label_dtype = label_ds.dtype
+
+            writer = VoxelH5Writer(
+                outfile=tmp_path,
+                t_bins=voxel_channels,
+                height=effective_output_height,
+                width=effective_output_width,
+                voxel_dtype=voxel_dtype,
+                activity_mode=activity_mode,
+                activity_grid_shape=activity_grid_shape,
+                embedded_label_name=embedded_label_name,
+                embedded_label_shape=embedded_label_shape,
+                embedded_label_dtype=embedded_label_dtype,
+            )
+            writer.h5f.attrs["representation"] = "event_voxel_grid_m3ed"
+            writer.h5f.attrs["source_file"] = str(input_path)
+            writer.h5f.attrs["source_event_group"] = EVENT_GROUP_PATH
+            writer.h5f.attrs["input_height"] = int(resolved_input_height)
+            writer.h5f.attrs["input_width"] = int(resolved_input_width)
+            writer.h5f.attrs["requested_output_height"] = int(output_height)
+            writer.h5f.attrs["requested_output_width"] = int(output_width)
+            writer.h5f.attrs["height"] = int(effective_output_height)
+            writer.h5f.attrs["width"] = int(effective_output_width)
+            writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
+            writer.h5f.attrs["spatial_resize_mode"] = "nearest"
+            writer.h5f.attrs["t_bins"] = int(t_bins)
+            writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
+            writer.h5f.attrs["split_polarity"] = int(split_polarity)
+            writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
+            writer.h5f.attrs["accum_time_us"] = int(accum_time)
+            writer.h5f.attrs["stride_time_us"] = int(stride_time)
+            writer.h5f.attrs["normalize"] = int(normalize)
+            writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+            writer.h5f.attrs["window_mode"] = window_mode
+            writer.h5f.attrs["sync_target"] = (
+                "event_only"
+                if window_mode == "fixed"
+                else "semantic"
+                if window_mode == "semantics_middle"
+                else "depth"
+            )
+            writer.h5f.attrs["semantics_ts_source"] = semantics_ts_source
+            writer.h5f.attrs["semantics_ts_divisor"] = int(semantics_ts_divisor)
+            writer.h5f.attrs["depth_ts_source"] = depth_ts_source
+            writer.h5f.attrs["depth_ts_divisor"] = int(depth_ts_divisor)
+            writer.h5f.attrs["ms_to_idx_source"] = ms_idx_source
+            writer.h5f.attrs["activity_mode"] = str(activity_mode)
+            writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
+            writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
+            writer.h5f.attrs["embedded_label_dataset"] = "" if embedded_label_name is None else str(embedded_label_name)
+            writer.h5f.attrs["embedded_label_source_path"] = (
+                "" if embedded_label_source_path is None else str(embedded_label_source_path)
+            )
+            writer.h5f.attrs["resolved_semantics_ts_source"] = (
+                ""
+                if window_mode == "fixed" or window_mode == "depth_middle"
+                else resolved_source
+            )
+            writer.h5f.attrs["num_semantic_timestamps"] = (
+                0 if window_mode != "semantics_middle" else int(len(semantic_ts))
+            )
+            writer.h5f.attrs["resolved_depth_ts_source"] = (
+                "" if window_mode != "depth_middle" else resolved_source
+            )
+            writer.h5f.attrs["num_depth_timestamps"] = (
+                0 if window_mode != "depth_middle" else int(len(depth_ts))
+            )
             writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
             writer.h5f.attrs["anchor_timebase_mode"] = anchor_timebase_mode
             writer.h5f.attrs["anchor_timebase_shift_us"] = int(anchor_timebase_shift_us)
@@ -957,6 +1269,17 @@ def process_single_file(
                     output_width=effective_output_width,
                 )
                 voxel = voxel.astype(voxel_dtype, copy=False)
+                activity_grid, activity_score, active_pixel_ratio = _compute_activity_metadata(
+                    voxel=voxel,
+                    temporal_bins=int(t_bins),
+                    split_polarity=bool(split_polarity),
+                    spatial_patch_size=int(activity_spatial_patch_size),
+                    temporal_patch_size=int(activity_temporal_patch_size),
+                    activity_mode=str(activity_mode),
+                )
+                embedded_label = None
+                if embedded_label_source_path is not None:
+                    embedded_label = np.asarray(h5f[embedded_label_source_path][int(window_index)])
                 writer.add_window(
                     voxel=voxel,
                     window_index=window_index,
@@ -967,6 +1290,10 @@ def process_single_file(
                     anchor_timestamp_us=anchor_us,
                     anchor_rel_timestamp_us=anchor_us - time_origin_us,
                     event_count=len(events["t"]),
+                    activity_score=activity_score,
+                    active_pixel_ratio=active_pixel_ratio,
+                    activity_grid=activity_grid,
+                    embedded_label=embedded_label,
                 )
                 if pbar is not None:
                     pbar.update(1)
@@ -1006,6 +1333,20 @@ def _process_file_with_retry(
     output_dtype: str,
     use_trilinear: bool,
     tmp_suffix: str,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
+    split_chunk_duration_s: float | None,
+    split_output_path: Path | None,
+    split_copy_batch_size: int,
+    split_min_windows_per_chunk: int,
+    split_chunk_index_pad: int,
+    split_metadata_mode: str,
+    split_progress_interval_s: float,
+    split_log_chunk_progress: bool,
+    split_log_dataset_progress: bool,
+    split_delete_source_after_success: bool,
+    overwrite: bool,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
     if not cleanup_tmp_file(tmp_path=stale_tmp_path, context=f"resume prep for {input_path}", strict=False):
@@ -1034,9 +1375,30 @@ def _process_file_with_retry(
                 normalize=normalize,
                 output_dtype=output_dtype,
                 use_trilinear=use_trilinear,
+                activity_mode=activity_mode,
+                activity_spatial_patch_size=activity_spatial_patch_size,
+                activity_temporal_patch_size=activity_temporal_patch_size,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
+            if split_chunk_duration_s is not None and float(split_chunk_duration_s) > 0:
+                if split_output_path is None:
+                    raise ValueError("split_output_path must be provided when split_chunk_duration_s is set")
+                split_voxel_h5_file(
+                    input_path=output_path,
+                    output_base_path=split_output_path,
+                    chunk_duration_s=float(split_chunk_duration_s),
+                    copy_batch_size=int(split_copy_batch_size),
+                    min_windows_per_chunk=int(split_min_windows_per_chunk),
+                    chunk_index_pad=int(split_chunk_index_pad),
+                    overwrite=bool(overwrite),
+                    metadata_mode=str(split_metadata_mode),
+                    progress_interval_s=float(split_progress_interval_s),
+                    log_chunk_progress=bool(split_log_chunk_progress),
+                    log_dataset_progress=bool(split_log_dataset_progress),
+                )
+                if bool(split_delete_source_after_success):
+                    output_path.unlink(missing_ok=True)
             return True, None
         except Exception as exc:
             if attempt == 1:
@@ -1078,6 +1440,20 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         output_dtype=job["output_dtype"],
         use_trilinear=job["use_trilinear"],
         tmp_suffix=job["tmp_suffix"],
+        activity_mode=job["activity_mode"],
+        activity_spatial_patch_size=job["activity_spatial_patch_size"],
+        activity_temporal_patch_size=job["activity_temporal_patch_size"],
+        split_chunk_duration_s=job["split_chunk_duration_s"],
+        split_output_path=None if job["split_output_path"] is None else Path(job["split_output_path"]),
+        split_copy_batch_size=job["split_copy_batch_size"],
+        split_min_windows_per_chunk=job["split_min_windows_per_chunk"],
+        split_chunk_index_pad=job["split_chunk_index_pad"],
+        split_metadata_mode=job["split_metadata_mode"],
+        split_progress_interval_s=job["split_progress_interval_s"],
+        split_log_chunk_progress=job["split_log_chunk_progress"],
+        split_log_dataset_progress=job["split_log_dataset_progress"],
+        split_delete_source_after_success=job["split_delete_source_after_success"],
+        overwrite=job["overwrite"],
     )
     return str(input_path), ok, err
 
@@ -1118,6 +1494,22 @@ def _build_output_path(
     return output_dir / output_name
 
 
+def _build_split_output_path(
+    output_path: Path,
+    dataset_root: Path,
+    output_root: Path | None,
+    split_output_root: Path | None,
+) -> Path:
+    if split_output_root is None:
+        return output_path
+
+    if output_root is not None:
+        relative_output = output_path.relative_to(output_root)
+    else:
+        relative_output = output_path.relative_to(dataset_root)
+    return split_output_root / relative_output
+
+
 def process_dataset_root(
     dataset_root: Path,
     output_suffix: str,
@@ -1144,9 +1536,38 @@ def process_dataset_root(
     use_trilinear: bool,
     tmp_suffix: str,
     num_processes: int,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
+    split_chunk_duration_s: float | None,
+    split_output_root: Path | None,
+    split_copy_batch_size: int,
+    split_min_windows_per_chunk: int,
+    split_chunk_index_pad: int,
+    split_metadata_mode: str,
+    split_progress_interval_s: float,
+    split_log_chunk_progress: bool,
+    split_log_dataset_progress: bool,
+    split_delete_source_after_success: bool,
 ) -> None:
     if int(num_processes) < 1:
         raise ValueError("num_processes must be >= 1")
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
+    if int(activity_spatial_patch_size) <= 0 or int(activity_temporal_patch_size) <= 0:
+        raise ValueError("activity patch sizes must be > 0")
+    if split_chunk_duration_s is not None and float(split_chunk_duration_s) <= 0:
+        raise ValueError("split_chunk_duration_s must be > 0 when provided")
+    if int(split_copy_batch_size) < 1:
+        raise ValueError("split_copy_batch_size must be >= 1")
+    if int(split_min_windows_per_chunk) < 1:
+        raise ValueError("split_min_windows_per_chunk must be >= 1")
+    if int(split_chunk_index_pad) < 1:
+        raise ValueError("split_chunk_index_pad must be >= 1")
+    if str(split_metadata_mode) not in {"full", "minimal"}:
+        raise ValueError("split_metadata_mode must be one of {'full', 'minimal'}")
+    if float(split_progress_interval_s) < 0:
+        raise ValueError("split_progress_interval_s must be >= 0")
     _validate_sync_mode_args(
         window_mode=window_mode,
         semantics_ts_source=semantics_ts_source,
@@ -1162,6 +1583,8 @@ def process_dataset_root(
         raise FileNotFoundError(f"No valid M3ED event h5 files found under {dataset_root}")
     if output_root is not None:
         output_root.mkdir(parents=True, exist_ok=True)
+    if split_output_root is not None:
+        split_output_root.mkdir(parents=True, exist_ok=True)
 
     jobs: list[dict] = []
     num_done = 0
@@ -1187,6 +1610,14 @@ def process_dataset_root(
             else:
                 num_skipped += 1
                 continue
+        split_output_path = None
+        if split_chunk_duration_s is not None and float(split_chunk_duration_s) > 0:
+            split_output_path = _build_split_output_path(
+                output_path=output_path,
+                dataset_root=dataset_root,
+                output_root=output_root,
+                split_output_root=split_output_root,
+            )
 
         jobs.append(
             {
@@ -1211,6 +1642,20 @@ def process_dataset_root(
                 "output_dtype": output_dtype,
                 "use_trilinear": bool(use_trilinear),
                 "tmp_suffix": tmp_suffix,
+                "activity_mode": str(activity_mode),
+                "activity_spatial_patch_size": int(activity_spatial_patch_size),
+                "activity_temporal_patch_size": int(activity_temporal_patch_size),
+                "split_chunk_duration_s": split_chunk_duration_s,
+                "split_output_path": None if split_output_path is None else str(split_output_path),
+                "split_copy_batch_size": int(split_copy_batch_size),
+                "split_min_windows_per_chunk": int(split_min_windows_per_chunk),
+                "split_chunk_index_pad": int(split_chunk_index_pad),
+                "split_metadata_mode": str(split_metadata_mode),
+                "split_progress_interval_s": float(split_progress_interval_s),
+                "split_log_chunk_progress": bool(split_log_chunk_progress),
+                "split_log_dataset_progress": bool(split_log_dataset_progress),
+                "split_delete_source_after_success": bool(split_delete_source_after_success),
+                "overwrite": bool(overwrite),
             }
         )
 
@@ -1278,6 +1723,79 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Parallel workers for --dataset_root mode (spawn).",
+    )
+    parser.add_argument(
+        "--split_chunk_duration_s",
+        type=float,
+        default=None,
+        help="Optional: after writing each voxel H5, immediately split it into duration-based chunks.",
+    )
+    parser.add_argument(
+        "--split_output_root",
+        type=Path,
+        default=None,
+        help="Optional output root for split chunk files. Default writes chunks alongside the unsplit output.",
+    )
+    parser.add_argument("--split_copy_batch_size", type=int, default=8, help="Split row-copy batch size.")
+    parser.add_argument(
+        "--split_min_windows_per_chunk",
+        type=int,
+        default=1,
+        help="Drop split chunks with fewer than this number of windows.",
+    )
+    parser.add_argument(
+        "--split_chunk_index_pad",
+        type=int,
+        default=4,
+        help="Zero-padding width for split chunk suffix `_partXXXX`.",
+    )
+    parser.add_argument(
+        "--split_metadata_mode",
+        choices=["full", "minimal"],
+        default="full",
+        help="Metadata copy mode for split chunk files.",
+    )
+    parser.add_argument(
+        "--split_progress_interval_s",
+        type=float,
+        default=0.0,
+        help="If >0, print progress every N seconds while copying split chunk rows.",
+    )
+    parser.add_argument(
+        "--split_log_chunk_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print split chunk start/end logs.",
+    )
+    parser.add_argument(
+        "--split_log_dataset_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print split dataset copy logs.",
+    )
+    parser.add_argument(
+        "--split_delete_source_after_success",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Delete the unsplit voxel H5 after split chunks are successfully created.",
+    )
+    parser.add_argument(
+        "--activity_mode",
+        choices=["full", "light"],
+        default="full",
+        help="Activity metadata layout saved per window.",
+    )
+    parser.add_argument(
+        "--activity_spatial_patch_size",
+        type=int,
+        default=16,
+        help="Spatial patch size used when aggregating activity metadata.",
+    )
+    parser.add_argument(
+        "--activity_temporal_patch_size",
+        type=int,
+        default=2,
+        help="Temporal patch size used for full activity metadata.",
     )
 
     parser.add_argument("--input_height", type=int, default=720, help="Input event height (default: 720).")
@@ -1410,6 +1928,19 @@ if __name__ == "__main__":
             use_trilinear=args.use_trilinear,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
+            activity_mode=args.activity_mode,
+            activity_spatial_patch_size=args.activity_spatial_patch_size,
+            activity_temporal_patch_size=args.activity_temporal_patch_size,
+            split_chunk_duration_s=args.split_chunk_duration_s,
+            split_output_root=args.split_output_root,
+            split_copy_batch_size=args.split_copy_batch_size,
+            split_min_windows_per_chunk=args.split_min_windows_per_chunk,
+            split_chunk_index_pad=args.split_chunk_index_pad,
+            split_metadata_mode=args.split_metadata_mode,
+            split_progress_interval_s=args.split_progress_interval_s,
+            split_log_chunk_progress=args.split_log_chunk_progress,
+            split_log_dataset_progress=args.split_log_dataset_progress,
+            split_delete_source_after_success=args.split_delete_source_after_success,
         )
     else:
         if args.input_path is None or args.output_path is None:
@@ -1436,6 +1967,9 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            activity_mode=args.activity_mode,
+            activity_spatial_patch_size=args.activity_spatial_patch_size,
+            activity_temporal_patch_size=args.activity_temporal_patch_size,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

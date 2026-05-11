@@ -224,6 +224,7 @@ class _FileMeta:
     window_index: np.ndarray | None = None
     label_dataset_path: str | None = None
     label_length: int = 0
+    embedded_label_dataset_path: str | None = None
 
 
 class EventDenseTaskDataset(Dataset):
@@ -371,12 +372,6 @@ class EventDenseTaskDataset(Dataset):
                 )
                 return meta, np.asarray(valid, dtype=np.int64)
 
-            source_s = _load_h5_attr_str(h5f, "source_file", default="")
-            if source_s == "":
-                return None, np.empty((0,), dtype=np.int64)
-            source_h5 = Path(source_s).expanduser()
-            if not source_h5.exists():
-                return None, np.empty((0,), dtype=np.int64)
             if "window_index" in h5f:
                 window_index = np.asarray(h5f["window_index"][()], dtype=np.int64).reshape(-1)
             else:
@@ -384,10 +379,27 @@ class EventDenseTaskDataset(Dataset):
             if window_index.shape[0] != num_windows:
                 return None, np.empty((0,), dtype=np.int64)
 
-            label_ds_path, label_len = self._resolve_m3ed_label_dataset(
-                source_h5=source_h5,
-                preprocessed_h5=h5f,
-            )
+            embedded_label_ds_path = _load_h5_attr_str(h5f, "embedded_label_dataset", default="")
+            label_ds_path = None
+            label_len = 0
+            source_h5 = None
+            if self.target == "semantic" and embedded_label_ds_path == "embedded_semantics" and embedded_label_ds_path in h5f:
+                label_ds_path = embedded_label_ds_path
+                label_len = int(h5f[embedded_label_ds_path].shape[0])
+            elif self.target == "depth" and embedded_label_ds_path == "embedded_depth" and embedded_label_ds_path in h5f:
+                label_ds_path = embedded_label_ds_path
+                label_len = int(h5f[embedded_label_ds_path].shape[0])
+            else:
+                source_s = _load_h5_attr_str(h5f, "source_file", default="")
+                if source_s == "":
+                    return None, np.empty((0,), dtype=np.int64)
+                source_h5 = Path(source_s).expanduser()
+                if not source_h5.exists():
+                    return None, np.empty((0,), dtype=np.int64)
+                label_ds_path, label_len = self._resolve_m3ed_label_dataset(
+                    source_h5=source_h5,
+                    preprocessed_h5=h5f,
+                )
             if label_ds_path is None or label_len <= 0:
                 return None, np.empty((0,), dtype=np.int64)
             valid = window_index[(window_index >= 0) & (window_index < int(label_len))]
@@ -403,6 +415,7 @@ class EventDenseTaskDataset(Dataset):
                 window_index=window_index,
                 label_dataset_path=label_ds_path,
                 label_length=int(label_len),
+                embedded_label_dataset_path=(label_ds_path if source_h5 is None else None),
             )
             return meta, valid_indices.astype(np.int64, copy=False)
 
@@ -513,13 +526,16 @@ class EventDenseTaskDataset(Dataset):
                 "is_semantic": True,
             }
 
-        assert meta.source_h5 is not None
         assert meta.window_index is not None
         assert meta.label_dataset_path is not None
 
-        source_h5 = self._get_source_h5(meta.source_h5)
         label_idx = int(meta.window_index[int(center_window)])
-        label_arr = np.asarray(source_h5[meta.label_dataset_path][label_idx])
+        if meta.embedded_label_dataset_path is not None:
+            label_arr = np.asarray(pre_h5[meta.embedded_label_dataset_path][label_idx])
+        else:
+            assert meta.source_h5 is not None
+            source_h5 = self._get_source_h5(meta.source_h5)
+            label_arr = np.asarray(source_h5[meta.label_dataset_path][label_idx])
         label_arr = _squeeze_to_hw(label_arr, target=self.target)
 
         if self.target == "semantic":

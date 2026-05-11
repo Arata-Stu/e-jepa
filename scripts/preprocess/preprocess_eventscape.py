@@ -39,6 +39,7 @@ from scripts.preprocess.utils import (
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
+ACTIVITY_MODES = {"full", "light"}
 
 EVENTS_SUBDIR = Path("events/data")
 SEMANTIC_SUBDIR = Path("semantic/data")
@@ -310,6 +311,51 @@ def _events_to_voxel_numpy(
     return voxel.cpu().numpy().astype(np.float32, copy=False)
 
 
+def _compute_activity_metadata(
+    voxel: np.ndarray,
+    *,
+    temporal_bins: int,
+    split_polarity: bool,
+    spatial_patch_size: int,
+    temporal_patch_size: int,
+    activity_mode: str,
+) -> tuple[np.ndarray, float, float]:
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
+    channels, height, width = voxel.shape
+    if split_polarity:
+        activity_volume = np.abs(voxel).reshape(2, temporal_bins, height, width).sum(axis=0)
+    else:
+        activity_volume = np.abs(voxel)
+    nonzero_voxel_ratio = float(np.count_nonzero(activity_volume) / float(max(1, activity_volume.size)))
+    active_pixel_ratio = float(np.count_nonzero(activity_volume.sum(axis=0) > 0) / float(max(1, height * width)))
+    if activity_mode == "light":
+        spatial_volume = activity_volume.sum(axis=0, dtype=np.float32)
+        hp = (height + spatial_patch_size - 1) // spatial_patch_size
+        wp = (width + spatial_patch_size - 1) // spatial_patch_size
+        padded = np.pad(
+            spatial_volume,
+            ((0, hp * spatial_patch_size - height), (0, wp * spatial_patch_size - width)),
+            mode="constant",
+        )
+        grid = padded.reshape(hp, spatial_patch_size, wp, spatial_patch_size).sum(axis=(1, 3))
+        return grid.astype(np.float16, copy=False), nonzero_voxel_ratio, active_pixel_ratio
+    tp = (temporal_bins + temporal_patch_size - 1) // temporal_patch_size
+    hp = (height + spatial_patch_size - 1) // spatial_patch_size
+    wp = (width + spatial_patch_size - 1) // spatial_patch_size
+    padded = np.pad(
+        activity_volume,
+        (
+            (0, tp * temporal_patch_size - temporal_bins),
+            (0, hp * spatial_patch_size - height),
+            (0, wp * spatial_patch_size - width),
+        ),
+        mode="constant",
+    )
+    grid = padded.reshape(tp, temporal_patch_size, hp, spatial_patch_size, wp, spatial_patch_size).sum(axis=(1, 3, 5))
+    return grid.astype(np.float16, copy=False), nonzero_voxel_ratio, active_pixel_ratio
+
+
 class VoxelH5Writer:
     def __init__(
         self,
@@ -318,6 +364,7 @@ class VoxelH5Writer:
         height: int,
         width: int,
         voxel_dtype: np.dtype,
+        activity_grid_shape: tuple[int, ...],
         initial_capacity: int = 256,
     ):
         if outfile.exists():
@@ -347,6 +394,9 @@ class VoxelH5Writer:
             "depth_frame_index",
             "depth_timestamp_us",
             "depth_relpath",
+            "window_activity_score",
+            "window_active_pixel_ratio",
+            "window_activity_grid",
         )
 
         voxel_chunks = (1, t_bins, min(height, 64), min(width, 64))
@@ -502,6 +552,30 @@ class VoxelH5Writer:
             dtype=string_dtype,
             chunks=scalar_chunks,
         )
+        self.h5f.create_dataset(
+            "window_activity_score",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_active_pixel_ratio",
+            shape=(self._capacity,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=scalar_chunks,
+            **H5_COMPRESSION_FLAGS,
+        )
+        self.h5f.create_dataset(
+            "window_activity_grid",
+            shape=(self._capacity,) + tuple(activity_grid_shape),
+            maxshape=(None,) + tuple(activity_grid_shape),
+            dtype="f2",
+            chunks=(1,) + tuple(activity_grid_shape),
+            **H5_COMPRESSION_FLAGS,
+        )
 
     @staticmethod
     def close_callback(h5f: h5py.File):
@@ -538,6 +612,9 @@ class VoxelH5Writer:
         depth_frame_index: int,
         depth_timestamp_us: int,
         depth_relpath: str,
+        activity_score: float,
+        active_pixel_ratio: float,
+        activity_grid: np.ndarray,
     ):
         idx = self._num_windows
         self._ensure_capacity(idx + 1)
@@ -561,6 +638,9 @@ class VoxelH5Writer:
         self.h5f["depth_frame_index"][idx] = int(depth_frame_index)
         self.h5f["depth_timestamp_us"][idx] = int(depth_timestamp_us)
         self.h5f["depth_relpath"][idx] = depth_relpath
+        self.h5f["window_activity_score"][idx] = float(activity_score)
+        self.h5f["window_active_pixel_ratio"][idx] = float(active_pixel_ratio)
+        self.h5f["window_activity_grid"][idx] = activity_grid
         self._num_windows += 1
 
     def _trim(self):
@@ -646,6 +726,9 @@ def process_sequence(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     show_progress: bool,
     tmp_suffix: str,
 ) -> None:
@@ -657,6 +740,8 @@ def process_sequence(
         raise ValueError("downsample_factor must be 1 or 2")
     if t_bins <= 0:
         raise ValueError("t_bins must be > 0")
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
 
     event_files = _collect_event_files(sequence_dir)
     if len(event_files) == 0:
@@ -678,6 +763,18 @@ def process_sequence(
     )
     voxel_channels = int(t_bins) * (2 if split_polarity else 1)
     voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
+    activity_grid_shape = (
+        (
+            (int(t_bins) + int(activity_temporal_patch_size) - 1) // int(activity_temporal_patch_size),
+            (int(effective_output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+            (int(effective_output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+        )
+        if activity_mode == "full"
+        else (
+            (int(effective_output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+            (int(effective_output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
+        )
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -692,6 +789,7 @@ def process_sequence(
             height=effective_output_height,
             width=effective_output_width,
             voxel_dtype=voxel_dtype,
+            activity_grid_shape=activity_grid_shape,
             initial_capacity=max(256, len(event_files)),
         )
         writer.h5f.attrs["representation"] = "event_voxel_grid_eventscape"
@@ -720,6 +818,9 @@ def process_sequence(
         writer.h5f.attrs["num_depth_files"] = int(len(depth_by_idx))
         writer.h5f.attrs["has_semantic_timestamps"] = int(semantic_timestamps is not None)
         writer.h5f.attrs["has_depth_timestamps"] = int(depth_timestamps is not None)
+        writer.h5f.attrs["activity_mode"] = str(activity_mode)
+        writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
+        writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
 
         voxelizer = EventVoxelGrid(
             input_size=(t_bins, effective_output_height, effective_output_width),
@@ -781,6 +882,14 @@ def process_sequence(
                 output_width=effective_output_width,
             )
             voxel = voxel.astype(voxel_dtype, copy=False)
+            activity_grid, activity_score, active_pixel_ratio = _compute_activity_metadata(
+                voxel=voxel,
+                temporal_bins=int(t_bins),
+                split_polarity=bool(split_polarity),
+                spatial_patch_size=int(activity_spatial_patch_size),
+                temporal_patch_size=int(activity_temporal_patch_size),
+                activity_mode=str(activity_mode),
+            )
 
             writer.add_window(
                 voxel=voxel,
@@ -802,6 +911,9 @@ def process_sequence(
                 depth_frame_index=depth_frame_idx,
                 depth_timestamp_us=depth_timestamp_us,
                 depth_relpath=depth_relpath,
+                activity_score=activity_score,
+                active_pixel_ratio=active_pixel_ratio,
+                activity_grid=activity_grid,
             )
             if pbar is not None:
                 pbar.update(1)
@@ -834,6 +946,9 @@ def _process_sequence_with_retry(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     tmp_suffix: str,
 ) -> tuple[bool, str | None]:
     stale_tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -855,6 +970,9 @@ def _process_sequence_with_retry(
                 normalize=normalize,
                 output_dtype=output_dtype,
                 use_trilinear=use_trilinear,
+                activity_mode=activity_mode,
+                activity_spatial_patch_size=activity_spatial_patch_size,
+                activity_temporal_patch_size=activity_temporal_patch_size,
                 show_progress=False,
                 tmp_suffix=tmp_suffix,
             )
@@ -890,6 +1008,9 @@ def _worker_process_sequence(job: dict) -> tuple[str, bool, str | None]:
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
         use_trilinear=job["use_trilinear"],
+        activity_mode=job["activity_mode"],
+        activity_spatial_patch_size=job["activity_spatial_patch_size"],
+        activity_temporal_patch_size=job["activity_temporal_patch_size"],
         tmp_suffix=job["tmp_suffix"],
     )
     return str(sequence_dir), ok, err
@@ -948,11 +1069,16 @@ def process_dataset_root(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    activity_mode: str,
+    activity_spatial_patch_size: int,
+    activity_temporal_patch_size: int,
     tmp_suffix: str,
     num_processes: int,
 ) -> None:
     if int(num_processes) < 1:
         raise ValueError("num_processes must be >= 1")
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
 
     normalized_suffix = normalized_output_suffix(output_suffix)
     normalized_subdir = normalized_output_subdir(output_subdir)
@@ -997,6 +1123,9 @@ def process_dataset_root(
                 "normalize": bool(normalize),
                 "output_dtype": output_dtype,
                 "use_trilinear": bool(use_trilinear),
+                "activity_mode": str(activity_mode),
+                "activity_spatial_patch_size": int(activity_spatial_patch_size),
+                "activity_temporal_patch_size": int(activity_temporal_patch_size),
                 "tmp_suffix": tmp_suffix,
             }
         )
@@ -1045,6 +1174,14 @@ if __name__ == "__main__":
             "Use '.' for dataset_root itself."
         ),
     )
+    parser.add_argument(
+        "--activity_mode",
+        choices=["full", "light"],
+        default="full",
+        help="Activity metadata layout saved per window.",
+    )
+    parser.add_argument("--activity_spatial_patch_size", type=int, default=16, help="Spatial patch size for activity metadata.")
+    parser.add_argument("--activity_temporal_patch_size", type=int, default=2, help="Temporal patch size for full activity metadata.")
     parser.add_argument(
         "--output_suffix",
         type=str,
@@ -1138,6 +1275,9 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            activity_mode=args.activity_mode,
+            activity_spatial_patch_size=args.activity_spatial_patch_size,
+            activity_temporal_patch_size=args.activity_temporal_patch_size,
             tmp_suffix=args.tmp_suffix,
             num_processes=args.num_processes,
         )
@@ -1158,6 +1298,9 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            activity_mode=args.activity_mode,
+            activity_spatial_patch_size=args.activity_spatial_patch_size,
+            activity_temporal_patch_size=args.activity_temporal_patch_size,
             show_progress=True,
             tmp_suffix=args.tmp_suffix,
         )

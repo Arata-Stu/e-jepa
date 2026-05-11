@@ -20,5 +20,8 @@ split_polarity: true
 normalize: true
 output_dtype: float16
 use_trilinear: true
+activity_mode: full
+activity_spatial_patch_size: 16
+activity_temporal_patch_size: 2
 tmp_suffix: .tmp
 num_processes: 1

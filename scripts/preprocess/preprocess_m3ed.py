@@ -1105,6 +1105,10 @@ def process_single_file(
             embedded_label_name = None
             embedded_label_shape = None
             embedded_label_dtype = None
+            resolved_semantics_ts_source = ""
+            num_semantic_timestamps = 0
+            resolved_depth_ts_source = ""
+            num_depth_timestamps = 0
             if window_mode == "fixed":
                 window_start_us = max(int(t_first), time_origin_us)
                 windows = _build_windows_from_start(
@@ -1113,10 +1117,6 @@ def process_single_file(
                     accum_time_us=accum_time,
                     stride_time_us=stride_time,
                 )
-                writer.h5f.attrs["resolved_semantics_ts_source"] = ""
-                writer.h5f.attrs["num_semantic_timestamps"] = 0
-                writer.h5f.attrs["resolved_depth_ts_source"] = ""
-                writer.h5f.attrs["num_depth_timestamps"] = 0
             elif window_mode == "semantics_middle":
                 semantic_ts, resolved_source = _load_semantic_anchor_timestamps_us(
                     filehandle=h5f,
@@ -1134,10 +1134,8 @@ def process_single_file(
                     t_last_exclusive_us=int(t_last_exclusive),
                     anchor_timestamps_us=semantic_ts,
                 )
-                writer.h5f.attrs["resolved_semantics_ts_source"] = resolved_source
-                writer.h5f.attrs["num_semantic_timestamps"] = int(len(semantic_ts))
-                writer.h5f.attrs["resolved_depth_ts_source"] = ""
-                writer.h5f.attrs["num_depth_timestamps"] = 0
+                resolved_semantics_ts_source = str(resolved_source)
+                num_semantic_timestamps = int(len(semantic_ts))
                 embedded_label_source_path, embedded_label_name = _resolve_embedded_label_source(
                     filehandle=h5f,
                     target="semantic",
@@ -1160,10 +1158,8 @@ def process_single_file(
                     t_last_exclusive_us=int(t_last_exclusive),
                     anchor_timestamps_us=depth_ts,
                 )
-                writer.h5f.attrs["resolved_semantics_ts_source"] = ""
-                writer.h5f.attrs["num_semantic_timestamps"] = 0
-                writer.h5f.attrs["resolved_depth_ts_source"] = resolved_source
-                writer.h5f.attrs["num_depth_timestamps"] = int(len(depth_ts))
+                resolved_depth_ts_source = str(resolved_source)
+                num_depth_timestamps = int(len(depth_ts))
                 embedded_label_source_path, embedded_label_name = _resolve_embedded_label_source(
                     filehandle=h5f,
                     target="depth",
@@ -1225,20 +1221,10 @@ def process_single_file(
             writer.h5f.attrs["embedded_label_source_path"] = (
                 "" if embedded_label_source_path is None else str(embedded_label_source_path)
             )
-            writer.h5f.attrs["resolved_semantics_ts_source"] = (
-                ""
-                if window_mode == "fixed" or window_mode == "depth_middle"
-                else resolved_source
-            )
-            writer.h5f.attrs["num_semantic_timestamps"] = (
-                0 if window_mode != "semantics_middle" else int(len(semantic_ts))
-            )
-            writer.h5f.attrs["resolved_depth_ts_source"] = (
-                "" if window_mode != "depth_middle" else resolved_source
-            )
-            writer.h5f.attrs["num_depth_timestamps"] = (
-                0 if window_mode != "depth_middle" else int(len(depth_ts))
-            )
+            writer.h5f.attrs["resolved_semantics_ts_source"] = str(resolved_semantics_ts_source)
+            writer.h5f.attrs["num_semantic_timestamps"] = int(num_semantic_timestamps)
+            writer.h5f.attrs["resolved_depth_ts_source"] = str(resolved_depth_ts_source)
+            writer.h5f.attrs["num_depth_timestamps"] = int(num_depth_timestamps)
             writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
             writer.h5f.attrs["anchor_timebase_mode"] = anchor_timebase_mode
             writer.h5f.attrs["anchor_timebase_shift_us"] = int(anchor_timebase_shift_us)

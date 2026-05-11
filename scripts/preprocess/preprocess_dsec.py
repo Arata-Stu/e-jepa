@@ -800,7 +800,6 @@ def process_single_file(
                 return
 
             time_origin_us = int(t_first) if start_time_us is None else int(start_time_us)
-            writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
 
             if window_mode == "fixed":
                 window_start_us = max(int(t_first), time_origin_us)
@@ -810,6 +809,7 @@ def process_single_file(
                     accum_time_us=accum_time,
                     stride_time_us=stride_time,
                 )
+                image_timestamps = None
             else:
                 image_timestamps = _load_image_timestamps(image_timestamps_path)
                 windows = _build_image_middle_windows(
@@ -817,7 +817,6 @@ def process_single_file(
                     t_last_exclusive_us=t_last_exclusive,
                     image_timestamps_us=image_timestamps,
                 )
-                writer.h5f.attrs["num_image_timestamps"] = int(len(image_timestamps))
 
             if sync_segmentation and segmentation_dir is not None:
                 seg_timestamps, seg_relpaths = _load_segmentation_index(segmentation_dir)
@@ -872,6 +871,9 @@ def process_single_file(
             writer.h5f.attrs["activity_mode"] = str(activity_mode)
             writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
             writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
+            writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
+            if image_timestamps is not None:
+                writer.h5f.attrs["num_image_timestamps"] = int(len(image_timestamps))
             if embedded_segmentation_shape is not None:
                 writer.h5f.attrs["embedded_label_dataset"] = "embedded_segmentation"
                 writer.h5f.attrs["embedded_label_source_path"] = str(segmentation_dir)

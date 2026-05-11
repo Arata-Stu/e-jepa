@@ -1338,6 +1338,33 @@ def _process_file_with_retry(
     if not cleanup_tmp_file(tmp_path=stale_tmp_path, context=f"resume prep for {input_path}", strict=False):
         return False, f"could not remove stale tmp file: {stale_tmp_path}"
 
+    if (
+        split_chunk_duration_s is not None
+        and float(split_chunk_duration_s) > 0
+        and split_output_path is not None
+        and output_path.exists()
+        and not bool(overwrite)
+    ):
+        try:
+            split_voxel_h5_file(
+                input_path=output_path,
+                output_base_path=split_output_path,
+                chunk_duration_s=float(split_chunk_duration_s),
+                copy_batch_size=int(split_copy_batch_size),
+                min_windows_per_chunk=int(split_min_windows_per_chunk),
+                chunk_index_pad=int(split_chunk_index_pad),
+                overwrite=False,
+                metadata_mode=str(split_metadata_mode),
+                progress_interval_s=float(split_progress_interval_s),
+                log_chunk_progress=bool(split_log_chunk_progress),
+                log_dataset_progress=bool(split_log_dataset_progress),
+            )
+            if bool(split_delete_source_after_success):
+                output_path.unlink(missing_ok=True)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+
     for attempt in (1, 2):
         try:
             process_single_file(
@@ -1496,6 +1523,11 @@ def _build_split_output_path(
     return split_output_root / relative_output
 
 
+def _split_chunk_outputs_exist(output_base_path: Path) -> bool:
+    pattern = f"{output_base_path.stem}_part*{output_base_path.suffix}"
+    return any(output_base_path.parent.glob(pattern))
+
+
 def process_dataset_root(
     dataset_root: Path,
     output_suffix: str,
@@ -1590,12 +1622,6 @@ def process_dataset_root(
             normalized_subdir=normalized_subdir,
             downsample_factor=downsample_factor,
         )
-        if output_path.exists():
-            if overwrite:
-                output_path.unlink()
-            else:
-                num_skipped += 1
-                continue
         split_output_path = None
         if split_chunk_duration_s is not None and float(split_chunk_duration_s) > 0:
             split_output_path = _build_split_output_path(
@@ -1604,6 +1630,21 @@ def process_dataset_root(
                 output_root=output_root,
                 split_output_root=split_output_root,
             )
+            if (
+                not output_path.exists()
+                and not overwrite
+                and bool(split_delete_source_after_success)
+                and split_output_path is not None
+                and _split_chunk_outputs_exist(split_output_path)
+            ):
+                num_skipped += 1
+                continue
+        if output_path.exists():
+            if overwrite:
+                output_path.unlink()
+            elif split_output_path is None:
+                num_skipped += 1
+                continue
 
         jobs.append(
             {

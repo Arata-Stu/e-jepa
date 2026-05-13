@@ -54,6 +54,37 @@ KNOWN_SEMANTIC_SUPPORTED_M3ED_SEQUENCES = frozenset(
         "car_urban_day_ucity_small_loop",
     }
 )
+KNOWN_DEPTH_SUPPORTED_M3ED_SEQUENCES = frozenset(
+    {
+        "car_urban_day_city_hall",
+        "car_urban_day_horse",
+        "car_urban_day_penno_big_loop",
+        "car_urban_day_penno_small_loop",
+        "car_urban_day_rittenhouse",
+        "car_urban_day_ucity_small_loop",
+        "car_urban_night_city_hall",
+        "car_urban_night_penno_big_loop",
+        "car_urban_night_penno_small_loop",
+        "car_urban_night_penno_small_loop_darker",
+        "car_urban_night_rittenhouse",
+        "car_urban_night_ucity_small_loop",
+        "city_hall",
+        "horse",
+        "penno_big_loop",
+        "penno_small_loop",
+        "penno_small_loop_darker",
+        "rittenhouse",
+        "ucity_small_loop",
+        "forest_into_ponds_long",
+        "forest_into_ponds_short",
+        "forest_sand_1",
+        "forest_tree_tunnel",
+        "into_ponds_long",
+        "into_ponds_short",
+        "sand_1",
+        "tree_tunnel",
+    }
+)
 
 
 def _open_event_group(filehandle: h5py.File) -> h5py.Group:
@@ -101,6 +132,10 @@ def _resolve_sequence_name(input_path: Path) -> str:
 
 def _is_known_semantic_supported_sequence(input_path: Path) -> bool:
     return any(name in KNOWN_SEMANTIC_SUPPORTED_M3ED_SEQUENCES for name in _candidate_sequence_names(input_path))
+
+
+def _is_known_depth_supported_sequence(input_path: Path) -> bool:
+    return any(name in KNOWN_DEPTH_SUPPORTED_M3ED_SEQUENCES for name in _candidate_sequence_names(input_path))
 
 
 def _read_t_offset(filehandle: h5py.File) -> int:
@@ -1005,6 +1040,7 @@ def process_single_file(
     start_time_us: int | None,
     window_mode: str,
     filter_known_semantic_sequences: bool,
+    filter_known_depth_sequences: bool,
     semantics_ts_source: str,
     semantics_ts_divisor: int,
     depth_ts_source: str,
@@ -1053,6 +1089,16 @@ def process_single_file(
         sequence_name = _resolve_sequence_name(input_path)
         raise ValueError(
             "sequence is outside the known semantic-supported M3ED subset for semantics_middle: "
+            f"{sequence_name} ({input_path})"
+        )
+    if (
+        window_mode == "depth_middle"
+        and bool(filter_known_depth_sequences)
+        and not _is_known_depth_supported_sequence(input_path)
+    ):
+        sequence_name = _resolve_sequence_name(input_path)
+        raise ValueError(
+            "sequence is outside the known depth-supported M3ED subset for depth_middle: "
             f"{sequence_name} ({input_path})"
         )
 
@@ -1365,6 +1411,7 @@ def _process_file_with_retry(
     start_time_us: int | None,
     window_mode: str,
     filter_known_semantic_sequences: bool,
+    filter_known_depth_sequences: bool,
     semantics_ts_source: str,
     semantics_ts_divisor: int,
     depth_ts_source: str,
@@ -1436,6 +1483,7 @@ def _process_file_with_retry(
                 start_time_us=start_time_us,
                 window_mode=window_mode,
                 filter_known_semantic_sequences=filter_known_semantic_sequences,
+                filter_known_depth_sequences=filter_known_depth_sequences,
                 semantics_ts_source=semantics_ts_source,
                 semantics_ts_divisor=semantics_ts_divisor,
                 depth_ts_source=depth_ts_source,
@@ -1501,6 +1549,7 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         start_time_us=job["start_time_us"],
         window_mode=job["window_mode"],
         filter_known_semantic_sequences=job["filter_known_semantic_sequences"],
+        filter_known_depth_sequences=job["filter_known_depth_sequences"],
         semantics_ts_source=job["semantics_ts_source"],
         semantics_ts_divisor=job["semantics_ts_divisor"],
         depth_ts_source=job["depth_ts_source"],
@@ -1602,6 +1651,7 @@ def process_dataset_root(
     start_time_us: int | None,
     window_mode: str,
     filter_known_semantic_sequences: bool,
+    filter_known_depth_sequences: bool,
     semantics_ts_source: str,
     semantics_ts_divisor: int,
     depth_ts_source: str,
@@ -1665,6 +1715,7 @@ def process_dataset_root(
     num_done = 0
     num_skipped = 0
     num_skipped_semantic_unsupported = 0
+    num_skipped_depth_unsupported = 0
     num_failed = 0
 
     for input_path in tqdm.tqdm(input_files, desc="M3ED files"):
@@ -1680,6 +1731,18 @@ def process_dataset_root(
             num_skipped_semantic_unsupported += 1
             print(
                 "[SKIP] semantics_middle is limited to known semantic-supported sequences: "
+                f"{_resolve_sequence_name(input_path)} ({input_path})"
+            )
+            continue
+        if (
+            window_mode == "depth_middle"
+            and bool(filter_known_depth_sequences)
+            and not _is_known_depth_supported_sequence(input_path)
+        ):
+            num_skipped += 1
+            num_skipped_depth_unsupported += 1
+            print(
+                "[SKIP] depth_middle is limited to known depth-supported sequences: "
                 f"{_resolve_sequence_name(input_path)} ({input_path})"
             )
             continue
@@ -1732,6 +1795,7 @@ def process_dataset_root(
                 "start_time_us": start_time_us,
                 "window_mode": window_mode,
                 "filter_known_semantic_sequences": bool(filter_known_semantic_sequences),
+                "filter_known_depth_sequences": bool(filter_known_depth_sequences),
                 "semantics_ts_source": semantics_ts_source,
                 "semantics_ts_divisor": semantics_ts_divisor,
                 "depth_ts_source": depth_ts_source,
@@ -1783,7 +1847,8 @@ def process_dataset_root(
     print(
         "[SUMMARY] "
         f"done={num_done}, skipped={num_skipped}, "
-        f"skipped_semantic_unsupported={num_skipped_semantic_unsupported}, failed={num_failed}"
+        f"skipped_semantic_unsupported={num_skipped_semantic_unsupported}, "
+        f"skipped_depth_unsupported={num_skipped_depth_unsupported}, failed={num_failed}"
     )
     if num_failed > 0:
         raise RuntimeError(f"{num_failed} files failed while processing {dataset_root}")
@@ -1949,6 +2014,12 @@ if __name__ == "__main__":
         help="When using semantics_middle, only process the currently confirmed semantic-supported M3ED sequences.",
     )
     parser.add_argument(
+        "--filter_known_depth_sequences",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When using depth_middle, only process the currently confirmed depth-supported M3ED sequences.",
+    )
+    parser.add_argument(
         "--semantics_ts_source",
         choices=["auto", "semantics_ts_map", "ovc_ts_map", "semantics_ts"],
         default="auto",
@@ -2028,6 +2099,7 @@ if __name__ == "__main__":
             start_time_us=args.start_time_us,
             window_mode=args.window_mode,
             filter_known_semantic_sequences=args.filter_known_semantic_sequences,
+            filter_known_depth_sequences=args.filter_known_depth_sequences,
             semantics_ts_source=args.semantics_ts_source,
             semantics_ts_divisor=args.semantics_ts_divisor,
             depth_ts_source=args.depth_ts_source,
@@ -2070,6 +2142,7 @@ if __name__ == "__main__":
             start_time_us=args.start_time_us,
             window_mode=args.window_mode,
             filter_known_semantic_sequences=args.filter_known_semantic_sequences,
+            filter_known_depth_sequences=args.filter_known_depth_sequences,
             semantics_ts_source=args.semantics_ts_source,
             semantics_ts_divisor=args.semantics_ts_divisor,
             depth_ts_source=args.depth_ts_source,

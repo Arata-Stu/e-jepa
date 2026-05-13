@@ -167,6 +167,7 @@ def _run_m3ed(cfg: DictConfig) -> None:
         start_time_us=_optional_int(cfg.start_time_us),
         window_mode=str(cfg.window_mode),
         filter_known_semantic_sequences=bool(cfg.filter_known_semantic_sequences),
+        filter_known_depth_sequences=bool(cfg.filter_known_depth_sequences),
         semantics_ts_source=str(cfg.semantics_ts_source),
         semantics_ts_divisor=int(cfg.semantics_ts_divisor),
         depth_ts_source=str(cfg.depth_ts_source),

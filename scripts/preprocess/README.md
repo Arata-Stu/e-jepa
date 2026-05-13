@@ -140,6 +140,9 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.output_suffix=_voxels_depth.h5
 ```
 
+`depth_middle` も既定で、現在 depth 対応が確認できている M3ED sequence のみを処理します。
+既知 subset 以外も無理に流したい場合は `dataset.filter_known_depth_sequences=false` を追加してください。
+
 ## EventScape
 
 想定例: `event_scape/Town05_test/<sequence>/events/data/*.npz`

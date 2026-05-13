@@ -219,6 +219,23 @@ python3 scripts/preprocess/analyze_voxel_h5.py \
   --output_dir /data/preprocessed_voxels_analysis_single
 ```
 
+activity 指標の全体分布を見て閾値設計したい場合:
+
+```bash
+python3 scripts/preprocess/analyze_activity_distribution.py \
+  --dataset_root /data/preprocessed_voxels \
+  --output_dir /data/preprocessed_voxels_activity \
+  --bins 100 \
+  --thresholds 0.0 0.001 0.005 0.01 0.02 0.05 0.1
+```
+
+主な出力:
+
+- `activity_histograms.svg`: `window_active_pixel_ratio` / `window_activity_score` の正規化ヒストグラム
+- `activity_percentiles.csv`: 例えば下位 5%, 10%, 25% を落とすときの閾値候補
+- `activity_threshold_sweep.csv`: 指定閾値ごとの keep/drop 割合
+- `activity_per_file.csv`: sequence/H5 ごとの平均値や外れ値確認用
+
 ## 20秒分割（事前学習向け）
 
 M3ED など長尺 voxel H5 を、約20秒ごとの複数 H5 に分割:

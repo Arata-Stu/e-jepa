@@ -236,6 +236,26 @@ python3 scripts/preprocess/analyze_activity_distribution.py \
 - `activity_threshold_sweep.csv`: 指定閾値ごとの keep/drop 割合
 - `activity_per_file.csv`: sequence/H5 ごとの平均値や外れ値確認用
 
+filter 後に残る clip / 落ちる clip を見たい場合:
+
+```bash
+python3 scripts/preprocess/visualize_activity_filter.py \
+  --dataset_root /data/m3ed_voxels \
+  --frames_per_clip 16 \
+  --min_clip_mean_active 0.01 \
+  --min_clip_active_frac 0.25 \
+  --output_dir /data/m3ed_filter_preview
+```
+
+主な出力:
+
+- `clip_filter_histograms.svg`: clip 単位で見た keep/drop 分布
+- `examples/keep_random/contact_sheet.png`: 典型的に残る clip
+- `examples/drop_random/contact_sheet.png`: 典型的に落ちる clip
+- `examples/keep_boundary/contact_sheet.png`: しきい値ギリギリで残る clip
+- `examples/drop_boundary/contact_sheet.png`: しきい値ギリギリで落ちる clip
+- `clip_filter_rows.csv`: clip ごとの keep/drop 判定
+
 ## 20秒分割（事前学習向け）
 
 M3ED など長尺 voxel H5 を、約20秒ごとの複数 H5 に分割:

@@ -20,6 +20,7 @@ stride_time: null
 start_time_us: null
 
 window_mode: semantics_middle
+filter_known_semantic_sequences: true
 semantics_ts_source: auto
 semantics_ts_divisor: 1
 depth_ts_source: auto

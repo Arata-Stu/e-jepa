@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import hdf5plugin  # noqa: F401
 import numpy as np
 
 

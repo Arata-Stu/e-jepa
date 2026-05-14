@@ -431,6 +431,23 @@ def main(args, resume_preempt: bool = False):
     allow_clip_overlap = bool(cfgs_data.get("allow_clip_overlap", False))
     file_pattern = str(cfgs_data.get("file_pattern", "*.h5"))
     recursive = bool(cfgs_data.get("recursive", True))
+    activity_filter_enabled = bool(cfgs_data.get("activity_filter_enabled", False))
+    activity_filter_min_clip_mean_active_pixel_ratio = cfgs_data.get(
+        "activity_filter_min_clip_mean_active_pixel_ratio",
+        None,
+    )
+    activity_filter_min_clip_mean_activity_score = cfgs_data.get(
+        "activity_filter_min_clip_mean_activity_score",
+        None,
+    )
+    activity_filter_min_clip_active_window_ratio = cfgs_data.get(
+        "activity_filter_min_clip_active_window_ratio",
+        None,
+    )
+    activity_filter_active_window_threshold = cfgs_data.get(
+        "activity_filter_active_window_threshold",
+        None,
+    )
 
     if len(dataset_paths) == 0:
         raise ValueError("data.datasets is empty. Please provide one or more dataset roots/manifests/H5 files.")
@@ -507,7 +524,12 @@ def main(args, resume_preempt: bool = False):
 
     logger.info(
         f"Dataset setup: type={dataset_type}, paths={dataset_paths}, "
-        f"dataset_fpcs={dataset_fpcs}, batch_size={batch_size}, num_clips={num_clips}"
+        f"dataset_fpcs={dataset_fpcs}, batch_size={batch_size}, num_clips={num_clips}, "
+        f"activity_filter_enabled={activity_filter_enabled}, "
+        f"min_clip_mean_active={activity_filter_min_clip_mean_active_pixel_ratio}, "
+        f"min_clip_mean_score={activity_filter_min_clip_mean_activity_score}, "
+        f"min_clip_active_window_ratio={activity_filter_min_clip_active_window_ratio}, "
+        f"active_window_threshold={activity_filter_active_window_threshold}"
     )
 
     transform = make_event_transforms(
@@ -596,6 +618,11 @@ def main(args, resume_preempt: bool = False):
         max_open_h5_files=max_open_h5_files,
         file_pattern=file_pattern,
         recursive=recursive,
+        activity_filter_enabled=activity_filter_enabled,
+        activity_filter_min_clip_mean_active_pixel_ratio=activity_filter_min_clip_mean_active_pixel_ratio,
+        activity_filter_min_clip_mean_activity_score=activity_filter_min_clip_mean_activity_score,
+        activity_filter_min_clip_active_window_ratio=activity_filter_min_clip_active_window_ratio,
+        activity_filter_active_window_threshold=activity_filter_active_window_threshold,
     )
 
     dlen = _extract_loader_len(data_loader)

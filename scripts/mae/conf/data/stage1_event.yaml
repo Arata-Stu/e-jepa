@@ -30,3 +30,9 @@ allow_clip_overlap: false
 # Scan options for directory mode.
 file_pattern: "*.h5"
 recursive: true
+# Optional clip-level activity filtering. Scalars apply to all datasets; lists align with `datasets`.
+activity_filter_enabled: false
+activity_filter_min_clip_mean_active_pixel_ratio: null
+activity_filter_min_clip_mean_activity_score: null
+activity_filter_min_clip_active_window_ratio: null
+activity_filter_active_window_threshold: null

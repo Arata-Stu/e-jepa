@@ -38,6 +38,11 @@ def init_data(
     file_pattern="*.h5",
     recursive=True,
     require_voxels_key=True,
+    activity_filter_enabled=False,
+    activity_filter_min_clip_mean_active_pixel_ratio=None,
+    activity_filter_min_clip_mean_activity_score=None,
+    activity_filter_min_clip_active_window_ratio=None,
+    activity_filter_active_window_threshold=None,
 ):
     if root_path is None:
         raise ValueError("root_path must be provided")
@@ -71,6 +76,11 @@ def init_data(
             file_pattern=file_pattern,
             recursive=recursive,
             require_voxels_key=require_voxels_key,
+            activity_filter_enabled=activity_filter_enabled,
+            activity_filter_min_clip_mean_active_pixel_ratio=activity_filter_min_clip_mean_active_pixel_ratio,
+            activity_filter_min_clip_mean_activity_score=activity_filter_min_clip_mean_activity_score,
+            activity_filter_min_clip_active_window_ratio=activity_filter_min_clip_active_window_ratio,
+            activity_filter_active_window_threshold=activity_filter_active_window_threshold,
         )
     elif name == "imagenet":
         dataset, data_loader, dist_sampler = make_imagenet1k(

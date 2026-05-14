@@ -110,6 +110,40 @@ def _to_cthw_tensor(buffer: np.ndarray) -> torch.Tensor:
     return tensor.permute(3, 0, 1, 2).contiguous()
 
 
+def _is_sequence_but_not_str(value) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, Path))
+
+
+def _coerce_optional_float(value, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "null"}:
+            return None
+        value = text
+    return float(value)
+
+
+def _expand_optional_per_dataset(value, num_datasets: int, field_name: str) -> list[float | None]:
+    if num_datasets <= 0:
+        raise ValueError("num_datasets must be > 0")
+    if value is None:
+        return [None] * num_datasets
+    if _is_sequence_but_not_str(value):
+        values = list(value)
+        if len(values) == 0:
+            return [None] * num_datasets
+        if len(values) == 1 and num_datasets > 1:
+            coerced = _coerce_optional_float(values[0], field_name)
+            return [coerced] * num_datasets
+        if len(values) != num_datasets:
+            raise ValueError(f"{field_name} length must match number of datasets ({num_datasets})")
+        return [_coerce_optional_float(v, field_name) for v in values]
+    coerced = _coerce_optional_float(value, field_name)
+    return [coerced] * num_datasets
+
+
 class EventVideoDataset(torch.utils.data.Dataset):
     """
     Stage-1 event representation dataset for JEPA-style pretraining.
@@ -136,6 +170,11 @@ class EventVideoDataset(torch.utils.data.Dataset):
         recursive: bool = True,
         require_voxels_key: bool = True,
         max_open_h5_files: int = 32,
+        activity_filter_enabled: bool = False,
+        activity_filter_min_clip_mean_active_pixel_ratio=None,
+        activity_filter_min_clip_mean_activity_score=None,
+        activity_filter_min_clip_active_window_ratio=None,
+        activity_filter_active_window_threshold=None,
     ):
         if isinstance(data_paths, (str, Path)):
             data_paths = [data_paths]
@@ -157,6 +196,7 @@ class EventVideoDataset(torch.utils.data.Dataset):
         self.random_clip_sampling = bool(random_clip_sampling)
         self.allow_clip_overlap = bool(allow_clip_overlap)
         self.max_open_h5_files = max(1, int(max_open_h5_files))
+        self.activity_filter_enabled = bool(activity_filter_enabled)
 
         if dataset_fpcs is None:
             self.dataset_fpcs = [int(frames_per_clip) for _ in self.data_paths]
@@ -166,6 +206,32 @@ class EventVideoDataset(torch.utils.data.Dataset):
             self.dataset_fpcs = [int(v) for v in dataset_fpcs]
         if any(fpc <= 0 for fpc in self.dataset_fpcs):
             raise ValueError("All dataset_fpcs must be > 0")
+
+        self.activity_filter_min_clip_mean_active_pixel_ratio = _expand_optional_per_dataset(
+            activity_filter_min_clip_mean_active_pixel_ratio,
+            num_datasets=len(self.data_paths),
+            field_name="activity_filter_min_clip_mean_active_pixel_ratio",
+        )
+        self.activity_filter_min_clip_mean_activity_score = _expand_optional_per_dataset(
+            activity_filter_min_clip_mean_activity_score,
+            num_datasets=len(self.data_paths),
+            field_name="activity_filter_min_clip_mean_activity_score",
+        )
+        self.activity_filter_min_clip_active_window_ratio = _expand_optional_per_dataset(
+            activity_filter_min_clip_active_window_ratio,
+            num_datasets=len(self.data_paths),
+            field_name="activity_filter_min_clip_active_window_ratio",
+        )
+        self.activity_filter_active_window_threshold = _expand_optional_per_dataset(
+            activity_filter_active_window_threshold,
+            num_datasets=len(self.data_paths),
+            field_name="activity_filter_active_window_threshold",
+        )
+        for idx in range(len(self.data_paths)):
+            if self.activity_filter_min_clip_active_window_ratio[idx] is not None:
+                threshold = self.activity_filter_active_window_threshold[idx]
+                if threshold is None:
+                    self.activity_filter_active_window_threshold[idx] = 1e-6
 
         samples: list[str] = []
         labels: list[int] = []
@@ -197,6 +263,8 @@ class EventVideoDataset(torch.utils.data.Dataset):
 
         # Worker-local lazy cache. We intentionally avoid sharing handles.
         self._h5_cache: OrderedDict[str, h5py.File] = OrderedDict()
+        self._activity_cache: OrderedDict[str, tuple[np.ndarray | None, np.ndarray | None]] = OrderedDict()
+        self._valid_clip_start_cache: dict[tuple[str, int, int, int, int], np.ndarray] = {}
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -212,6 +280,12 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 except Exception:
                     pass
             cache.clear()
+        activity_cache = getattr(self, "_activity_cache", None)
+        if isinstance(activity_cache, dict):
+            activity_cache.clear()
+        valid_cache = getattr(self, "_valid_clip_start_cache", None)
+        if isinstance(valid_cache, dict):
+            valid_cache.clear()
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -232,7 +306,40 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 old_h5.close()
             except Exception:
                 pass
+            self._activity_cache.pop(old_key, None)
         return h5f
+
+    def _dataset_activity_filter_enabled(self, dataset_idx: int) -> bool:
+        if not self.activity_filter_enabled:
+            return False
+        return any(
+            (
+                self.activity_filter_min_clip_mean_active_pixel_ratio[dataset_idx] is not None,
+                self.activity_filter_min_clip_mean_activity_score[dataset_idx] is not None,
+                self.activity_filter_min_clip_active_window_ratio[dataset_idx] is not None,
+            )
+        )
+
+    def _get_activity_arrays(self, sample_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+        cached = self._activity_cache.get(sample_path)
+        if cached is not None:
+            self._activity_cache.move_to_end(sample_path, last=True)
+            return cached
+
+        h5f = self._get_h5(sample_path)
+        active_ratio = None
+        activity_score = None
+        if "window_active_pixel_ratio" in h5f:
+            active_ratio = np.asarray(h5f["window_active_pixel_ratio"], dtype=np.float32).reshape(-1)
+        if "window_activity_score" in h5f:
+            activity_score = np.asarray(h5f["window_activity_score"], dtype=np.float32).reshape(-1)
+
+        cached = (active_ratio, activity_score)
+        self._activity_cache[sample_path] = cached
+        self._activity_cache.move_to_end(sample_path, last=True)
+        while len(self._activity_cache) > self.max_open_h5_files:
+            self._activity_cache.popitem(last=False)
+        return cached
 
     @staticmethod
     def _fit_indices_length(indices: np.ndarray, target_len: int, last_valid: int) -> np.ndarray:
@@ -246,17 +353,100 @@ class EventVideoDataset(torch.utils.data.Dataset):
     def _sample_clip_in_segment(
         self,
         *,
+        sample_path: str,
+        dataset_idx: int,
         segment_start: int,
         segment_length: int,
         total_windows: int,
         fpc: int,
-    ) -> np.ndarray:
+    ) -> np.ndarray | None:
         if total_windows <= 0:
             return np.zeros((fpc,), dtype=np.int64)
 
         if segment_length <= 0:
             anchor = min(max(segment_start, 0), total_windows - 1)
             return np.full((fpc,), anchor, dtype=np.int64)
+
+        def _candidate_local_starts() -> np.ndarray:
+            clip_span = max(1, fpc * self.frame_step)
+            if segment_length > clip_span:
+                max_local_start = segment_length - clip_span
+                return np.arange(0, max_local_start + 1, dtype=np.int64)
+            return np.array([0], dtype=np.int64)
+
+        def _indices_from_local_start(local_start: int) -> np.ndarray:
+            clip_span = max(1, fpc * self.frame_step)
+            if segment_length > clip_span:
+                local_indices = np.arange(
+                    int(local_start),
+                    int(local_start) + clip_span,
+                    self.frame_step,
+                    dtype=np.int64,
+                )
+            else:
+                local_indices = np.arange(0, segment_length, self.frame_step, dtype=np.int64)
+            if local_indices.size == 0:
+                local_indices = np.array([0], dtype=np.int64)
+            local_indices = self._fit_indices_length(
+                local_indices,
+                target_len=fpc,
+                last_valid=max(0, segment_length - 1),
+            )
+            global_indices = segment_start + local_indices
+            np.clip(global_indices, 0, total_windows - 1, out=global_indices)
+            return global_indices.astype(np.int64, copy=False)
+
+        def _passes_activity_filter(indices: np.ndarray) -> bool:
+            if not self._dataset_activity_filter_enabled(dataset_idx):
+                return True
+
+            active_ratio, activity_score = self._get_activity_arrays(sample_path)
+            min_mean_active = self.activity_filter_min_clip_mean_active_pixel_ratio[dataset_idx]
+            min_mean_score = self.activity_filter_min_clip_mean_activity_score[dataset_idx]
+            min_active_window_ratio = self.activity_filter_min_clip_active_window_ratio[dataset_idx]
+            active_window_threshold = self.activity_filter_active_window_threshold[dataset_idx]
+
+            if min_mean_active is not None:
+                if active_ratio is None or active_ratio.shape[0] < total_windows:
+                    return False
+                if float(np.mean(active_ratio[indices])) < float(min_mean_active):
+                    return False
+
+            if min_mean_score is not None:
+                if activity_score is None or activity_score.shape[0] < total_windows:
+                    return False
+                if float(np.mean(activity_score[indices])) < float(min_mean_score):
+                    return False
+
+            if min_active_window_ratio is not None:
+                if active_ratio is None or active_ratio.shape[0] < total_windows:
+                    return False
+                threshold = 0.0 if active_window_threshold is None else float(active_window_threshold)
+                active_mask = active_ratio[indices] > threshold
+                if float(np.mean(active_mask.astype(np.float32))) < float(min_active_window_ratio):
+                    return False
+
+            return True
+
+        candidate_local_starts = _candidate_local_starts()
+        if self._dataset_activity_filter_enabled(dataset_idx):
+            cache_key = (sample_path, int(dataset_idx), int(segment_start), int(segment_length), int(fpc))
+            valid_local_starts = self._valid_clip_start_cache.get(cache_key)
+            if valid_local_starts is None:
+                valid = []
+                for local_start in candidate_local_starts.tolist():
+                    candidate_indices = _indices_from_local_start(int(local_start))
+                    if _passes_activity_filter(candidate_indices):
+                        valid.append(int(local_start))
+                valid_local_starts = np.asarray(valid, dtype=np.int64)
+                self._valid_clip_start_cache[cache_key] = valid_local_starts
+            if valid_local_starts.size == 0:
+                return None
+            if self.random_clip_sampling:
+                chosen_local_start = int(valid_local_starts[np.random.randint(0, valid_local_starts.size)])
+            else:
+                chosen_local_start = int(valid_local_starts[valid_local_starts.size // 2])
+            return _indices_from_local_start(chosen_local_start)
 
         clip_span = max(1, fpc * self.frame_step)
         if segment_length > clip_span:
@@ -286,16 +476,19 @@ class EventVideoDataset(torch.utils.data.Dataset):
         np.clip(global_indices, 0, total_windows - 1, out=global_indices)
         return global_indices.astype(np.int64, copy=False)
 
-    def _sample_clip_indices(self, total_windows: int, fpc: int) -> list[np.ndarray]:
+    def _sample_clip_indices(self, *, sample_path: str, dataset_idx: int, total_windows: int, fpc: int) -> list[np.ndarray] | None:
         if self.num_clips == 1:
-            return [
-                self._sample_clip_in_segment(
-                    segment_start=0,
-                    segment_length=total_windows,
-                    total_windows=total_windows,
-                    fpc=fpc,
-                )
-            ]
+            indices = self._sample_clip_in_segment(
+                sample_path=sample_path,
+                dataset_idx=dataset_idx,
+                segment_start=0,
+                segment_length=total_windows,
+                total_windows=total_windows,
+                fpc=fpc,
+            )
+            if indices is None:
+                return None
+            return [indices]
 
         all_clip_indices: list[np.ndarray] = []
         if not self.allow_clip_overlap:
@@ -304,14 +497,17 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 start = clip_id * partition_len
                 end = total_windows if clip_id == self.num_clips - 1 else min(total_windows, (clip_id + 1) * partition_len)
                 length = max(1, end - start)
-                all_clip_indices.append(
-                    self._sample_clip_in_segment(
-                        segment_start=start,
-                        segment_length=length,
-                        total_windows=total_windows,
-                        fpc=fpc,
-                    )
+                indices = self._sample_clip_in_segment(
+                    sample_path=sample_path,
+                    dataset_idx=dataset_idx,
+                    segment_start=start,
+                    segment_length=length,
+                    total_windows=total_windows,
+                    fpc=fpc,
                 )
+                if indices is None:
+                    return None
+                all_clip_indices.append(indices)
         else:
             clip_span = max(1, fpc * self.frame_step)
             if self.num_clips == 1:
@@ -324,14 +520,17 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 starts = np.round(starts).astype(np.int64)
             for start in starts.tolist():
                 seg_len = min(total_windows - start, clip_span)
-                all_clip_indices.append(
-                    self._sample_clip_in_segment(
-                        segment_start=int(start),
-                        segment_length=int(seg_len),
-                        total_windows=total_windows,
-                        fpc=fpc,
-                    )
+                indices = self._sample_clip_in_segment(
+                    sample_path=sample_path,
+                    dataset_idx=dataset_idx,
+                    segment_start=int(start),
+                    segment_length=int(seg_len),
+                    total_windows=total_windows,
+                    fpc=fpc,
                 )
+                if indices is None:
+                    return None
+                all_clip_indices.append(indices)
         return all_clip_indices
 
     @staticmethod
@@ -365,7 +564,14 @@ class EventVideoDataset(torch.utils.data.Dataset):
             return None
 
         total_windows = int(voxels_ds.shape[0])
-        clip_indices = self._sample_clip_indices(total_windows=total_windows, fpc=fpc)
+        clip_indices = self._sample_clip_indices(
+            sample_path=sample_path,
+            dataset_idx=dataset_idx,
+            total_windows=total_windows,
+            fpc=fpc,
+        )
+        if clip_indices is None:
+            return None
         all_indices = np.concatenate(clip_indices, axis=0).astype(np.int64, copy=False)
         windows = self._read_windows(voxels_ds=voxels_ds, indices=all_indices)  # [T,C,H,W]
         windows = np.transpose(windows, (0, 2, 3, 1))  # [T,H,W,C]
@@ -418,6 +624,11 @@ def make_eventdataset(
     file_pattern: str = "*.h5",
     recursive: bool = True,
     require_voxels_key: bool = True,
+    activity_filter_enabled: bool = False,
+    activity_filter_min_clip_mean_active_pixel_ratio=None,
+    activity_filter_min_clip_mean_activity_score=None,
+    activity_filter_min_clip_active_window_ratio=None,
+    activity_filter_active_window_threshold=None,
 ):
     dataset = EventVideoDataset(
         data_paths=data_paths,
@@ -434,6 +645,11 @@ def make_eventdataset(
         recursive=recursive,
         require_voxels_key=require_voxels_key,
         max_open_h5_files=max_open_h5_files,
+        activity_filter_enabled=activity_filter_enabled,
+        activity_filter_min_clip_mean_active_pixel_ratio=activity_filter_min_clip_mean_active_pixel_ratio,
+        activity_filter_min_clip_mean_activity_score=activity_filter_min_clip_mean_activity_score,
+        activity_filter_min_clip_active_window_ratio=activity_filter_min_clip_active_window_ratio,
+        activity_filter_active_window_threshold=activity_filter_active_window_threshold,
     )
 
     if datasets_weights is not None:

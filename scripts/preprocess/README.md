@@ -262,6 +262,41 @@ python3 scripts/preprocess/visualize_activity_filter.py \
 - `examples/drop_boundary/contact_sheet.png`: しきい値ギリギリで落ちる clip
 - `clip_filter_rows.csv`: clip ごとの keep/drop 判定
 
+前処理直後に構造エラーや怪しい sequence をまとめて見たい場合:
+
+```bash
+python3 scripts/preprocess/validate_preprocessed_h5.py \
+  --dataset_root /data/preprocessed_voxels \
+  --output_dir /data/preprocessed_voxels_healthcheck \
+  --fail_on error
+```
+
+低 activity の outlier が特定 sequence に偏っていたら warning でも止めたい場合:
+
+```bash
+python3 scripts/preprocess/validate_preprocessed_h5.py \
+  --dataset_root /data/preprocessed_voxels \
+  --output_dir /data/preprocessed_voxels_healthcheck \
+  --fail_on warning
+```
+
+主な出力:
+
+- `preprocess_health_report.md`: 最初に見るべき summary report
+- `preprocess_health_rows.csv`: file ごとの event/activity 統計と status
+- `preprocess_health_issues.csv`: error / warning 一覧
+- `preprocess_health_summary.json`: CI 向け summary
+
+この healthcheck は、例えば次を自動で拾います。
+
+- `voxels` や `window_event_count` など必須 dataset の欠落
+- window 時刻の非単調や `end <= start`
+- NaN / Inf voxel
+- `semantic` / `depth` 同期 H5 なのに label reference が無い
+- M3ED semantic が `ovc_ts_map` fallback に落ちている
+- zero-event window が極端に多い file
+- low activity outlier が特定 sequence に偏っている
+
 ## 20秒分割（事前学習向け）
 
 M3ED など長尺 voxel H5 を、約20秒ごとの複数 H5 に分割:

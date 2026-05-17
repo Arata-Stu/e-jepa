@@ -86,6 +86,45 @@ def _load_h5_attr_str(h5f: h5py.File, key: str, default: str = "") -> str:
     return _decode_h5_string(h5f.attrs[key]).strip()
 
 
+def _load_h5_attr_int(h5f: h5py.File, key: str) -> int | None:
+    if key not in h5f.attrs:
+        return None
+    value = h5f.attrs[key]
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            value = value.item()
+        elif value.size == 1:
+            value = value.reshape(-1)[0]
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _maybe_rebase_split_embedded_window_index(
+    *,
+    h5f: h5py.File,
+    window_index: np.ndarray,
+    label_len: int,
+    embedded_label_ds_path: str | None,
+) -> np.ndarray:
+    if embedded_label_ds_path is None or int(label_len) <= 0 or window_index.size == 0:
+        return window_index
+
+    split_start = _load_h5_attr_int(h5f, "split_source_start_index")
+    split_end = _load_h5_attr_int(h5f, "split_source_end_index_exclusive")
+    if split_start is None or split_end is None or int(split_end) <= int(split_start):
+        return window_index
+
+    if not np.all((window_index >= int(split_start)) & (window_index < int(split_end))):
+        return window_index
+
+    rebased = window_index - int(split_start)
+    if not np.all((rebased >= 0) & (rebased < int(label_len))):
+        return window_index
+    return rebased.astype(np.int64, copy=False)
+
+
 def _squeeze_to_hw(arr: np.ndarray, *, target: TaskTarget) -> np.ndarray:
     if arr.ndim == 2:
         return arr
@@ -223,6 +262,7 @@ class _FileMeta:
     # M3ED
     source_h5: Path | None = None
     window_index: np.ndarray | None = None
+    label_lookup_index: np.ndarray | None = None
     label_dataset_path: str | None = None
     label_length: int = 0
     embedded_label_dataset_path: str | None = None
@@ -415,10 +455,17 @@ class EventDenseTaskDataset(Dataset):
                 )
             if label_ds_path is None or label_len <= 0:
                 return None, np.empty((0,), dtype=np.int64)
-            valid = window_index[(window_index >= 0) & (window_index < int(label_len))]
-            if valid.size == 0:
+            label_lookup_index = window_index
+            if source_h5 is None:
+                label_lookup_index = _maybe_rebase_split_embedded_window_index(
+                    h5f=h5f,
+                    window_index=window_index,
+                    label_len=int(label_len),
+                    embedded_label_ds_path=label_ds_path,
+                )
+            valid_mask = (label_lookup_index >= 0) & (label_lookup_index < int(label_len))
+            if not np.any(valid_mask):
                 return None, np.empty((0,), dtype=np.int64)
-            valid_mask = (window_index >= 0) & (window_index < int(label_len))
             valid_indices = all_indices[valid_mask]
 
             meta = _FileMeta(
@@ -426,6 +473,7 @@ class EventDenseTaskDataset(Dataset):
                 num_windows=num_windows,
                 source_h5=source_h5,
                 window_index=window_index,
+                label_lookup_index=label_lookup_index,
                 label_dataset_path=label_ds_path,
                 label_length=int(label_len),
                 embedded_label_dataset_path=(label_ds_path if source_h5 is None else None),
@@ -543,9 +591,10 @@ class EventDenseTaskDataset(Dataset):
             }
 
         assert meta.window_index is not None
+        assert meta.label_lookup_index is not None
         assert meta.label_dataset_path is not None
 
-        label_idx = int(meta.window_index[int(center_window)])
+        label_idx = int(meta.label_lookup_index[int(center_window)])
         if meta.embedded_label_dataset_path is not None:
             label_arr = np.asarray(pre_h5[meta.embedded_label_dataset_path][label_idx])
         else:

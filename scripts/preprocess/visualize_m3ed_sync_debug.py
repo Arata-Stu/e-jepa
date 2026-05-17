@@ -65,7 +65,9 @@ class LabelSourceInfo:
 class WindowLabelInfo:
     target: TaskTarget
     window_index: int
+    source_window_index: int
     label_index: int
+    label_index_mode: str
     label_shape: tuple[int, ...]
     valid_window: bool
     source_kind: str
@@ -106,6 +108,21 @@ def _load_h5_attr_str(h5f: h5py.File, key: str, default: str = "") -> str:
     if key not in h5f.attrs:
         return default
     return _decode_h5_string(h5f.attrs[key]).strip()
+
+
+def _load_h5_attr_int(h5f: h5py.File, key: str) -> int | None:
+    if key not in h5f.attrs:
+        return None
+    value = h5f.attrs[key]
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            value = value.item()
+        elif value.size == 1:
+            value = value.reshape(-1)[0]
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def _is_voxel_h5(path: Path) -> bool:
@@ -525,6 +542,31 @@ def _load_window_index(h5f: h5py.File, n_samples: int) -> np.ndarray:
     return arr
 
 
+def _resolve_label_indices(
+    *,
+    h5f: h5py.File,
+    source_info: LabelSourceInfo,
+    window_index: np.ndarray,
+) -> tuple[np.ndarray, str]:
+    label_index = np.asarray(window_index, dtype=np.int64)
+    mode = "as_is"
+    if source_info.source_kind != "embedded" or source_info.label_length <= 0 or label_index.size == 0:
+        return label_index, mode
+
+    split_start = _load_h5_attr_int(h5f, "split_source_start_index")
+    split_end = _load_h5_attr_int(h5f, "split_source_end_index_exclusive")
+    if split_start is None or split_end is None or int(split_end) <= int(split_start):
+        return label_index, mode
+
+    if not np.all((label_index >= int(split_start)) & (label_index < int(split_end))):
+        return label_index, mode
+
+    rebased = label_index - int(split_start)
+    if not np.all((rebased >= 0) & (rebased < int(source_info.label_length))):
+        return label_index, mode
+    return rebased.astype(np.int64, copy=False), "rebased_split_embedded"
+
+
 def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceInfo:
     if target == "semantic":
         embedded_name = "embedded_semantics"
@@ -621,12 +663,15 @@ def _load_label_for_window(
     source_info: LabelSourceInfo,
     center_window: int,
     window_index: np.ndarray,
+    label_index: np.ndarray,
+    label_index_mode: str,
     ignore_index: int,
     depth_scale: float,
     depth_valid_min: float,
     depth_valid_max: float,
 ) -> tuple[np.ndarray | None, WindowLabelInfo]:
-    label_idx = int(window_index[center_window])
+    source_window_idx = int(window_index[center_window])
+    label_idx = int(label_index[center_window])
     valid_window = (
         source_info.source_h5_exists
         and source_info.label_length > 0
@@ -638,7 +683,10 @@ def _load_label_for_window(
     if source_info.label_length <= 0 and missing_reason == "":
         missing_reason = "label_length is zero"
     elif not (0 <= label_idx < max(1, int(source_info.label_length))) and missing_reason == "":
-        missing_reason = f"window_index={label_idx} out of label range"
+        missing_reason = (
+            f"label_index={label_idx} out of label range "
+            f"(source_window_index={source_window_idx})"
+        )
 
     label = None
     label_shape: tuple[int, ...] = ()
@@ -677,7 +725,9 @@ def _load_label_for_window(
     info = WindowLabelInfo(
         target=source_info.target,
         window_index=center_window,
+        source_window_index=source_window_idx,
         label_index=label_idx,
+        label_index_mode=label_index_mode,
         label_shape=label_shape,
         valid_window=bool(valid_window),
         source_kind=source_info.source_kind,
@@ -817,12 +867,14 @@ def _render_preview(
     label_gap = 18
     header_lines = [
         f"{file_label} | sync_target={sync_target or 'n/a'} | target={target} | "
-        f"window={window_info.window_index} | label_idx={window_info.label_index} | "
+        f"window={window_info.window_index} | source_idx={window_info.source_window_index} | "
+        f"label_idx={window_info.label_index} | "
         f"events={event_count if event_count is not None else 'n/a'} | "
         f"anchor_us={anchor_timestamp_us if anchor_timestamp_us is not None else 'n/a'}",
         f"source_kind={window_info.source_kind} | source_exists={int(window_info.source_exists)} | "
         f"label_ds={_truncate_middle(window_info.label_dataset_path or 'n/a', 72)} | "
-        f"resolved_ts={source_info.resolved_ts_source or 'n/a'} | label_len={source_info.label_length}",
+        f"resolved_ts={source_info.resolved_ts_source or 'n/a'} | label_len={source_info.label_length} | "
+        f"label_index_mode={window_info.label_index_mode}",
         extra_line,
     ]
     header_text = "\n".join(header_lines)
@@ -874,6 +926,9 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "label_length",
         "window_index_min",
         "window_index_max",
+        "label_index_min",
+        "label_index_max",
+        "label_index_mode",
         "valid_windows",
         "valid_ratio",
         "source_missing_reason",
@@ -922,6 +977,11 @@ def _analyze_file(
         sync_target = _load_h5_attr_str(pre_h5, "sync_target", default="")
         window_index = _load_window_index(pre_h5, n_samples)
         source_info = _resolve_label_source(pre_h5, target=target)
+        label_index, label_index_mode = _resolve_label_indices(
+            h5f=pre_h5,
+            source_info=source_info,
+            window_index=window_index,
+        )
         valid_mask = np.fromiter(
             (
                 1
@@ -932,7 +992,7 @@ def _analyze_file(
                     and 0 <= int(label_idx) < int(source_info.label_length)
                 )
                 else 0
-                for label_idx in window_index
+                for label_idx in label_index
             ),
             dtype=np.int64,
             count=n_samples,
@@ -975,6 +1035,8 @@ def _analyze_file(
                     source_info=source_info,
                     center_window=int(idx),
                     window_index=window_index,
+                    label_index=label_index,
+                    label_index_mode=label_index_mode,
                     ignore_index=int(ignore_index),
                     depth_scale=float(depth_scale),
                     depth_valid_min=float(depth_valid_min),
@@ -1006,7 +1068,9 @@ def _analyze_file(
                 preview_rows.append(
                     {
                         "window_index": int(idx),
+                        "source_window_index": int(window_info.source_window_index),
                         "label_index": int(window_info.label_index),
+                        "label_index_mode": window_info.label_index_mode,
                         "label_shape": list(window_info.label_shape),
                         "valid_window": int(window_info.valid_window),
                         "source_kind": window_info.source_kind,
@@ -1049,6 +1113,9 @@ def _analyze_file(
             "label_length": int(source_info.label_length),
             "window_index_min": (int(window_index.min()) if window_index.size > 0 else None),
             "window_index_max": (int(window_index.max()) if window_index.size > 0 else None),
+            "label_index_min": (int(label_index.min()) if label_index.size > 0 else None),
+            "label_index_max": (int(label_index.max()) if label_index.size > 0 else None),
+            "label_index_mode": label_index_mode,
             "valid_windows": int(np.count_nonzero(valid_mask > 0)),
             "valid_ratio": float(np.mean(valid_mask > 0)) if valid_mask.size > 0 else 0.0,
             "selection_mode_requested": selection_mode,

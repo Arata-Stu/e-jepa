@@ -142,6 +142,23 @@ def _copy_attrs(src, dst) -> None:
         dst.attrs[key] = value
 
 
+def _decode_h5_string(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _decode_h5_string(value.item())
+        if value.size == 1:
+            return _decode_h5_string(value.reshape(-1)[0])
+    return str(value)
+
+
+def _load_h5_attr_str(h5f: h5py.File, key: str, default: str = "") -> str:
+    if key not in h5f.attrs:
+        return default
+    return _decode_h5_string(h5f.attrs[key]).strip()
+
+
 def _progress_write(message: str) -> None:
     tqdm.tqdm.write(message)
 
@@ -236,6 +253,8 @@ def _dataset_name_allowed(dataset_name: str, metadata_mode: str) -> bool:
         "window_active_pixel_ratio",
         "window_activity_grid",
         "embedded_segmentation",
+        "embedded_semantics",
+        "embedded_depth",
         "segmentation_available",
         "segmentation_timestamp_us",
         "segmentation_time_delta_us",
@@ -257,6 +276,63 @@ def _create_dataset_with_fallback(
         # Some HDF5 dtypes (notably variable-length strings) may not support
         # filter/chunk combinations consistently across environments.
         return out_h5.create_dataset(name, shape=shape, dtype=dtype)
+
+
+def _should_rebase_window_index(
+    *,
+    src_h5: h5py.File,
+    src_ds: h5py.Dataset,
+    src_start: int,
+    src_end: int,
+) -> bool:
+    embedded_name = _load_h5_attr_str(src_h5, "embedded_label_dataset", default="")
+    if embedded_name not in {"embedded_semantics", "embedded_depth"}:
+        return False
+    if embedded_name not in src_h5:
+        return False
+    values = np.asarray(src_ds[src_start:src_end], dtype=np.int64).reshape(-1)
+    if values.size == 0:
+        return False
+    return bool(np.all((values >= int(src_start)) & (values < int(src_end))))
+
+
+def _copy_dataset_slice_rebased(
+    src_ds: h5py.Dataset,
+    dst_ds: h5py.Dataset,
+    src_start: int,
+    src_end: int,
+    copy_batch_size: int,
+    offset: int,
+    progress_interval_s: float = 0.0,
+    progress_context: str | None = None,
+) -> None:
+    if src_end <= src_start:
+        return
+
+    copy_batch_size = max(1, int(copy_batch_size))
+    total_rows = int(src_end - src_start)
+    copied_rows = 0
+    next_report_at = 0.0
+    if float(progress_interval_s) > 0:
+        next_report_at = time.monotonic() + float(progress_interval_s)
+
+    out_pos = 0
+    for s in range(int(src_start), int(src_end), copy_batch_size):
+        e = min(int(src_end), s + copy_batch_size)
+        data = np.asarray(src_ds[s:e], dtype=np.int64) - int(offset)
+        dst_ds[out_pos : out_pos + (e - s)] = data.astype(src_ds.dtype, copy=False)
+        out_pos += (e - s)
+        copied_rows += (e - s)
+
+        if float(progress_interval_s) > 0:
+            now = time.monotonic()
+            if now >= next_report_at:
+                pct = 100.0 * (float(copied_rows) / float(max(1, total_rows)))
+                if progress_context is None:
+                    _emit_progress(f"[COPY] {copied_rows}/{total_rows} rows ({pct:.1f}%)")
+                else:
+                    _emit_progress(f"[COPY] {progress_context}: {copied_rows}/{total_rows} rows ({pct:.1f}%)")
+                next_report_at = now + float(progress_interval_s)
 
 
 def _write_chunk_file(
@@ -361,15 +437,38 @@ def _write_chunk_file(
                     out_ds[()] = src_ds[()]
                 elif row_aligned:
                     ds_progress_interval_s = float(progress_interval_s) if dname == "voxels" else 0.0
-                    _copy_dataset_slice(
+                    if dname == "window_index" and _should_rebase_window_index(
+                        src_h5=src_h5,
                         src_ds=src_ds,
-                        dst_ds=out_ds,
                         src_start=src_start,
                         src_end=src_end,
-                        copy_batch_size=copy_batch_size,
-                        progress_interval_s=ds_progress_interval_s,
-                        progress_context=f"pid={pid} {src_h5_path.name} chunk={chunk_index + 1}/{total_chunks} ds={dname}",
-                    )
+                    ):
+                        _copy_dataset_slice_rebased(
+                            src_ds=src_ds,
+                            dst_ds=out_ds,
+                            src_start=src_start,
+                            src_end=src_end,
+                            copy_batch_size=copy_batch_size,
+                            offset=src_start,
+                            progress_interval_s=ds_progress_interval_s,
+                            progress_context=(
+                                f"pid={pid} {src_h5_path.name} "
+                                f"chunk={chunk_index + 1}/{total_chunks} ds={dname}"
+                            ),
+                        )
+                    else:
+                        _copy_dataset_slice(
+                            src_ds=src_ds,
+                            dst_ds=out_ds,
+                            src_start=src_start,
+                            src_end=src_end,
+                            copy_batch_size=copy_batch_size,
+                            progress_interval_s=ds_progress_interval_s,
+                            progress_context=(
+                                f"pid={pid} {src_h5_path.name} "
+                                f"chunk={chunk_index + 1}/{total_chunks} ds={dname}"
+                            ),
+                        )
                 else:
                     out_ds[...] = src_ds[...]
                 if bool(log_dataset_progress):

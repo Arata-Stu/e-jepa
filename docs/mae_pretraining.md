@@ -71,8 +71,8 @@ Use the existing downstream trainer and point `model.checkpoint_path` to MAE che
 ```bash
 python3 scripts/downstream/run_downstream.py \
   task=dsec_semantic \
-  task.train_roots=[/data/DSEC_voxels_seg/train] \
-  task.val_roots=[/data/DSEC_voxels_seg/val] \
+  task.train_roots=[/data/DSEC_voxels_seg_train] \
+  task.val_roots=[/data/DSEC_voxels_seg_val] \
   model.checkpoint_path=/path/to/stage1_mae/latest_mae.pth.tar \
   model.checkpoint_key=encoder \
   model.freeze_encoder=true

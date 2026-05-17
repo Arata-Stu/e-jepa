@@ -24,8 +24,8 @@
 python3 scripts/downstream/run_downstream.py \
   task=dsec_semantic \
   folder=outputs/downstream_dsec_sem \
-  task.train_roots=[/data/DSEC_voxels_seg/train] \
-  task.val_roots=[/data/DSEC_voxels_seg/val] \
+  task.train_roots=[/data/DSEC_voxels_seg_train] \
+  task.val_roots=[/data/DSEC_voxels_seg_val] \
   model.checkpoint_path=/path/to/stage1/latest.pth.tar \
   model.freeze_encoder=true
 ```
@@ -58,6 +58,9 @@ python3 scripts/downstream/run_downstream.py \
 
 - Input is voxel clips sampled around each anchor window (`task.clip_num_frames`, `task.clip_frame_stride`).
 - DSEC semantic labels are read from `segmentation_relpath` / `segmentation_dir` metadata in each preprocessed H5.
+- DSEC semantic requires preprocessing with `dataset.sync_segmentation=true`; using `dataset.window_mode=image_middle` is the intended path for label-aligned windows.
+- DSEC official `test` split does not ship semantic labels, so downstream evaluation needs a user-created validation split carved out from labeled `train`.
+- Splitting after preprocessing is fine if you move/copy whole H5 files into separate `train` / `val` roots. If you rewrite H5 contents, preserve segmentation datasets/attrs such as `embedded_segmentation`, `segmentation_available`, `segmentation_relpath`, and `segmentation_dir`.
 - M3ED semantic/depth labels are read from the raw `source_file` referenced by each preprocessed H5.
 - If semantic class count is unknown, set `task.num_classes=0` and it will be inferred from sampled labels.
 - Logs:
@@ -66,4 +69,3 @@ python3 scripts/downstream/run_downstream.py \
 - Checkpoints:
   - latest: `<folder>/latest_downstream.pth.tar`
   - best: `<folder>/best_downstream.pth.tar`
-

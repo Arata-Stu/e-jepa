@@ -365,3 +365,16 @@ python3 scripts/preprocess/debug_dsec_preprocess.py \
   --preprocessed_h5 /data/DSEC_voxels_seg/test/interlaken_00_a/events/left/events_voxels_1x.h5 \
   --divisors 1 1000
 ```
+
+preprocessed H5 の voxel と semantic label を並べて目視確認:
+
+```bash
+python3 scripts/preprocess/visualize_dsec_semantic_debug.py \
+  --dataset_root /data/DSEC_voxels_seg_val \
+  --output_dir /tmp/dsec_semantic_debug \
+  --num_samples 4 \
+  --selection_mode available
+```
+
+各 preview には `activity / polarity / label / overlay` を並べて保存します。  
+`selection_mode missing` にすると、`segmentation_available=0` の window を重点的に確認できます。

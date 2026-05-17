@@ -741,9 +741,27 @@ def _find_first_matching_dataset(
         if path not in h5f:
             continue
         ds = h5f[path]
-        if isinstance(ds, h5py.Dataset) and ds.ndim >= min_ndim and int(ds.shape[0]) == int(length0):
+        if _is_plausible_dense_label_dataset(ds, length0=length0, min_ndim=min_ndim):
             return path
     return None
+
+
+def _is_plausible_dense_label_dataset(
+    ds: h5py.Dataset,
+    *,
+    length0: int,
+    min_ndim: int = 3,
+    min_spatial_extent: int = 8,
+) -> bool:
+    if not isinstance(ds, h5py.Dataset):
+        return False
+    if ds.ndim < min_ndim or int(ds.shape[0]) != int(length0):
+        return False
+    tail = [int(v) for v in ds.shape[1:] if int(v) > 1]
+    if len(tail) < 2:
+        return False
+    spatial_dims = sorted(tail)[-2:]
+    return spatial_dims[0] >= int(min_spatial_extent) and spatial_dims[1] >= int(min_spatial_extent)
 
 
 def _find_recursive_dataset_with_length(
@@ -766,7 +784,7 @@ def _find_recursive_dataset_with_length(
             obj = group[key]
             if isinstance(obj, h5py.Group):
                 stack.append((full, obj))
-            elif isinstance(obj, h5py.Dataset) and obj.ndim >= min_ndim and int(obj.shape[0]) == int(length0):
+            elif _is_plausible_dense_label_dataset(obj, length0=length0, min_ndim=min_ndim):
                 return full
     return None
 

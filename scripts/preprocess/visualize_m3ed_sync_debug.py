@@ -426,9 +426,27 @@ def _find_first_matching_dataset(
         if path not in h5f:
             continue
         ds = h5f[path]
-        if isinstance(ds, h5py.Dataset) and ds.ndim >= min_ndim and int(ds.shape[0]) == int(length0):
+        if _is_plausible_dense_label_dataset(ds, length0=length0, min_ndim=min_ndim):
             return path
     return None
+
+
+def _is_plausible_dense_label_dataset(
+    ds: h5py.Dataset,
+    *,
+    length0: int,
+    min_ndim: int = 3,
+    min_spatial_extent: int = 8,
+) -> bool:
+    if not isinstance(ds, h5py.Dataset):
+        return False
+    if ds.ndim < min_ndim or int(ds.shape[0]) != int(length0):
+        return False
+    tail = [int(v) for v in ds.shape[1:] if int(v) > 1]
+    if len(tail) < 2:
+        return False
+    spatial_dims = sorted(tail)[-2:]
+    return spatial_dims[0] >= int(min_spatial_extent) and spatial_dims[1] >= int(min_spatial_extent)
 
 
 def _find_recursive_dataset_with_length(
@@ -451,7 +469,7 @@ def _find_recursive_dataset_with_length(
             obj = group[key]
             if isinstance(obj, h5py.Group):
                 stack.append((full, obj))
-            elif isinstance(obj, h5py.Dataset) and obj.ndim >= min_ndim and int(obj.shape[0]) == int(length0):
+            elif _is_plausible_dense_label_dataset(obj, length0=length0, min_ndim=min_ndim):
                 return full
     return None
 
@@ -580,18 +598,25 @@ def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceI
     embedded_attr = _load_h5_attr_str(h5f, "embedded_label_dataset", default="")
     if embedded_attr == embedded_name and embedded_attr in h5f:
         ds = h5f[embedded_attr]
-        return LabelSourceInfo(
-            target=target,
-            source_kind="embedded",
-            label_dataset_path=embedded_attr,
-            label_length=int(ds.shape[0]),
-            source_h5_path=None,
-            source_h5_exists=True,
-            embedded_dataset_name=embedded_attr,
-            resolved_ts_source=resolved_key,
-            num_timestamps=num_timestamps,
-            missing_reason="",
+        if _is_plausible_dense_label_dataset(ds, length0=int(ds.shape[0]), min_ndim=3):
+            return LabelSourceInfo(
+                target=target,
+                source_kind="embedded",
+                label_dataset_path=embedded_attr,
+                label_length=int(ds.shape[0]),
+                source_h5_path=None,
+                source_h5_exists=True,
+                embedded_dataset_name=embedded_attr,
+                resolved_ts_source=resolved_key,
+                num_timestamps=num_timestamps,
+                missing_reason="",
+            )
+        embedded_shape = tuple(int(v) for v in ds.shape)
+        embedded_missing_reason = (
+            f"embedded label dataset {embedded_attr} has implausible shape {embedded_shape}"
         )
+    else:
+        embedded_missing_reason = ""
 
     source_s = _load_h5_attr_str(h5f, "source_file", default="")
     if source_s == "":
@@ -605,7 +630,11 @@ def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceI
             embedded_dataset_name=embedded_attr,
             resolved_ts_source=resolved_key,
             num_timestamps=num_timestamps,
-            missing_reason="source_file attr is empty",
+            missing_reason=(
+                embedded_missing_reason
+                if embedded_missing_reason != ""
+                else "source_file attr is empty"
+            ),
         )
 
     source_h5_path = Path(source_s).expanduser()
@@ -620,7 +649,11 @@ def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceI
             embedded_dataset_name=embedded_attr,
             resolved_ts_source=resolved_key,
             num_timestamps=num_timestamps,
-            missing_reason=f"source_file missing: {source_h5_path}",
+            missing_reason=(
+                embedded_missing_reason
+                if embedded_missing_reason != ""
+                else f"source_file missing: {source_h5_path}"
+            ),
         )
 
     label_path, label_len = _resolve_source_label_dataset(
@@ -639,7 +672,11 @@ def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceI
             embedded_dataset_name=embedded_attr,
             resolved_ts_source=resolved_key,
             num_timestamps=num_timestamps,
-            missing_reason="could not resolve source label dataset",
+            missing_reason=(
+                embedded_missing_reason
+                if embedded_missing_reason != ""
+                else "could not resolve source label dataset"
+            ),
         )
 
     return LabelSourceInfo(

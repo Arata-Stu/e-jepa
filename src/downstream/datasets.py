@@ -216,11 +216,27 @@ def _find_first_matching_dataset(
         if path not in h5f:
             continue
         ds = h5f[path]
-        if not isinstance(ds, h5py.Dataset):
-            continue
-        if ds.ndim >= min_ndim and int(ds.shape[0]) == int(length0):
+        if _is_plausible_dense_label_dataset(ds, length0=length0, min_ndim=min_ndim):
             return path
     return None
+
+
+def _is_plausible_dense_label_dataset(
+    ds: h5py.Dataset,
+    *,
+    length0: int,
+    min_ndim: int = 3,
+    min_spatial_extent: int = 8,
+) -> bool:
+    if not isinstance(ds, h5py.Dataset):
+        return False
+    if ds.ndim < min_ndim or int(ds.shape[0]) != int(length0):
+        return False
+    tail = [int(v) for v in ds.shape[1:] if int(v) > 1]
+    if len(tail) < 2:
+        return False
+    spatial_dims = sorted(tail)[-2:]
+    return spatial_dims[0] >= int(min_spatial_extent) and spatial_dims[1] >= int(min_spatial_extent)
 
 
 def _find_recursive_dataset_with_length(
@@ -245,9 +261,8 @@ def _find_recursive_dataset_with_length(
             if isinstance(obj, h5py.Group):
                 stack.append((full, obj))
                 continue
-            if isinstance(obj, h5py.Dataset):
-                if obj.ndim >= min_ndim and int(obj.shape[0]) == int(length0):
-                    return full
+            if _is_plausible_dense_label_dataset(obj, length0=length0, min_ndim=min_ndim):
+                return full
     return None
 
 
@@ -437,11 +452,15 @@ class EventDenseTaskDataset(Dataset):
             label_len = 0
             source_h5 = None
             if self.target == "semantic" and embedded_label_ds_path == "embedded_semantics" and embedded_label_ds_path in h5f:
-                label_ds_path = embedded_label_ds_path
-                label_len = int(h5f[embedded_label_ds_path].shape[0])
+                embedded_ds = h5f[embedded_label_ds_path]
+                if _is_plausible_dense_label_dataset(embedded_ds, length0=num_windows, min_ndim=3):
+                    label_ds_path = embedded_label_ds_path
+                    label_len = int(embedded_ds.shape[0])
             elif self.target == "depth" and embedded_label_ds_path == "embedded_depth" and embedded_label_ds_path in h5f:
-                label_ds_path = embedded_label_ds_path
-                label_len = int(h5f[embedded_label_ds_path].shape[0])
+                embedded_ds = h5f[embedded_label_ds_path]
+                if _is_plausible_dense_label_dataset(embedded_ds, length0=num_windows, min_ndim=3):
+                    label_ds_path = embedded_label_ds_path
+                    label_len = int(embedded_ds.shape[0])
             else:
                 source_s = _load_h5_attr_str(h5f, "source_file", default="")
                 if source_s == "":
@@ -453,6 +472,15 @@ class EventDenseTaskDataset(Dataset):
                     source_h5=source_h5,
                     preprocessed_h5=h5f,
                 )
+            if label_ds_path is None or label_len <= 0:
+                source_s = _load_h5_attr_str(h5f, "source_file", default="")
+                if source_s != "":
+                    source_h5 = Path(source_s).expanduser()
+                    if source_h5.exists():
+                        label_ds_path, label_len = self._resolve_m3ed_label_dataset(
+                            source_h5=source_h5,
+                            preprocessed_h5=h5f,
+                        )
             if label_ds_path is None or label_len <= 0:
                 return None, np.empty((0,), dtype=np.int64)
             label_lookup_index = window_index

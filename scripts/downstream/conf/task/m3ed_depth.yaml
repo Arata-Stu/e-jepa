@@ -30,4 +30,3 @@ infer_num_classes_max_samples: 256
 
 # Common settings.
 require_labels: true
-

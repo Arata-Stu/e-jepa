@@ -1176,7 +1176,6 @@ def process_single_file(
                     activity_grid_shape=activity_grid_shape,
                 )
                 writer.h5f.attrs["representation"] = "event_voxel_grid_m3ed"
-                writer.h5f.attrs["source_file"] = str(input_path)
                 writer.h5f.attrs["source_event_group"] = EVENT_GROUP_PATH
                 writer.h5f.attrs["input_height"] = int(resolved_input_height)
                 writer.h5f.attrs["input_width"] = int(resolved_input_width)
@@ -1282,6 +1281,13 @@ def process_single_file(
                     target="depth",
                     label_length=int(len(depth_ts)),
                 )
+            if window_mode in {"semantics_middle", "depth_middle"} and (
+                embedded_label_source_path is None or embedded_label_name is None
+            ):
+                raise RuntimeError(
+                    "M3ED preprocessing now requires self-contained embedded labels for "
+                    f"window_mode={window_mode}, but no valid embedded label dataset was found in {input_path}."
+                )
             if embedded_label_source_path is not None:
                 label_ds = h5f[embedded_label_source_path]
                 embedded_label_shape = tuple(int(v) for v in label_ds.shape[1:])
@@ -1300,7 +1306,6 @@ def process_single_file(
                 embedded_label_dtype=embedded_label_dtype,
             )
             writer.h5f.attrs["representation"] = "event_voxel_grid_m3ed"
-            writer.h5f.attrs["source_file"] = str(input_path)
             writer.h5f.attrs["source_event_group"] = EVENT_GROUP_PATH
             writer.h5f.attrs["input_height"] = int(resolved_input_height)
             writer.h5f.attrs["input_width"] = int(resolved_input_width)

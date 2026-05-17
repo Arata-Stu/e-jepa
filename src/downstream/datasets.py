@@ -17,7 +17,6 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from torch.utils.data import Dataset
 
 
@@ -271,11 +270,8 @@ class _FileMeta:
     preprocessed_h5: Path
     num_windows: int
     # DSEC
-    segmentation_dir: Path | None = None
-    segmentation_relpaths: tuple[str, ...] = ()
     embedded_segmentation_dataset_path: str | None = None
     # M3ED
-    source_h5: Path | None = None
     window_index: np.ndarray | None = None
     label_lookup_index: np.ndarray | None = None
     label_dataset_path: str | None = None
@@ -323,7 +319,6 @@ class EventDenseTaskDataset(Dataset):
         self.samples: list[tuple[int, int]] = []  # (file_idx, window_idx)
 
         self._pre_h5_cache: dict[str, h5py.File] = {}
-        self._source_h5_cache: dict[str, h5py.File] = {}
 
         all_h5 = discover_h5_files(roots, file_pattern=file_pattern, recursive=recursive)
         if len(all_h5) == 0:
@@ -345,16 +340,10 @@ class EventDenseTaskDataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_pre_h5_cache"] = {}
-        state["_source_h5_cache"] = {}
         return state
 
     def __del__(self):
         for h5f in getattr(self, "_pre_h5_cache", {}).values():
-            try:
-                h5f.close()
-            except Exception:
-                pass
-        for h5f in getattr(self, "_source_h5_cache", {}).values():
             try:
                 h5f.close()
             except Exception:
@@ -369,14 +358,6 @@ class EventDenseTaskDataset(Dataset):
         if h5f is None:
             h5f = h5py.File(key, "r")
             self._pre_h5_cache[key] = h5f
-        return h5f
-
-    def _get_source_h5(self, path: Path) -> h5py.File:
-        key = str(path)
-        h5f = self._source_h5_cache.get(key)
-        if h5f is None:
-            h5f = h5py.File(key, "r")
-            self._source_h5_cache[key] = h5f
         return h5f
 
     def _build_file_meta(self, h5_path: Path) -> tuple[_FileMeta | None, np.ndarray]:
@@ -397,6 +378,8 @@ class EventDenseTaskDataset(Dataset):
                     embedded_ds = h5f[embedded_label_ds_path]
                     if embedded_ds.ndim >= 3 and int(embedded_ds.shape[0]) == num_windows:
                         embedded_seg_ds_path = embedded_label_ds_path
+                if embedded_seg_ds_path is None:
+                    return None, np.empty((0,), dtype=np.int64)
                 if "segmentation_available" in h5f:
                     avail = np.asarray(h5f["segmentation_available"][()], dtype=np.int64).reshape(-1)
                     if avail.shape[0] != num_windows:
@@ -404,38 +387,11 @@ class EventDenseTaskDataset(Dataset):
                 else:
                     avail = np.ones((num_windows,), dtype=np.int64)
 
-                relpaths: tuple[str, ...] = ()
-                seg_dir = None
-                valid = []
-                if embedded_seg_ds_path is not None:
-                    valid = [idx for idx in range(num_windows) if int(avail[idx]) > 0]
-                else:
-                    if "segmentation_relpath" not in h5f:
-                        return None, np.empty((0,), dtype=np.int64)
-                    seg_rel = h5f["segmentation_relpath"][()]
-                    relpaths = tuple(_decode_h5_string(v).strip() for v in seg_rel.tolist())
-                    if len(relpaths) != num_windows:
-                        return None, np.empty((0,), dtype=np.int64)
-
-                    seg_dir_s = _load_h5_attr_str(h5f, "segmentation_dir", default="")
-                    seg_dir = Path(seg_dir_s).expanduser() if seg_dir_s else None
-                    for idx in range(num_windows):
-                        if int(avail[idx]) <= 0:
-                            continue
-                        rel = relpaths[idx]
-                        if rel == "":
-                            continue
-                        if seg_dir is None:
-                            continue
-                        if not (seg_dir / rel).exists():
-                            continue
-                        valid.append(idx)
+                valid = [idx for idx in range(num_windows) if int(avail[idx]) > 0]
 
                 meta = _FileMeta(
                     preprocessed_h5=h5_path,
                     num_windows=num_windows,
-                    segmentation_dir=seg_dir,
-                    segmentation_relpaths=relpaths,
                     embedded_segmentation_dataset_path=embedded_seg_ds_path,
                 )
                 return meta, np.asarray(valid, dtype=np.int64)
@@ -450,7 +406,6 @@ class EventDenseTaskDataset(Dataset):
             embedded_label_ds_path = _load_h5_attr_str(h5f, "embedded_label_dataset", default="")
             label_ds_path = None
             label_len = 0
-            source_h5 = None
             if self.target == "semantic" and embedded_label_ds_path == "embedded_semantics" and embedded_label_ds_path in h5f:
                 embedded_ds = h5f[embedded_label_ds_path]
                 if _is_plausible_dense_label_dataset(embedded_ds, length0=num_windows, min_ndim=3):
@@ -461,36 +416,14 @@ class EventDenseTaskDataset(Dataset):
                 if _is_plausible_dense_label_dataset(embedded_ds, length0=num_windows, min_ndim=3):
                     label_ds_path = embedded_label_ds_path
                     label_len = int(embedded_ds.shape[0])
-            else:
-                source_s = _load_h5_attr_str(h5f, "source_file", default="")
-                if source_s == "":
-                    return None, np.empty((0,), dtype=np.int64)
-                source_h5 = Path(source_s).expanduser()
-                if not source_h5.exists():
-                    return None, np.empty((0,), dtype=np.int64)
-                label_ds_path, label_len = self._resolve_m3ed_label_dataset(
-                    source_h5=source_h5,
-                    preprocessed_h5=h5f,
-                )
-            if label_ds_path is None or label_len <= 0:
-                source_s = _load_h5_attr_str(h5f, "source_file", default="")
-                if source_s != "":
-                    source_h5 = Path(source_s).expanduser()
-                    if source_h5.exists():
-                        label_ds_path, label_len = self._resolve_m3ed_label_dataset(
-                            source_h5=source_h5,
-                            preprocessed_h5=h5f,
-                        )
             if label_ds_path is None or label_len <= 0:
                 return None, np.empty((0,), dtype=np.int64)
-            label_lookup_index = window_index
-            if source_h5 is None:
-                label_lookup_index = _maybe_rebase_split_embedded_window_index(
-                    h5f=h5f,
-                    window_index=window_index,
-                    label_len=int(label_len),
-                    embedded_label_ds_path=label_ds_path,
-                )
+            label_lookup_index = _maybe_rebase_split_embedded_window_index(
+                h5f=h5f,
+                window_index=window_index,
+                label_len=int(label_len),
+                embedded_label_ds_path=label_ds_path,
+            )
             valid_mask = (label_lookup_index >= 0) & (label_lookup_index < int(label_len))
             if not np.any(valid_mask):
                 return None, np.empty((0,), dtype=np.int64)
@@ -499,89 +432,13 @@ class EventDenseTaskDataset(Dataset):
             meta = _FileMeta(
                 preprocessed_h5=h5_path,
                 num_windows=num_windows,
-                source_h5=source_h5,
                 window_index=window_index,
                 label_lookup_index=label_lookup_index,
                 label_dataset_path=label_ds_path,
                 label_length=int(label_len),
-                embedded_label_dataset_path=(label_ds_path if source_h5 is None else None),
+                embedded_label_dataset_path=label_ds_path,
             )
             return meta, valid_indices.astype(np.int64, copy=False)
-
-    def _resolve_m3ed_label_dataset(
-        self,
-        *,
-        source_h5: Path,
-        preprocessed_h5: h5py.File,
-    ) -> tuple[str | None, int]:
-        if not source_h5.exists():
-            return None, 0
-
-        if self.target == "semantic":
-            ts_map = {
-                "semantics_ts_map": "semantics/ts_map_prophesee_left_t",
-                "ovc_ts_map": "ovc/ts_map_prophesee_left_t",
-                "semantics_ts": "semantics/ts",
-            }
-            label_candidates = (
-                "semantics/class_id",
-                "semantics/labels",
-                "semantics/label",
-                "semantics/data",
-                "semantics/image",
-            )
-            group_prefix = "semantics"
-            resolved_key = _load_h5_attr_str(preprocessed_h5, "resolved_semantics_ts_source", default="")
-        else:
-            ts_map = {
-                "depth_ts_map_left_t": "depth_gt/ts_map_prophesee_left_t",
-                "depth_ts_map_left": "depth_gt/ts_map_prophesee_left",
-                "depth_ts": "depth_gt/ts",
-            }
-            label_candidates = (
-                "depth_gt/depth",
-                "depth_gt/depth_map",
-                "depth_gt/data",
-                "depth_gt/image",
-            )
-            group_prefix = "depth_gt"
-            resolved_key = _load_h5_attr_str(preprocessed_h5, "resolved_depth_ts_source", default="")
-
-        divisor_key = "semantics_ts_divisor" if self.target == "semantic" else "depth_ts_divisor"
-        divisor_raw = preprocessed_h5.attrs.get(divisor_key, 1)
-        divisor = int(divisor_raw) if int(divisor_raw) > 0 else 1
-
-        with h5py.File(str(source_h5), "r") as src:
-            ts_candidates = []
-            if resolved_key in ts_map:
-                ts_candidates.append(ts_map[resolved_key])
-            for p in ts_map.values():
-                if p not in ts_candidates:
-                    ts_candidates.append(p)
-
-            ts_len = 0
-            for ts_path in ts_candidates:
-                if ts_path not in src:
-                    continue
-                arr = np.atleast_1d(np.asarray(src[ts_path][()], dtype=np.int64)).reshape(-1)
-                if divisor != 1 and arr.size > 0:
-                    arr = np.floor_divide(arr, divisor).astype(np.int64, copy=False)
-                if arr.size > 0:
-                    ts_len = int(arr.size)
-                    break
-            if ts_len <= 0:
-                return None, 0
-
-            label_path = _find_first_matching_dataset(
-                src, candidates=label_candidates, length0=ts_len, min_ndim=3
-            )
-            if label_path is None:
-                label_path = _find_recursive_dataset_with_length(
-                    src, group_prefix=group_prefix, length0=ts_len, min_ndim=3
-                )
-            if label_path is None:
-                return None, 0
-            return label_path, ts_len
 
     def __getitem__(self, index: int):
         file_idx, center_window = self.samples[index]
@@ -601,14 +458,8 @@ class EventDenseTaskDataset(Dataset):
         clip_cthw = torch.from_numpy(clip_tchw).permute(1, 0, 2, 3).contiguous()  # [C,T,H,W]
 
         if self.dataset_kind == "dsec":
-            if meta.embedded_segmentation_dataset_path is not None:
-                label_np = np.asarray(pre_h5[meta.embedded_segmentation_dataset_path][int(center_window)])
-            else:
-                assert meta.segmentation_dir is not None
-                rel = meta.segmentation_relpaths[int(center_window)]
-                label_path = meta.segmentation_dir / rel
-                with Image.open(str(label_path)) as img:
-                    label_np = np.asarray(img)
+            assert meta.embedded_segmentation_dataset_path is not None
+            label_np = np.asarray(pre_h5[meta.embedded_segmentation_dataset_path][int(center_window)])
             label_np = _squeeze_to_hw(label_np, target="semantic")
             label = torch.from_numpy(label_np.astype(np.int64, copy=False))
             label = _resize_label_to_hw(label, target_h=h, target_w=w, target="semantic")
@@ -623,12 +474,8 @@ class EventDenseTaskDataset(Dataset):
         assert meta.label_dataset_path is not None
 
         label_idx = int(meta.label_lookup_index[int(center_window)])
-        if meta.embedded_label_dataset_path is not None:
-            label_arr = np.asarray(pre_h5[meta.embedded_label_dataset_path][label_idx])
-        else:
-            assert meta.source_h5 is not None
-            source_h5 = self._get_source_h5(meta.source_h5)
-            label_arr = np.asarray(source_h5[meta.label_dataset_path][label_idx])
+        assert meta.embedded_label_dataset_path is not None
+        label_arr = np.asarray(pre_h5[meta.embedded_label_dataset_path][label_idx])
         label_arr = _squeeze_to_hw(label_arr, target=self.target)
 
         if self.target == "semantic":

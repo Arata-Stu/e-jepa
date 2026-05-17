@@ -29,4 +29,3 @@ require_labels: true
 depth_scale: 1.0
 depth_valid_min: 0.0
 depth_valid_max: 1000000000.0
-

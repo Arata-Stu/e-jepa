@@ -22,30 +22,6 @@ except AttributeError:  # Pillow < 9.1
 
 TaskTarget = Literal["semantic", "depth"]
 
-SEMANTIC_TS_PATHS = {
-    "semantics_ts": "semantics/ts",
-    "semantics_ts_map": "semantics/ts_map_prophesee_left_t",
-    "ovc_ts_map": "ovc/ts_map_prophesee_left_t",
-}
-DEPTH_TS_PATHS = {
-    "depth_ts": "depth_gt/ts",
-    "depth_ts_map_left_t": "depth_gt/ts_map_prophesee_left_t",
-    "depth_ts_map_left": "depth_gt/ts_map_prophesee_left",
-}
-SEMANTIC_LABEL_CANDIDATES = (
-    "semantics/class_id",
-    "semantics/labels",
-    "semantics/label",
-    "semantics/data",
-    "semantics/image",
-)
-DEPTH_LABEL_CANDIDATES = (
-    "depth_gt/depth",
-    "depth_gt/depth_map",
-    "depth_gt/data",
-    "depth_gt/image",
-)
-
 
 @dataclass(frozen=True)
 class LabelSourceInfo:
@@ -53,8 +29,6 @@ class LabelSourceInfo:
     source_kind: str
     label_dataset_path: str
     label_length: int
-    source_h5_path: Path | None
-    source_h5_exists: bool
     embedded_dataset_name: str
     resolved_ts_source: str
     num_timestamps: int
@@ -71,7 +45,6 @@ class WindowLabelInfo:
     label_shape: tuple[int, ...]
     valid_window: bool
     source_kind: str
-    source_exists: bool
     label_dataset_path: str
     missing_reason: str
     unique_classes: list[int]
@@ -133,7 +106,7 @@ def _is_voxel_h5(path: Path) -> bool:
             if h5f["voxels"].ndim != 4 or int(h5f["voxels"].shape[0]) <= 0:
                 return False
             rep = _load_h5_attr_str(h5f, "representation", default="")
-            return rep == "event_voxel_grid_m3ed" or "source_file" in h5f.attrs
+            return rep == "event_voxel_grid_m3ed"
     except Exception:
         return False
 
@@ -474,65 +447,6 @@ def _find_recursive_dataset_with_length(
     return None
 
 
-def _resolve_source_label_dataset(
-    *,
-    source_h5_path: Path,
-    preprocessed_h5: h5py.File,
-    target: TaskTarget,
-) -> tuple[str | None, int]:
-    if target == "semantic":
-        ts_map = SEMANTIC_TS_PATHS
-        label_candidates = SEMANTIC_LABEL_CANDIDATES
-        group_prefix = "semantics"
-        resolved_key = _load_h5_attr_str(preprocessed_h5, "resolved_semantics_ts_source", default="")
-        divisor_key = "semantics_ts_divisor"
-    else:
-        ts_map = DEPTH_TS_PATHS
-        label_candidates = DEPTH_LABEL_CANDIDATES
-        group_prefix = "depth_gt"
-        resolved_key = _load_h5_attr_str(preprocessed_h5, "resolved_depth_ts_source", default="")
-        divisor_key = "depth_ts_divisor"
-
-    divisor_raw = preprocessed_h5.attrs.get(divisor_key, 1)
-    divisor = int(divisor_raw) if int(divisor_raw) > 0 else 1
-
-    with h5py.File(str(source_h5_path), "r") as src:
-        ts_candidates = []
-        if resolved_key in ts_map:
-            ts_candidates.append(ts_map[resolved_key])
-        for path in ts_map.values():
-            if path not in ts_candidates:
-                ts_candidates.append(path)
-
-        ts_len = 0
-        for ts_path in ts_candidates:
-            if ts_path not in src:
-                continue
-            arr = np.atleast_1d(np.asarray(src[ts_path][()], dtype=np.int64)).reshape(-1)
-            if divisor != 1 and arr.size > 0:
-                arr = np.floor_divide(arr, divisor).astype(np.int64, copy=False)
-            if arr.size > 0:
-                ts_len = int(arr.size)
-                break
-        if ts_len <= 0:
-            return None, 0
-
-        label_path = _find_first_matching_dataset(
-            src,
-            candidates=label_candidates,
-            length0=ts_len,
-            min_ndim=3,
-        )
-        if label_path is None:
-            label_path = _find_recursive_dataset_with_length(
-                src,
-                group_prefix=group_prefix,
-                length0=ts_len,
-                min_ndim=3,
-            )
-        return label_path, ts_len if label_path is not None else 0
-
-
 def _infer_target(h5f: h5py.File, requested: str) -> TaskTarget:
     if requested in {"semantic", "depth"}:
         return requested  # type: ignore[return-value]
@@ -585,7 +499,11 @@ def _resolve_label_indices(
     return rebased.astype(np.int64, copy=False), "rebased_split_embedded"
 
 
-def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceInfo:
+def _resolve_label_source(
+    h5f: h5py.File,
+    *,
+    target: TaskTarget,
+) -> LabelSourceInfo:
     if target == "semantic":
         embedded_name = "embedded_semantics"
         resolved_key = _load_h5_attr_str(h5f, "resolved_semantics_ts_source", default="")
@@ -604,8 +522,6 @@ def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceI
                 source_kind="embedded",
                 label_dataset_path=embedded_attr,
                 label_length=int(ds.shape[0]),
-                source_h5_path=None,
-                source_h5_exists=True,
                 embedded_dataset_name=embedded_attr,
                 resolved_ts_source=resolved_key,
                 num_timestamps=num_timestamps,
@@ -618,85 +534,25 @@ def _resolve_label_source(h5f: h5py.File, *, target: TaskTarget) -> LabelSourceI
     else:
         embedded_missing_reason = ""
 
-    source_s = _load_h5_attr_str(h5f, "source_file", default="")
-    if source_s == "":
-        return LabelSourceInfo(
-            target=target,
-            source_kind="missing",
-            label_dataset_path="",
-            label_length=0,
-            source_h5_path=None,
-            source_h5_exists=False,
-            embedded_dataset_name=embedded_attr,
-            resolved_ts_source=resolved_key,
-            num_timestamps=num_timestamps,
-            missing_reason=(
-                embedded_missing_reason
-                if embedded_missing_reason != ""
-                else "source_file attr is empty"
-            ),
-        )
-
-    source_h5_path = Path(source_s).expanduser()
-    if not source_h5_path.exists():
-        return LabelSourceInfo(
-            target=target,
-            source_kind="source",
-            label_dataset_path="",
-            label_length=0,
-            source_h5_path=source_h5_path,
-            source_h5_exists=False,
-            embedded_dataset_name=embedded_attr,
-            resolved_ts_source=resolved_key,
-            num_timestamps=num_timestamps,
-            missing_reason=(
-                embedded_missing_reason
-                if embedded_missing_reason != ""
-                else f"source_file missing: {source_h5_path}"
-            ),
-        )
-
-    label_path, label_len = _resolve_source_label_dataset(
-        source_h5_path=source_h5_path,
-        preprocessed_h5=h5f,
-        target=target,
-    )
-    if label_path is None or label_len <= 0:
-        return LabelSourceInfo(
-            target=target,
-            source_kind="source",
-            label_dataset_path="",
-            label_length=0,
-            source_h5_path=source_h5_path,
-            source_h5_exists=True,
-            embedded_dataset_name=embedded_attr,
-            resolved_ts_source=resolved_key,
-            num_timestamps=num_timestamps,
-            missing_reason=(
-                embedded_missing_reason
-                if embedded_missing_reason != ""
-                else "could not resolve source label dataset"
-            ),
-        )
-
     return LabelSourceInfo(
         target=target,
-        source_kind="source",
-        label_dataset_path=label_path,
-        label_length=int(label_len),
-        source_h5_path=source_h5_path,
-        source_h5_exists=True,
+        source_kind="missing",
+        label_dataset_path="",
+        label_length=0,
         embedded_dataset_name=embedded_attr,
         resolved_ts_source=resolved_key,
         num_timestamps=num_timestamps,
-        missing_reason="",
+        missing_reason=(
+            embedded_missing_reason
+            if embedded_missing_reason != ""
+            else "valid embedded label dataset is missing"
+        ),
     )
 
 
 def _load_label_for_window(
     *,
     pre_h5: h5py.File,
-    source_h5: h5py.File | None,
     source_info: LabelSourceInfo,
     center_window: int,
     window_index: np.ndarray,
@@ -710,8 +566,7 @@ def _load_label_for_window(
     source_window_idx = int(window_index[center_window])
     label_idx = int(label_index[center_window])
     valid_window = (
-        source_info.source_h5_exists
-        and source_info.label_length > 0
+        source_info.label_length > 0
         and 0 <= label_idx < int(source_info.label_length)
         and len(source_info.label_dataset_path) > 0
     )
@@ -728,11 +583,7 @@ def _load_label_for_window(
     label = None
     label_shape: tuple[int, ...] = ()
     if valid_window:
-        if source_info.source_kind == "embedded":
-            label = np.asarray(pre_h5[source_info.label_dataset_path][label_idx])
-        elif source_info.source_kind == "source":
-            assert source_h5 is not None
-            label = np.asarray(source_h5[source_info.label_dataset_path][label_idx])
+        label = np.asarray(pre_h5[source_info.label_dataset_path][label_idx])
         if label is not None:
             label_shape = tuple(int(v) for v in label.shape)
 
@@ -768,7 +619,6 @@ def _load_label_for_window(
         label_shape=label_shape,
         valid_window=bool(valid_window),
         source_kind=source_info.source_kind,
-        source_exists=bool(source_info.source_h5_exists),
         label_dataset_path=source_info.label_dataset_path,
         missing_reason=missing_reason,
         unique_classes=unique_classes,
@@ -908,7 +758,7 @@ def _render_preview(
         f"label_idx={window_info.label_index} | "
         f"events={event_count if event_count is not None else 'n/a'} | "
         f"anchor_us={anchor_timestamp_us if anchor_timestamp_us is not None else 'n/a'}",
-        f"source_kind={window_info.source_kind} | source_exists={int(window_info.source_exists)} | "
+        f"label_source={window_info.source_kind} | "
         f"label_ds={_truncate_middle(window_info.label_dataset_path or 'n/a', 72)} | "
         f"resolved_ts={source_info.resolved_ts_source or 'n/a'} | label_len={source_info.label_length} | "
         f"label_index_mode={window_info.label_index_mode}",
@@ -953,8 +803,6 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "samples",
         "shape",
         "window_mode",
-        "source_file",
-        "source_file_exists",
         "embedded_label_dataset",
         "embedded_label_source_path",
         "resolved_ts_source",
@@ -968,7 +816,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "label_index_mode",
         "valid_windows",
         "valid_ratio",
-        "source_missing_reason",
+        "label_missing_reason",
         "selection_mode_requested",
         "selection_mode_used",
         "preview_images",
@@ -1023,8 +871,7 @@ def _analyze_file(
             (
                 1
                 if (
-                    source_info.source_h5_exists
-                    and source_info.label_length > 0
+                    source_info.label_length > 0
                     and len(source_info.label_dataset_path) > 0
                     and 0 <= int(label_idx) < int(source_info.label_length)
                 )
@@ -1054,78 +901,68 @@ def _analyze_file(
             else None
         )
 
-        source_h5 = None
-        if source_info.source_kind == "source" and source_info.source_h5_exists and source_info.source_h5_path is not None:
-            source_h5 = h5py.File(str(source_info.source_h5_path), "r")
+        preview_dir = output_dir / "previews" / stem
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_paths: list[str] = []
+        preview_rows: list[dict[str, Any]] = []
 
-        try:
-            preview_dir = output_dir / "previews" / stem
-            preview_dir.mkdir(parents=True, exist_ok=True)
-            preview_paths: list[str] = []
-            preview_rows: list[dict[str, Any]] = []
-
-            for idx in selected_indices:
-                voxel = np.asarray(voxels[idx], dtype=np.float32)
-                label, window_info = _load_label_for_window(
-                    pre_h5=pre_h5,
-                    source_h5=source_h5,
-                    source_info=source_info,
-                    center_window=int(idx),
-                    window_index=window_index,
-                    label_index=label_index,
-                    label_index_mode=label_index_mode,
-                    ignore_index=int(ignore_index),
-                    depth_scale=float(depth_scale),
-                    depth_valid_min=float(depth_valid_min),
-                    depth_valid_max=float(depth_valid_max),
-                )
-                preview = _render_preview(
-                    file_label=relative_name,
-                    target=target,
-                    sync_target=sync_target,
-                    voxel=voxel,
-                    event_count=(None if event_counts is None or idx >= len(event_counts) else int(event_counts[idx])),
-                    anchor_timestamp_us=(
-                        None if anchor_timestamps is None or idx >= len(anchor_timestamps) else int(anchor_timestamps[idx])
-                    ),
-                    source_info=source_info,
-                    window_info=window_info,
-                    label=label,
-                    panel_width=int(panel_width),
-                    overlay_alpha=float(overlay_alpha),
-                    ignore_index=int(ignore_index),
-                    split_polarity=split_polarity,
-                    polarity_order=polarity_order,
-                    depth_valid_min=float(depth_valid_min),
-                    depth_valid_max=float(depth_valid_max),
-                )
-                out_path = preview_dir / f"window_{int(idx):06d}.png"
-                preview.save(out_path)
-                preview_paths.append(str(out_path))
-                preview_rows.append(
-                    {
-                        "window_index": int(idx),
-                        "source_window_index": int(window_info.source_window_index),
-                        "label_index": int(window_info.label_index),
-                        "label_index_mode": window_info.label_index_mode,
-                        "label_shape": list(window_info.label_shape),
-                        "valid_window": int(window_info.valid_window),
-                        "source_kind": window_info.source_kind,
-                        "source_exists": int(window_info.source_exists),
-                        "label_dataset_path": window_info.label_dataset_path,
-                        "missing_reason": window_info.missing_reason,
-                        "unique_classes": window_info.unique_classes,
-                        "depth_min": window_info.depth_min,
-                        "depth_max": window_info.depth_max,
-                        "depth_p05": window_info.depth_p05,
-                        "depth_p95": window_info.depth_p95,
-                        "depth_valid_ratio": window_info.depth_valid_ratio,
-                        "preview_path": str(out_path),
-                    }
-                )
-        finally:
-            if source_h5 is not None:
-                source_h5.close()
+        for idx in selected_indices:
+            voxel = np.asarray(voxels[idx], dtype=np.float32)
+            label, window_info = _load_label_for_window(
+                pre_h5=pre_h5,
+                source_info=source_info,
+                center_window=int(idx),
+                window_index=window_index,
+                label_index=label_index,
+                label_index_mode=label_index_mode,
+                ignore_index=int(ignore_index),
+                depth_scale=float(depth_scale),
+                depth_valid_min=float(depth_valid_min),
+                depth_valid_max=float(depth_valid_max),
+            )
+            preview = _render_preview(
+                file_label=relative_name,
+                target=target,
+                sync_target=sync_target,
+                voxel=voxel,
+                event_count=(None if event_counts is None or idx >= len(event_counts) else int(event_counts[idx])),
+                anchor_timestamp_us=(
+                    None if anchor_timestamps is None or idx >= len(anchor_timestamps) else int(anchor_timestamps[idx])
+                ),
+                source_info=source_info,
+                window_info=window_info,
+                label=label,
+                panel_width=int(panel_width),
+                overlay_alpha=float(overlay_alpha),
+                ignore_index=int(ignore_index),
+                split_polarity=split_polarity,
+                polarity_order=polarity_order,
+                depth_valid_min=float(depth_valid_min),
+                depth_valid_max=float(depth_valid_max),
+            )
+            out_path = preview_dir / f"window_{int(idx):06d}.png"
+            preview.save(out_path)
+            preview_paths.append(str(out_path))
+            preview_rows.append(
+                {
+                    "window_index": int(idx),
+                    "source_window_index": int(window_info.source_window_index),
+                    "label_index": int(window_info.label_index),
+                    "label_index_mode": window_info.label_index_mode,
+                    "label_shape": list(window_info.label_shape),
+                    "valid_window": int(window_info.valid_window),
+                    "source_kind": window_info.source_kind,
+                    "label_dataset_path": window_info.label_dataset_path,
+                    "missing_reason": window_info.missing_reason,
+                    "unique_classes": window_info.unique_classes,
+                    "depth_min": window_info.depth_min,
+                    "depth_max": window_info.depth_max,
+                    "depth_p05": window_info.depth_p05,
+                    "depth_p95": window_info.depth_p95,
+                    "depth_valid_ratio": window_info.depth_valid_ratio,
+                    "preview_path": str(out_path),
+                }
+            )
 
         result = {
             "file": str(file_path),
@@ -1136,12 +973,6 @@ def _analyze_file(
             "samples": n_samples,
             "shape": [n_samples, channels, height, width],
             "window_mode": _load_h5_attr_str(pre_h5, "window_mode", default=""),
-            "source_file": _load_h5_attr_str(pre_h5, "source_file", default=""),
-            "source_file_exists": (
-                source_info.source_h5_path.exists()
-                if source_info.source_h5_path is not None and source_info.source_h5_exists
-                else False
-            ),
             "embedded_label_dataset": _load_h5_attr_str(pre_h5, "embedded_label_dataset", default=""),
             "embedded_label_source_path": _load_h5_attr_str(pre_h5, "embedded_label_source_path", default=""),
             "resolved_ts_source": source_info.resolved_ts_source,
@@ -1159,7 +990,7 @@ def _analyze_file(
             "selection_mode_used": selection_mode_used,
             "preview_images": preview_paths,
             "preview_rows": preview_rows,
-            "source_missing_reason": source_info.missing_reason,
+            "label_missing_reason": source_info.missing_reason,
         }
         return result
 

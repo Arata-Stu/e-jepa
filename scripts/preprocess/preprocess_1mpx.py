@@ -742,7 +742,6 @@ def process_single_file(
                 capacity_growth=writer_capacity_growth,
             )
             writer.h5f.attrs["representation"] = "event_voxel_grid_1mpx"
-            writer.h5f.attrs["source_file"] = str(input_path)
             writer.h5f.attrs["input_height"] = int(resolved_input_height)
             writer.h5f.attrs["input_width"] = int(resolved_input_width)
             writer.h5f.attrs["requested_output_height"] = int(output_height)

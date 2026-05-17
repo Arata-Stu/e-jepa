@@ -132,17 +132,7 @@ def _is_generic_sequence_name(name: str) -> bool:
     return str(name).strip().lower() in GENERIC_SEQUENCE_NAMES
 
 
-def _guess_sequence_name(*, file_path: Path, source_file: str, relative_file: str) -> str:
-    if len(source_file) > 0:
-        src_path = Path(source_file)
-        stem = _strip_known_suffixes(src_path.stem)
-        if len(stem) > 0 and not _is_generic_sequence_name(stem):
-            return stem
-        for parent in src_path.parents:
-            name = _strip_known_suffixes(parent.name)
-            if len(name) > 0 and not _is_generic_sequence_name(name):
-                return name
-
+def _guess_sequence_name(*, file_path: Path, relative_file: str) -> str:
     rel_path = Path(relative_file)
     stem = _strip_known_suffixes(rel_path.stem)
     if len(stem) > 0 and not _is_generic_sequence_name(stem):
@@ -297,7 +287,6 @@ def _validate_file(
         "embedded_label_dataset": "",
         "embedded_label_source_path": "",
         "sequence_name": "",
-        "source_file": "",
         "low_activity_suspicious": 0,
         "low_activity_reasons": "",
         "status": "ok",
@@ -317,10 +306,8 @@ def _validate_file(
             row["resolved_depth_ts_source"] = str(_safe_attr(h5f.attrs, "resolved_depth_ts_source", ""))
             row["embedded_label_dataset"] = str(_safe_attr(h5f.attrs, "embedded_label_dataset", ""))
             row["embedded_label_source_path"] = str(_safe_attr(h5f.attrs, "embedded_label_source_path", ""))
-            row["source_file"] = str(_safe_attr(h5f.attrs, "source_file", ""))
             row["sequence_name"] = _guess_sequence_name(
                 file_path=file_path,
-                source_file=str(row["source_file"]),
                 relative_file=relative_file,
             )
 
@@ -576,8 +563,7 @@ def _validate_file(
 
             if sync_target in {"semantic", "depth"}:
                 embedded_label_dataset = str(_safe_attr(h5f.attrs, "embedded_label_dataset", ""))
-                embedded_label_source_path = str(_safe_attr(h5f.attrs, "embedded_label_source_path", ""))
-                if len(embedded_label_dataset) == 0 and len(embedded_label_source_path) == 0:
+                if len(embedded_label_dataset) == 0:
                     _add_issue(
                         issues,
                         file_path=file_path,
@@ -585,7 +571,7 @@ def _validate_file(
                         dataset_family=dataset_family,
                         severity="error",
                         code="missing_label_reference",
-                        message=f"sync_target={sync_target} but no embedded label dataset or source path was recorded.",
+                        message=f"sync_target={sync_target} but no embedded label dataset was recorded.",
                     )
                 if len(embedded_label_dataset) > 0 and embedded_label_dataset not in h5f:
                     _add_issue(
@@ -654,6 +640,17 @@ def _validate_file(
                 if segmentation_available.size == samples and sync_target != "event_only":
                     keep_ratio = float(np.mean(segmentation_available > 0))
                     row["segmentation_available_ratio"] = keep_ratio
+                    embedded_label_dataset = str(_safe_attr(h5f.attrs, "embedded_label_dataset", ""))
+                    if embedded_label_dataset != "embedded_segmentation" or "embedded_segmentation" not in h5f:
+                        _add_issue(
+                            issues,
+                            file_path=file_path,
+                            relative_file=relative_file,
+                            dataset_family=dataset_family,
+                            severity="error",
+                            code="dsec_missing_embedded_segmentation",
+                            message="DSEC semantic preprocessing must embed labels into 'embedded_segmentation'.",
+                        )
                     if keep_ratio == 0.0:
                         _add_issue(
                             issues,
@@ -664,6 +661,62 @@ def _validate_file(
                             code="dsec_no_segmentation_matches",
                             message="segmentation_available is zero for all windows.",
                         )
+
+            if dataset_family == "eventscape":
+                if "semantic_available" in h5f:
+                    semantic_available = _read_1d_dataset(h5f["semantic_available"])
+                    if semantic_available.size == samples and np.any(semantic_available > 0):
+                        embedded_semantic_dataset = str(_safe_attr(h5f.attrs, "embedded_semantic_dataset", ""))
+                        if embedded_semantic_dataset != "embedded_semantics" or "embedded_semantics" not in h5f:
+                            _add_issue(
+                                issues,
+                                file_path=file_path,
+                                relative_file=relative_file,
+                                dataset_family=dataset_family,
+                                severity="error",
+                                code="eventscape_missing_embedded_semantics",
+                                message="EventScape semantic labels must be embedded into 'embedded_semantics'.",
+                            )
+                        elif int(h5f["embedded_semantics"].shape[0]) != samples:
+                            _add_issue(
+                                issues,
+                                file_path=file_path,
+                                relative_file=relative_file,
+                                dataset_family=dataset_family,
+                                severity="error",
+                                code="eventscape_embedded_semantics_length_mismatch",
+                                message=(
+                                    f"embedded_semantics has length {int(h5f['embedded_semantics'].shape[0])}, "
+                                    f"expected {samples}."
+                                ),
+                            )
+                if "depth_available" in h5f:
+                    depth_available = _read_1d_dataset(h5f["depth_available"])
+                    if depth_available.size == samples and np.any(depth_available > 0):
+                        embedded_depth_dataset = str(_safe_attr(h5f.attrs, "embedded_depth_dataset", ""))
+                        if embedded_depth_dataset != "embedded_depth" or "embedded_depth" not in h5f:
+                            _add_issue(
+                                issues,
+                                file_path=file_path,
+                                relative_file=relative_file,
+                                dataset_family=dataset_family,
+                                severity="error",
+                                code="eventscape_missing_embedded_depth",
+                                message="EventScape depth labels must be embedded into 'embedded_depth'.",
+                            )
+                        elif int(h5f["embedded_depth"].shape[0]) != samples:
+                            _add_issue(
+                                issues,
+                                file_path=file_path,
+                                relative_file=relative_file,
+                                dataset_family=dataset_family,
+                                severity="error",
+                                code="eventscape_embedded_depth_length_mismatch",
+                                message=(
+                                    f"embedded_depth has length {int(h5f['embedded_depth'].shape[0])}, "
+                                    f"expected {samples}."
+                                ),
+                            )
     except Exception as exc:
         _add_issue(
             issues,
@@ -1120,7 +1173,6 @@ def main() -> None:
         "embedded_label_dataset",
         "embedded_label_source_path",
         "sequence_name",
-        "source_file",
         "low_activity_suspicious",
         "low_activity_reasons",
         "segmentation_available_ratio",

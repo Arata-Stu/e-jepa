@@ -20,6 +20,7 @@ import h5py
 import numpy as np
 import torch
 import tqdm
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -100,6 +101,41 @@ def _collect_indexed_files(directory: Path, pattern: str) -> dict[int, Path]:
             continue
         mapping[idx] = path
     return mapping
+
+
+def _squeeze_label_to_hw(arr: np.ndarray, *, name: str) -> np.ndarray:
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        return arr[0]
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        return arr[..., 0]
+    raise ValueError(f"unsupported {name} label shape={arr.shape}; expected HxW or singleton-channel variant")
+
+
+def _load_semantic_png(path: Path) -> np.ndarray:
+    with Image.open(str(path)) as img:
+        arr = np.asarray(img)
+    return _squeeze_label_to_hw(arr, name="EventScape semantic")
+
+
+def _load_depth_npy(path: Path) -> np.ndarray:
+    arr = np.asarray(np.load(str(path), allow_pickle=False))
+    return _squeeze_label_to_hw(arr, name="EventScape depth")
+
+
+def _infer_embedded_label_spec(
+    files_by_idx: dict[int, Path],
+    *,
+    loader,
+) -> tuple[tuple[int, int], np.dtype] | None:
+    for path in files_by_idx.values():
+        arr = np.asarray(loader(path))
+        shape = tuple(int(v) for v in arr.shape)
+        if len(shape) != 2:
+            raise ValueError(f"embedded label must be HxW, got shape={shape} from {path}")
+        return shape, arr.dtype
+    return None
 
 
 def _first_existing_array(npz_data, keys: tuple[str, ...]) -> np.ndarray | None:
@@ -365,6 +401,12 @@ class VoxelH5Writer:
         width: int,
         voxel_dtype: np.dtype,
         activity_grid_shape: tuple[int, ...],
+        with_embedded_semantics: bool = False,
+        embedded_semantics_shape: tuple[int, int] = (1, 1),
+        embedded_semantics_dtype: np.dtype = np.uint8,
+        with_embedded_depth: bool = False,
+        embedded_depth_shape: tuple[int, int] = (1, 1),
+        embedded_depth_dtype: np.dtype = np.float32,
         initial_capacity: int = 256,
     ):
         if outfile.exists():
@@ -386,10 +428,12 @@ class VoxelH5Writer:
             "window_event_count",
             "event_frame_index",
             "event_file_relpath",
+            "embedded_semantics",
             "semantic_available",
             "semantic_frame_index",
             "semantic_timestamp_us",
             "semantic_relpath",
+            "embedded_depth",
             "depth_available",
             "depth_frame_index",
             "depth_timestamp_us",
@@ -490,6 +534,18 @@ class VoxelH5Writer:
             dtype=string_dtype,
             chunks=scalar_chunks,
         )
+        if with_embedded_semantics:
+            sem_h, sem_w = embedded_semantics_shape
+            self.h5f.create_dataset(
+                "embedded_semantics",
+                shape=(self._capacity, int(sem_h), int(sem_w)),
+                maxshape=(None, int(sem_h), int(sem_w)),
+                dtype=embedded_semantics_dtype,
+                chunks=(1, min(int(sem_h), 256), min(int(sem_w), 256)),
+                **H5_COMPRESSION_FLAGS,
+            )
+        else:
+            self._datasets = tuple(d for d in self._datasets if d != "embedded_semantics")
         self.h5f.create_dataset(
             "semantic_available",
             shape=(self._capacity,),
@@ -521,6 +577,18 @@ class VoxelH5Writer:
             dtype=string_dtype,
             chunks=scalar_chunks,
         )
+        if with_embedded_depth:
+            depth_h, depth_w = embedded_depth_shape
+            self.h5f.create_dataset(
+                "embedded_depth",
+                shape=(self._capacity, int(depth_h), int(depth_w)),
+                maxshape=(None, int(depth_h), int(depth_w)),
+                dtype=embedded_depth_dtype,
+                chunks=(1, min(int(depth_h), 256), min(int(depth_w), 256)),
+                **H5_COMPRESSION_FLAGS,
+            )
+        else:
+            self._datasets = tuple(d for d in self._datasets if d != "embedded_depth")
         self.h5f.create_dataset(
             "depth_available",
             shape=(self._capacity,),
@@ -604,10 +672,12 @@ class VoxelH5Writer:
         event_count: int,
         event_frame_index: int,
         event_file_relpath: str,
+        embedded_semantics: np.ndarray | None,
         semantic_available: int,
         semantic_frame_index: int,
         semantic_timestamp_us: int,
         semantic_relpath: str,
+        embedded_depth: np.ndarray | None,
         depth_available: int,
         depth_frame_index: int,
         depth_timestamp_us: int,
@@ -630,10 +700,18 @@ class VoxelH5Writer:
         self.h5f["window_event_count"][idx] = int(event_count)
         self.h5f["event_frame_index"][idx] = int(event_frame_index)
         self.h5f["event_file_relpath"][idx] = event_file_relpath
+        if "embedded_semantics" in self.h5f:
+            if embedded_semantics is None:
+                raise ValueError("embedded_semantics is required when embedded_semantics dataset is present")
+            self.h5f["embedded_semantics"][idx] = embedded_semantics
         self.h5f["semantic_available"][idx] = int(semantic_available)
         self.h5f["semantic_frame_index"][idx] = int(semantic_frame_index)
         self.h5f["semantic_timestamp_us"][idx] = int(semantic_timestamp_us)
         self.h5f["semantic_relpath"][idx] = semantic_relpath
+        if "embedded_depth" in self.h5f:
+            if embedded_depth is None:
+                raise ValueError("embedded_depth is required when embedded_depth dataset is present")
+            self.h5f["embedded_depth"][idx] = embedded_depth
         self.h5f["depth_available"][idx] = int(depth_available)
         self.h5f["depth_frame_index"][idx] = int(depth_frame_index)
         self.h5f["depth_timestamp_us"][idx] = int(depth_timestamp_us)
@@ -753,6 +831,8 @@ def process_sequence(
     depth_by_idx = _collect_indexed_files(depth_data_dir, "*.npy")
     semantic_timestamps = _load_timestamp_txt(semantic_data_dir / "timestamps.txt")
     depth_timestamps = _load_timestamp_txt(depth_data_dir / "timestamps.txt")
+    semantic_spec = _infer_embedded_label_spec(semantic_by_idx, loader=_load_semantic_png)
+    depth_spec = _infer_embedded_label_spec(depth_by_idx, loader=_load_depth_npy)
 
     effective_output_height, effective_output_width = _resolve_output_resolution(
         input_height=input_height,
@@ -790,13 +870,15 @@ def process_sequence(
             width=effective_output_width,
             voxel_dtype=voxel_dtype,
             activity_grid_shape=activity_grid_shape,
+            with_embedded_semantics=semantic_spec is not None,
+            embedded_semantics_shape=((1, 1) if semantic_spec is None else semantic_spec[0]),
+            embedded_semantics_dtype=(np.uint8 if semantic_spec is None else semantic_spec[1]),
+            with_embedded_depth=depth_spec is not None,
+            embedded_depth_shape=((1, 1) if depth_spec is None else depth_spec[0]),
+            embedded_depth_dtype=(np.float32 if depth_spec is None else depth_spec[1]),
             initial_capacity=max(256, len(event_files)),
         )
         writer.h5f.attrs["representation"] = "event_voxel_grid_eventscape"
-        writer.h5f.attrs["source_sequence_dir"] = str(sequence_dir)
-        writer.h5f.attrs["source_events_dir"] = str(sequence_dir / EVENTS_SUBDIR)
-        writer.h5f.attrs["source_semantic_dir"] = str(semantic_data_dir)
-        writer.h5f.attrs["source_depth_dir"] = str(depth_data_dir)
         writer.h5f.attrs["input_height"] = int(input_height)
         writer.h5f.attrs["input_width"] = int(input_width)
         writer.h5f.attrs["requested_output_height"] = int(output_height)
@@ -818,6 +900,8 @@ def process_sequence(
         writer.h5f.attrs["num_depth_files"] = int(len(depth_by_idx))
         writer.h5f.attrs["has_semantic_timestamps"] = int(semantic_timestamps is not None)
         writer.h5f.attrs["has_depth_timestamps"] = int(depth_timestamps is not None)
+        writer.h5f.attrs["embedded_semantic_dataset"] = "embedded_semantics" if semantic_spec is not None else ""
+        writer.h5f.attrs["embedded_depth_dataset"] = "embedded_depth" if depth_spec is not None else ""
         writer.h5f.attrs["activity_mode"] = str(activity_mode)
         writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
         writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
@@ -868,6 +952,45 @@ def process_sequence(
                 depth_by_idx=depth_by_idx,
                 depth_timestamps=depth_timestamps,
             )
+            embedded_semantics = None
+            if semantic_spec is not None:
+                semantic_shape, semantic_dtype = semantic_spec
+                if semantic_available == 1 and semantic_frame_idx >= 0:
+                    semantic_path = semantic_by_idx.get(int(semantic_frame_idx))
+                    if semantic_path is None:
+                        raise FileNotFoundError(
+                            f"missing EventScape semantic file for frame {semantic_frame_idx} in {sequence_dir}"
+                        )
+                    embedded_semantics = np.asarray(_load_semantic_png(semantic_path))
+                    if tuple(int(v) for v in embedded_semantics.shape) != tuple(int(v) for v in semantic_shape):
+                        raise ValueError(
+                            "Inconsistent EventScape semantic shape: "
+                            f"expected {semantic_shape}, got {embedded_semantics.shape} for {semantic_path}"
+                        )
+                    embedded_semantics = embedded_semantics.astype(semantic_dtype, copy=False)
+                else:
+                    embedded_semantics = np.full(semantic_shape, fill_value=255, dtype=semantic_dtype)
+            embedded_depth = None
+            if depth_spec is not None:
+                depth_shape, depth_dtype = depth_spec
+                if depth_available == 1 and depth_frame_idx >= 0:
+                    depth_path = depth_by_idx.get(int(depth_frame_idx))
+                    if depth_path is None:
+                        raise FileNotFoundError(
+                            f"missing EventScape depth file for frame {depth_frame_idx} in {sequence_dir}"
+                        )
+                    embedded_depth = np.asarray(_load_depth_npy(depth_path))
+                    if tuple(int(v) for v in embedded_depth.shape) != tuple(int(v) for v in depth_shape):
+                        raise ValueError(
+                            "Inconsistent EventScape depth shape: "
+                            f"expected {depth_shape}, got {embedded_depth.shape} for {depth_path}"
+                        )
+                    embedded_depth = embedded_depth.astype(depth_dtype, copy=False)
+                else:
+                    if np.issubdtype(depth_dtype, np.floating):
+                        embedded_depth = np.full(depth_shape, fill_value=np.nan, dtype=depth_dtype)
+                    else:
+                        embedded_depth = np.zeros(depth_shape, dtype=depth_dtype)
             if anchor_us == 0 and semantic_available == 1 and semantic_timestamp_us >= 0:
                 anchor_us = int(semantic_timestamp_us)
                 t_start_us = int(semantic_timestamp_us)
@@ -903,10 +1026,12 @@ def process_sequence(
                 event_count=event_count,
                 event_frame_index=frame_idx,
                 event_file_relpath=str(event_file.relative_to(sequence_dir)),
+                embedded_semantics=embedded_semantics,
                 semantic_available=semantic_available,
                 semantic_frame_index=semantic_frame_idx,
                 semantic_timestamp_us=semantic_timestamp_us,
                 semantic_relpath=semantic_relpath,
+                embedded_depth=embedded_depth,
                 depth_available=depth_available,
                 depth_frame_index=depth_frame_idx,
                 depth_timestamp_us=depth_timestamp_us,

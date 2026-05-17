@@ -57,11 +57,12 @@ python3 scripts/downstream/run_downstream.py \
 ## Notes
 
 - Input is voxel clips sampled around each anchor window (`task.clip_num_frames`, `task.clip_frame_stride`).
-- DSEC semantic labels are read from `segmentation_relpath` / `segmentation_dir` metadata in each preprocessed H5.
+- Dense labels are read only from embedded datasets stored in each preprocessed H5. Downstream does not reopen raw source files or sidecar label directories.
 - DSEC semantic requires preprocessing with `dataset.sync_segmentation=true`; using `dataset.window_mode=image_middle` is the intended path for label-aligned windows.
 - DSEC official `test` split does not ship semantic labels, so downstream evaluation needs a user-created validation split carved out from labeled `train`.
-- Splitting after preprocessing is fine if you move/copy whole H5 files into separate `train` / `val` roots. If you rewrite H5 contents, preserve segmentation datasets/attrs such as `embedded_segmentation`, `segmentation_available`, `segmentation_relpath`, and `segmentation_dir`.
-- M3ED semantic/depth labels are read from the raw `source_file` referenced by each preprocessed H5.
+- Splitting after preprocessing is fine if you move/copy whole H5 files into separate `train` / `val` roots. If you rewrite H5 contents, preserve embedded label datasets and alignment metadata such as `embedded_segmentation`, `embedded_semantics`, `embedded_depth`, `segmentation_available`, and `window_index`.
+- M3ED semantic/depth labels are read only from embedded labels stored in each preprocessed H5.
+- If an old H5 depended on `source_file`, `segmentation_dir`, or other external label metadata, re-preprocess it with the current pipeline before downstream training.
 - If semantic class count is unknown, set `task.num_classes=0` and it will be inferred from sampled labels.
 - Logs:
   - CSV: `<folder>/downstream_log.csv`

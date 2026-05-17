@@ -27,8 +27,6 @@ class LabelDebugInfo:
     delta_us: int | None
     relpath: str
     source: str
-    source_exists: bool
-    used_embedded: bool
     missing_reason: str
     unique_classes: list[int]
 
@@ -262,12 +260,6 @@ def _alpha_blend(base_rgb: np.ndarray, label_rgb: np.ndarray, valid_mask: np.nda
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
-def _load_png_label(path: Path) -> np.ndarray:
-    with Image.open(str(path)) as img:
-        arr = np.asarray(img)
-    return _squeeze_label_to_hw(arr)
-
-
 def _load_label_for_window(h5f: h5py.File, window_idx: int, ignore_index: int) -> tuple[np.ndarray | None, LabelDebugInfo]:
     n_samples = int(h5f["voxels"].shape[0])
     avail_arr = (
@@ -298,8 +290,6 @@ def _load_label_for_window(h5f: h5py.File, window_idx: int, ignore_index: int) -
     embedded_path = _load_h5_attr_str(h5f, "embedded_label_dataset", default="")
     label = None
     source = ""
-    source_exists = False
-    used_embedded = False
     missing_reason = ""
 
     if embedded_path == "embedded_segmentation" and embedded_path in h5f:
@@ -307,26 +297,10 @@ def _load_label_for_window(h5f: h5py.File, window_idx: int, ignore_index: int) -
         if ds.ndim >= 3 and int(ds.shape[0]) > window_idx:
             label = _squeeze_label_to_hw(np.asarray(ds[window_idx]))
             source = "embedded_segmentation"
-            source_exists = True
-            used_embedded = True
-
-    if label is None and relpath != "":
-        seg_dir_s = _load_h5_attr_str(h5f, "segmentation_dir", default="")
-        seg_dir = Path(seg_dir_s).expanduser() if seg_dir_s else None
-        if seg_dir is None:
-            missing_reason = "segmentation_dir attr is empty"
-        else:
-            source_path = seg_dir / relpath
-            source = str(source_path)
-            source_exists = source_path.exists()
-            if source_path.exists():
-                label = _load_png_label(source_path)
-            else:
-                missing_reason = f"label file missing: {source_path}"
 
     if label is None and missing_reason == "":
-        if relpath == "":
-            missing_reason = "segmentation_relpath is empty"
+        if embedded_path != "embedded_segmentation":
+            missing_reason = "embedded_segmentation dataset is unavailable"
         else:
             missing_reason = "label unavailable"
 
@@ -341,8 +315,6 @@ def _load_label_for_window(h5f: h5py.File, window_idx: int, ignore_index: int) -
         delta_us=delta_us,
         relpath=relpath,
         source=source,
-        source_exists=source_exists,
-        used_embedded=used_embedded,
         missing_reason=missing_reason,
         unique_classes=unique_classes,
     )
@@ -447,8 +419,8 @@ def _render_preview(
         f"events={event_count if event_count is not None else 'n/a'} | "
         f"anchor_us={anchor_timestamp_us if anchor_timestamp_us is not None else 'n/a'} | "
         f"delta_us={label_info.delta_us if label_info.delta_us is not None else 'n/a'}",
-        f"label_source={'embedded' if label_info.used_embedded else 'file'} | "
-        f"source_exists={int(label_info.source_exists)} | relpath={_truncate_middle(label_info.relpath, 72) or 'n/a'}",
+        f"label_source={label_info.source or 'missing'} | "
+        f"relpath={_truncate_middle(label_info.relpath, 72) or 'n/a'}",
         f"classes={_format_unique_classes(label_info.unique_classes)} | "
         f"missing_reason={_truncate_middle(label_info.missing_reason or 'none', 72)}",
     ]
@@ -490,10 +462,9 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "window_mode",
         "sync_segmentation",
         "embedded_label_dataset",
-        "segmentation_dir",
-        "segmentation_dir_exists",
         "labeled_windows",
         "labeled_ratio",
+        "label_missing_reason",
         "selection_mode_requested",
         "selection_mode_used",
         "preview_images",
@@ -592,8 +563,6 @@ def _analyze_file(
                 {
                     "window_index": int(idx),
                     "available": int(label_info.available),
-                    "used_embedded": bool(label_info.used_embedded),
-                    "source_exists": bool(label_info.source_exists),
                     "relpath": label_info.relpath,
                     "missing_reason": label_info.missing_reason,
                     "unique_classes": label_info.unique_classes,
@@ -601,7 +570,6 @@ def _analyze_file(
                 }
             )
 
-        seg_dir = _load_h5_attr_str(h5f, "segmentation_dir", default="")
         result = {
             "file": str(file_path),
             "relative_file": relative_name,
@@ -610,10 +578,13 @@ def _analyze_file(
             "window_mode": _load_h5_attr_str(h5f, "window_mode", default=""),
             "sync_segmentation": int(_safe_attr(h5f.attrs, "sync_segmentation", 0) or 0),
             "embedded_label_dataset": _load_h5_attr_str(h5f, "embedded_label_dataset", default=""),
-            "segmentation_dir": seg_dir,
-            "segmentation_dir_exists": bool(seg_dir) and Path(seg_dir).expanduser().exists(),
             "labeled_windows": int(np.count_nonzero(available > 0)),
             "labeled_ratio": float(np.mean(available > 0)) if available.size > 0 else 0.0,
+            "label_missing_reason": (
+                next((row["missing_reason"] for row in preview_rows if row["missing_reason"]), "")
+                if len(preview_rows) > 0
+                else ""
+            ),
             "selection_mode_requested": selection_mode,
             "selection_mode_used": selection_mode_used,
             "preview_images": preview_paths,

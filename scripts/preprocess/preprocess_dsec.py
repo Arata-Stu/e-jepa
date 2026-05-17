@@ -738,7 +738,10 @@ def process_single_file(
         )
     )
     if sync_segmentation and (segmentation_dir is None or not segmentation_dir.exists()):
-        print(f"[WARN] segmentation directory unavailable for {input_path}; metadata will be marked unavailable.")
+        raise RuntimeError(
+            "DSEC preprocessing now requires self-contained embedded segmentation when "
+            f"sync_segmentation=true, but segmentation_dir is unavailable for {input_path}."
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
@@ -769,7 +772,6 @@ def process_single_file(
                     activity_grid_shape=activity_grid_shape,
                 )
                 writer.h5f.attrs["representation"] = "event_voxel_grid"
-                writer.h5f.attrs["source_file"] = str(input_path)
                 writer.h5f.attrs["input_height"] = int(height)
                 writer.h5f.attrs["input_width"] = int(width)
                 writer.h5f.attrs["height"] = int(output_height)
@@ -788,7 +790,6 @@ def process_single_file(
                 writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
                 writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
                 writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
-                writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
                 writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
                 writer.h5f.attrs["activity_mode"] = str(activity_mode)
                 writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
@@ -833,6 +834,11 @@ def process_single_file(
                     embedded_segmentation_shape = tuple(int(v) for v in sample_label.shape)
                     embedded_segmentation_dtype = sample_label.dtype
                     break
+            if sync_segmentation and embedded_segmentation_shape is None:
+                raise RuntimeError(
+                    "DSEC preprocessing now requires self-contained embedded segmentation when "
+                    f"sync_segmentation=true, but no valid segmentation PNGs were found in {segmentation_dir}."
+                )
 
             writer = VoxelH5Writer(
                 outfile=tmp_path,
@@ -847,7 +853,6 @@ def process_single_file(
                 activity_grid_shape=activity_grid_shape,
             )
             writer.h5f.attrs["representation"] = "event_voxel_grid"
-            writer.h5f.attrs["source_file"] = str(input_path)
             writer.h5f.attrs["input_height"] = int(height)
             writer.h5f.attrs["input_width"] = int(width)
             writer.h5f.attrs["height"] = int(output_height)
@@ -866,7 +871,6 @@ def process_single_file(
             writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
             writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
             writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
-            writer.h5f.attrs["segmentation_dir"] = str(segmentation_dir) if segmentation_dir is not None else ""
             writer.h5f.attrs["ms_to_idx_source"] = ms_to_idx_source
             writer.h5f.attrs["activity_mode"] = str(activity_mode)
             writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
@@ -876,7 +880,7 @@ def process_single_file(
                 writer.h5f.attrs["num_image_timestamps"] = int(len(image_timestamps))
             if embedded_segmentation_shape is not None:
                 writer.h5f.attrs["embedded_label_dataset"] = "embedded_segmentation"
-                writer.h5f.attrs["embedded_label_source_path"] = str(segmentation_dir)
+                writer.h5f.attrs["embedded_label_source_path"] = ""
 
             voxelizer = EventVoxelGrid(
                 input_size=(t_bins, output_height, output_width),

@@ -9,6 +9,34 @@ Hydra ランナー: `scripts/preprocess/run_preprocess.py`
 - `downsample_factor`: `dsec=1`, `eventscape=1`, `1mpx=2`, `m3ed=2`
 - 極性は `{0,1}` と `{-1,+1}` の両方を受け付け、内部で `{0,1}` に正規化
 
+## Local Presets
+
+履歴ベースでそのまま叩ける Hydra preset を追加:
+
+```bash
+python3 scripts/preprocess/run_preprocess.py dataset=1mpx_t10
+python3 scripts/preprocess/run_preprocess.py dataset=1mpx_t1
+python3 scripts/preprocess/run_preprocess.py dataset=eventscape_t10
+python3 scripts/preprocess/run_preprocess.py dataset=eventscape_t1
+python3 scripts/preprocess/run_preprocess.py dataset=dsec_semantic_t10
+python3 scripts/preprocess/run_preprocess.py dataset=dsec_semantic_t1
+python3 scripts/preprocess/run_preprocess.py dataset=m3ed_semantic_t10
+python3 scripts/preprocess/run_preprocess.py dataset=m3ed_semantic_t1
+```
+
+Preset file:
+
+- `scripts/preprocess/conf/dataset/1mpx_t10.yaml`
+- `scripts/preprocess/conf/dataset/1mpx_t1.yaml`
+- `scripts/preprocess/conf/dataset/eventscape_t10.yaml`
+- `scripts/preprocess/conf/dataset/eventscape_t1.yaml`
+- `scripts/preprocess/conf/dataset/dsec_semantic_t10.yaml`
+- `scripts/preprocess/conf/dataset/dsec_semantic_t1.yaml`
+- `scripts/preprocess/conf/dataset/m3ed_semantic_t10.yaml`
+- `scripts/preprocess/conf/dataset/m3ed_semantic_t1.yaml`
+
+`dsec` / `m3ed` は label 名に合わせて preset 名と出力 dir 名を `semantic` で統一しています。
+
 ## DSEC
 
 想定例: `dsec/train/<sequence>/events/left/events.h5`

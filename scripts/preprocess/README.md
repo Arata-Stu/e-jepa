@@ -143,6 +143,32 @@ python3 scripts/preprocess/run_preprocess.py \
 `depth_middle` も既定で、現在 depth 対応が確認できている M3ED sequence のみを処理します。
 既知 subset 以外も無理に流したい場合は `dataset.filter_known_depth_sequences=false` を追加してください。
 
+preprocessed H5 の voxel と semantic label を並べて目視確認:
+
+```bash
+python3 scripts/preprocess/visualize_m3ed_sync_debug.py \
+  --dataset_root /data/m3ed_voxels_semantic_20s \
+  --target semantic \
+  --output_dir /tmp/m3ed_semantic_debug \
+  --num_samples 4 \
+  --selection_mode valid
+```
+
+depth 版:
+
+```bash
+python3 scripts/preprocess/visualize_m3ed_sync_debug.py \
+  --dataset_root /data/m3ed_voxels_depth_20s \
+  --target depth \
+  --output_dir /tmp/m3ed_depth_debug \
+  --num_samples 4 \
+  --selection_mode valid
+```
+
+各 preview には `activity / polarity / label / overlay` を並べて保存します。  
+`selection_mode invalid` にすると、label を引けない window を重点的に確認できます。  
+raw H5 側の timestamp source 候補や単位ズレ調査は `scripts/preprocess/debug_m3ed_timestamps.py` を使ってください。
+
 ## EventScape
 
 想定例: `event_scape/Town05_test/<sequence>/events/data/*.npz`

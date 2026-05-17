@@ -66,6 +66,7 @@ class WindowLabelInfo:
     target: TaskTarget
     window_index: int
     label_index: int
+    label_shape: tuple[int, ...]
     valid_window: bool
     source_kind: str
     source_exists: bool
@@ -370,6 +371,33 @@ def _alpha_blend(base_rgb: np.ndarray, label_rgb: np.ndarray, valid_mask: np.nda
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
+def _resize_semantic_label(label: np.ndarray, *, target_h: int, target_w: int) -> np.ndarray:
+    arr = np.asarray(label, dtype=np.uint8)
+    if arr.shape == (int(target_h), int(target_w)):
+        return arr
+    image = Image.fromarray(arr, mode="L")
+    resized = image.resize((int(target_w), int(target_h)), resample=_RESAMPLING.NEAREST)
+    return np.asarray(resized, dtype=np.uint8)
+
+
+def _resize_depth_map(depth: np.ndarray, *, target_h: int, target_w: int) -> np.ndarray:
+    arr = np.asarray(depth, dtype=np.float32)
+    if arr.shape == (int(target_h), int(target_w)):
+        return arr
+    image = Image.fromarray(arr, mode="F")
+    resized = image.resize((int(target_w), int(target_h)), resample=_RESAMPLING.BILINEAR)
+    return np.asarray(resized, dtype=np.float32)
+
+
+def _resize_valid_mask(mask: np.ndarray, *, target_h: int, target_w: int) -> np.ndarray:
+    arr = np.asarray(mask, dtype=np.uint8)
+    if arr.shape == (int(target_h), int(target_w)):
+        return arr.astype(bool)
+    image = Image.fromarray(arr * 255, mode="L")
+    resized = image.resize((int(target_w), int(target_h)), resample=_RESAMPLING.NEAREST)
+    return (np.asarray(resized, dtype=np.uint8) > 0)
+
+
 def _find_first_matching_dataset(
     h5f: h5py.File,
     *,
@@ -613,12 +641,15 @@ def _load_label_for_window(
         missing_reason = f"window_index={label_idx} out of label range"
 
     label = None
+    label_shape: tuple[int, ...] = ()
     if valid_window:
         if source_info.source_kind == "embedded":
             label = np.asarray(pre_h5[source_info.label_dataset_path][label_idx])
         elif source_info.source_kind == "source":
             assert source_h5 is not None
             label = np.asarray(source_h5[source_info.label_dataset_path][label_idx])
+        if label is not None:
+            label_shape = tuple(int(v) for v in label.shape)
 
     unique_classes: list[int] = []
     depth_min = None
@@ -647,6 +678,7 @@ def _load_label_for_window(
         target=source_info.target,
         window_index=center_window,
         label_index=label_idx,
+        label_shape=label_shape,
         valid_window=bool(valid_window),
         source_kind=source_info.source_kind,
         source_exists=bool(source_info.source_h5_exists),
@@ -728,6 +760,8 @@ def _render_preview(
         split_polarity=split_polarity,
         polarity_order=polarity_order,
     )
+    target_h = int(activity_rgb.shape[0])
+    target_w = int(activity_rgb.shape[1])
 
     label_panel: Image.Image
     overlay_rgb = activity_rgb.copy()
@@ -739,18 +773,25 @@ def _render_preview(
         )
         extra_line = f"missing_reason={_truncate_middle(window_info.missing_reason or 'none', 72)}"
     elif target == "semantic":
-        label_rgb = _semantic_to_rgb(np.asarray(label, dtype=np.int64), ignore_index=ignore_index)
-        valid_mask = np.asarray(label, dtype=np.int64) != int(ignore_index)
+        label_resized = _resize_semantic_label(np.asarray(label, dtype=np.int64), target_h=target_h, target_w=target_w)
+        label_rgb = _semantic_to_rgb(label_resized, ignore_index=ignore_index)
+        valid_mask = np.asarray(label_resized, dtype=np.int64) != int(ignore_index)
         overlay_rgb = _alpha_blend(activity_rgb, label_rgb, valid_mask=valid_mask, alpha=overlay_alpha)
         label_panel = Image.fromarray(label_rgb, mode="RGB")
-        extra_line = f"classes={_format_unique_classes(window_info.unique_classes)}"
+        extra_line = (
+            f"label_shape={window_info.label_shape or 'n/a'} | "
+            f"classes={_format_unique_classes(window_info.unique_classes)}"
+        )
     else:
         depth = np.asarray(label, dtype=np.float32)
+        depth = _resize_depth_map(depth, target_h=target_h, target_w=target_w)
         valid_mask = np.isfinite(depth) & (depth > float(depth_valid_min)) & (depth < float(depth_valid_max))
+        valid_mask = _resize_valid_mask(valid_mask, target_h=target_h, target_w=target_w)
         label_rgb, depth_stats = _colorize_depth(depth, valid_mask)
         overlay_rgb = _alpha_blend(activity_rgb, label_rgb, valid_mask=valid_mask, alpha=overlay_alpha)
         label_panel = Image.fromarray(label_rgb, mode="RGB")
         extra_line = (
+            f"label_shape={window_info.label_shape or 'n/a'} | "
             f"depth_valid_ratio={0.0 if depth_stats['valid_ratio'] is None else depth_stats['valid_ratio']:.3f} | "
             f"depth_p05={depth_stats['p05'] if depth_stats['p05'] is not None else 'n/a'} | "
             f"depth_p95={depth_stats['p95'] if depth_stats['p95'] is not None else 'n/a'}"
@@ -966,6 +1007,7 @@ def _analyze_file(
                     {
                         "window_index": int(idx),
                         "label_index": int(window_info.label_index),
+                        "label_shape": list(window_info.label_shape),
                         "valid_window": int(window_info.valid_window),
                         "source_kind": window_info.source_kind,
                         "source_exists": int(window_info.source_exists),

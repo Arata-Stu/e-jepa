@@ -97,3 +97,23 @@ python3 scripts/train/run_train.py \
   model=vit_tiny_2_1 \
   folder=outputs/stage1_tiny
 ```
+
+## Mask visualization
+
+学習時と同じ `data` / `data_aug` / `mask` 設定から、実際に読み出された clip と
+その場で生成された `encoder context mask / predictor mask` を PNG に保存できます。
+
+```bash
+python3 scripts/train/visualize_masks.py \
+  --output-dir outputs/mask_debug \
+  --num-samples 4 \
+  data.datasets=[/data/DSEC_voxels/train] \
+  data.dataset_fpcs=[16]
+```
+
+- `summary.txt`: clip index, keep率, mask設定, 時間方向の keep 率
+- `sample_*.png`: `Activity / Context overlay / Predictor overlay`
+- `contact_sheet.png`: 複数サンプルを書いたときの一覧
+- `--sample-indices 0 10 42` で特定サンプルを固定できます。
+- `--num-draws 3` にすると、同じ dataset index を複数回引いて mask のばらつきも見られます。
+- `--branch image` を使うと、`img_data.enabled=true` の image branch 設定でも同じ確認ができます。

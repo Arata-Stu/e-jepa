@@ -30,6 +30,13 @@ beside the HDF5 by enabling `save_mp4=true` / `--save_mp4`. The HDF5 still store
 RGB event images, and the MP4 stores the same windows as standard video frames. If `mp4_fps` is
 omitted, the exporter infers FPS from timestamp spacing between generated windows/anchors.
 
+Hydra presets for this mode are available as:
+
+- `dataset=eventscape_event_image`
+- `dataset=dsec_semantic_event_image`
+- `dataset=m3ed_semantic_event_image`
+- `dataset=1mpx_event_image`
+
 ## Dataset behavior
 
 - Returns `(buffer, label, clip_indices)` like vjepa2 `VideoDataset`.

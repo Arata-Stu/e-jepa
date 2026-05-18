@@ -16,26 +16,37 @@ Hydra ランナー: `scripts/preprocess/run_preprocess.py`
 ```bash
 python3 scripts/preprocess/run_preprocess.py dataset=1mpx_t10
 python3 scripts/preprocess/run_preprocess.py dataset=1mpx_t1
+python3 scripts/preprocess/run_preprocess.py dataset=1mpx_event_image
 python3 scripts/preprocess/run_preprocess.py dataset=eventscape_t10
 python3 scripts/preprocess/run_preprocess.py dataset=eventscape_t1
+python3 scripts/preprocess/run_preprocess.py dataset=eventscape_event_image
 python3 scripts/preprocess/run_preprocess.py dataset=dsec_semantic_t10
 python3 scripts/preprocess/run_preprocess.py dataset=dsec_semantic_t1
+python3 scripts/preprocess/run_preprocess.py dataset=dsec_semantic_event_image
 python3 scripts/preprocess/run_preprocess.py dataset=m3ed_semantic_t10
 python3 scripts/preprocess/run_preprocess.py dataset=m3ed_semantic_t1
+python3 scripts/preprocess/run_preprocess.py dataset=m3ed_semantic_event_image
 ```
 
 Preset file:
 
 - `scripts/preprocess/conf/dataset/1mpx_t10.yaml`
 - `scripts/preprocess/conf/dataset/1mpx_t1.yaml`
+- `scripts/preprocess/conf/dataset/1mpx_event_image.yaml`
 - `scripts/preprocess/conf/dataset/eventscape_t10.yaml`
 - `scripts/preprocess/conf/dataset/eventscape_t1.yaml`
+- `scripts/preprocess/conf/dataset/eventscape_event_image.yaml`
 - `scripts/preprocess/conf/dataset/dsec_semantic_t10.yaml`
 - `scripts/preprocess/conf/dataset/dsec_semantic_t1.yaml`
+- `scripts/preprocess/conf/dataset/dsec_semantic_event_image.yaml`
 - `scripts/preprocess/conf/dataset/m3ed_semantic_t10.yaml`
 - `scripts/preprocess/conf/dataset/m3ed_semantic_t1.yaml`
+- `scripts/preprocess/conf/dataset/m3ed_semantic_event_image.yaml`
 
 `dsec` / `m3ed` は label 名に合わせて preset 名と出力 dir 名を `semantic` で統一しています。
+
+`*_event_image` preset は `representation=event_image` と `save_mp4=true` を含みます。event image は
+window 全体を 1 枚の RGB 画像に積算するので、preset 名は `t10` ではなく `event_image` を軸にしています。
 
 ## DSEC
 
@@ -245,6 +256,20 @@ python3 scripts/preprocess/run_preprocess.py \
   dataset.accum_time=50000 \
   dataset.output_dtype=float16
 ```
+
+## Event Image Presets
+
+event image + companion MP4 を出したい場合は、次の preset をそのまま使えます:
+
+```bash
+python3 scripts/preprocess/run_preprocess.py dataset=eventscape_event_image
+python3 scripts/preprocess/run_preprocess.py dataset=dsec_semantic_event_image
+python3 scripts/preprocess/run_preprocess.py dataset=m3ed_semantic_event_image
+python3 scripts/preprocess/run_preprocess.py dataset=1mpx_event_image
+```
+
+`dsec_semantic_event_image` は既定で `dataset.segmentation_tolerance_us=5000` を含みます。  
+`mp4_fps` は省略時に timestamp 間隔から自動推定されます。
 
 ## 解析コマンド（voxel H5）
 

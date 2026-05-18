@@ -28,10 +28,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.representations import EventVoxelGrid, accumulate_events_to_rgb
 from scripts.preprocess.utils import (
-    RgbMp4Writer,
     cleanup_tmp_file,
     ensure_scale_tag_in_filename,
     get_h5_compression_flags,
+    LazyRgbMp4Writer,
     normalize_polarity_to_binary,
     normalized_output_subdir,
     normalized_output_suffix,
@@ -379,12 +379,50 @@ def _build_image_middle_windows(
     return windows
 
 
+def _resolve_segmentation_timestamps_path(segmentation_dir: Path) -> Path | None:
+    candidates: list[Path] = [
+        segmentation_dir / "timestamps.txt",
+        segmentation_dir / "semantic_timestamps.txt",
+        segmentation_dir.parent / "timestamps.txt",
+        segmentation_dir.parent / "semantic_timestamps.txt",
+    ]
+    if segmentation_dir.parent.name == "semantic":
+        sequence_name = segmentation_dir.parent.parent.name
+        candidates.append(segmentation_dir.parent / f"{sequence_name}_semantic_timestamps.txt")
+    candidates.extend(sorted(segmentation_dir.parent.glob("*_semantic_timestamps.txt")))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve() if candidate.exists() else candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
 def _load_segmentation_index(segmentation_dir: Path) -> tuple[np.ndarray, list[str]]:
     if not segmentation_dir.exists() or not segmentation_dir.is_dir():
         return np.empty((0,), dtype=np.int64), []
 
+    label_paths = sorted(segmentation_dir.glob("*.png"))
+    if len(label_paths) == 0:
+        return np.empty((0,), dtype=np.int64), []
+
+    timestamps_path = _resolve_segmentation_timestamps_path(segmentation_dir)
+    if timestamps_path is not None:
+        timestamps = _load_image_timestamps(timestamps_path)
+        if int(timestamps.size) != len(label_paths):
+            raise ValueError(
+                "segmentation timestamp count mismatch: "
+                f"{timestamps_path} has {int(timestamps.size)} entries, "
+                f"but {segmentation_dir} has {len(label_paths)} PNGs"
+            )
+        return timestamps.astype(np.int64, copy=False), [label_path.name for label_path in label_paths]
+
     timestamped_files: list[tuple[int, str]] = []
-    for label_path in sorted(segmentation_dir.glob("*.png")):
+    for label_path in label_paths:
         try:
             timestamped_files.append((int(label_path.stem), label_path.name))
         except ValueError:
@@ -751,7 +789,7 @@ def process_single_file(
     representation: str,
     event_image_percentile: float,
     save_mp4: bool,
-    mp4_fps: float,
+    mp4_fps: float | None,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -870,6 +908,8 @@ def process_single_file(
                 writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
                 writer.h5f.attrs["has_companion_mp4"] = int(save_mp4)
                 writer.h5f.attrs["companion_mp4_relpath"] = mp4_path.name if save_mp4 else ""
+                writer.h5f.attrs["companion_mp4_fps"] = 0.0
+                writer.h5f.attrs["companion_mp4_fps_source"] = ""
                 writer.h5f.attrs["time_origin_us"] = -1
                 writer.close()
                 writer = None
@@ -955,6 +995,8 @@ def process_single_file(
             writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
             writer.h5f.attrs["has_companion_mp4"] = int(save_mp4)
             writer.h5f.attrs["companion_mp4_relpath"] = mp4_path.name if save_mp4 else ""
+            writer.h5f.attrs["companion_mp4_fps"] = 0.0
+            writer.h5f.attrs["companion_mp4_fps_source"] = ""
             writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
             if image_timestamps is not None:
                 writer.h5f.attrs["num_image_timestamps"] = int(len(image_timestamps))
@@ -1015,13 +1057,11 @@ def process_single_file(
                     if save_mp4:
                         frame_rgb = _event_image_chw_to_hwc_uint8(window_tensor)
                         if mp4_writer is None:
-                            mp4_writer = RgbMp4Writer(
+                            mp4_writer = LazyRgbMp4Writer(
                                 tmp_mp4_path,
-                                fps=float(mp4_fps),
-                                width=int(frame_rgb.shape[1]),
-                                height=int(frame_rgb.shape[0]),
+                                fps=mp4_fps,
                             )
-                        mp4_writer.write_rgb(frame_rgb)
+                        mp4_writer.write_rgb(frame_rgb, timestamp_us=anchor_us_int)
                 window_tensor = window_tensor.astype(voxel_dtype, copy=False)
                 seg_available = 0
                 seg_timestamp = -1
@@ -1067,12 +1107,14 @@ def process_single_file(
                 if pbar is not None:
                     pbar.update(1)
 
-        writer.close()
-        writer = None
         if mp4_writer is not None:
             mp4_writer.close()
-            mp4_writer = None
+            writer.h5f.attrs["companion_mp4_fps"] = float(mp4_writer.resolved_fps or 0.0)
+            writer.h5f.attrs["companion_mp4_fps_source"] = str(mp4_writer.fps_source)
             os.replace(tmp_mp4_path, mp4_path)
+            mp4_writer = None
+        writer.close()
+        writer = None
         os.replace(tmp_path, output_path)
     except Exception:
         if writer is not None:
@@ -1107,7 +1149,7 @@ def _process_file_with_retry(
     representation: str,
     event_image_percentile: float,
     save_mp4: bool,
-    mp4_fps: float,
+    mp4_fps: float | None,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -1444,7 +1486,7 @@ def process_dataset_root(
     representation: str,
     event_image_percentile: float,
     save_mp4: bool,
-    mp4_fps: float,
+    mp4_fps: float | None,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -1550,6 +1592,7 @@ def process_dataset_root(
     jobs: list[dict] = []
     num_done = 0
     num_skipped = 0
+    num_skipped_missing_segmentation = 0
     num_failed = 0
 
     for record in tqdm.tqdm(input_records, desc="DSEC sequences"):
@@ -1613,10 +1656,13 @@ def process_dataset_root(
                 segmentation_subdir=segmentation_subdir,
             )
             if segmentation_dir is None:
+                num_skipped += 1
+                num_skipped_missing_segmentation += 1
                 print(
-                    "[WARN] segmentation directory not found; sync metadata will be marked unavailable: "
+                    "[SKIP] segmentation directory not found for semantic preprocessing: "
                     f"split={record['split']}, sequence={record['sequence']}"
                 )
+                continue
 
         jobs.append(
             {
@@ -1638,7 +1684,7 @@ def process_dataset_root(
                 "representation": str(representation),
                 "event_image_percentile": float(event_image_percentile),
                 "save_mp4": bool(save_mp4),
-                "mp4_fps": float(mp4_fps),
+                "mp4_fps": None if mp4_fps is None else float(mp4_fps),
                 "activity_mode": str(activity_mode),
                 "activity_spatial_patch_size": int(activity_spatial_patch_size),
                 "activity_temporal_patch_size": int(activity_temporal_patch_size),
@@ -1683,7 +1729,11 @@ def process_dataset_root(
                         num_failed += 1
                         print(f"[FAILED] {input_name}: {err}")
 
-    print(f"[SUMMARY] done={num_done}, skipped={num_skipped}, failed={num_failed}")
+    print(
+        "[SUMMARY] "
+        f"done={num_done}, skipped={num_skipped}, "
+        f"skipped_missing_segmentation={num_skipped_missing_segmentation}, failed={num_failed}"
+    )
     if num_failed > 0:
         raise RuntimeError(f"{num_failed} sequences failed while processing {dataset_root}")
 
@@ -1916,8 +1966,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mp4_fps",
         type=float,
-        default=10.0,
-        help="FPS used for companion MP4 export when --save_mp4 is enabled.",
+        default=None,
+        help="Optional FPS for companion MP4 export. If omitted, infer from timestamp spacing.",
     )
     parser.add_argument(
         "--t_bins",

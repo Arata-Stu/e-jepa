@@ -27,10 +27,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.representations import EventVoxelGrid, accumulate_events_to_rgb
 from scripts.preprocess.utils import (
-    RgbMp4Writer,
     cleanup_tmp_file,
     ensure_scale_tag_in_filename,
     get_h5_compression_flags,
+    LazyRgbMp4Writer,
     normalize_polarity_to_binary,
     normalized_output_subdir,
     normalized_output_suffix,
@@ -1123,7 +1123,7 @@ def process_single_file(
     representation: str,
     event_image_percentile: float,
     save_mp4: bool,
-    mp4_fps: float,
+    mp4_fps: float | None,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -1279,6 +1279,8 @@ def process_single_file(
                 writer.h5f.attrs["embedded_label_source_path"] = ""
                 writer.h5f.attrs["has_companion_mp4"] = int(save_mp4)
                 writer.h5f.attrs["companion_mp4_relpath"] = mp4_path.name if save_mp4 else ""
+                writer.h5f.attrs["companion_mp4_fps"] = 0.0
+                writer.h5f.attrs["companion_mp4_fps_source"] = ""
                 writer.h5f.attrs["time_origin_us"] = -1
                 writer.h5f.attrs["num_windows_planned"] = 0
                 writer.h5f.attrs["anchor_timebase_mode"] = "as_is"
@@ -1431,6 +1433,8 @@ def process_single_file(
             writer.h5f.attrs["num_windows_planned"] = int(len(windows))
             writer.h5f.attrs["has_companion_mp4"] = int(save_mp4)
             writer.h5f.attrs["companion_mp4_relpath"] = mp4_path.name if save_mp4 else ""
+            writer.h5f.attrs["companion_mp4_fps"] = 0.0
+            writer.h5f.attrs["companion_mp4_fps_source"] = ""
 
             voxelizer = None
             if representation == "voxel_grid":
@@ -1486,13 +1490,11 @@ def process_single_file(
                     if save_mp4:
                         frame_rgb = _event_image_chw_to_hwc_uint8(window_tensor)
                         if mp4_writer is None:
-                            mp4_writer = RgbMp4Writer(
+                            mp4_writer = LazyRgbMp4Writer(
                                 tmp_mp4_path,
-                                fps=float(mp4_fps),
-                                width=int(frame_rgb.shape[1]),
-                                height=int(frame_rgb.shape[0]),
+                                fps=mp4_fps,
                             )
-                        mp4_writer.write_rgb(frame_rgb)
+                        mp4_writer.write_rgb(frame_rgb, timestamp_us=anchor_us)
                 window_tensor = window_tensor.astype(voxel_dtype, copy=False)
                 embedded_label = None
                 if embedded_label_source_path is not None:
@@ -1515,12 +1517,14 @@ def process_single_file(
                 if pbar is not None:
                     pbar.update(1)
 
-        writer.close()
-        writer = None
         if mp4_writer is not None:
             mp4_writer.close()
-            mp4_writer = None
+            writer.h5f.attrs["companion_mp4_fps"] = float(mp4_writer.resolved_fps or 0.0)
+            writer.h5f.attrs["companion_mp4_fps_source"] = str(mp4_writer.fps_source)
             os.replace(tmp_mp4_path, mp4_path)
+            mp4_writer = None
+        writer.close()
+        writer = None
         os.replace(tmp_path, output_path)
     except Exception:
         if writer is not None:
@@ -1562,7 +1566,7 @@ def _process_file_with_retry(
     representation: str,
     event_image_percentile: float,
     save_mp4: bool,
-    mp4_fps: float,
+    mp4_fps: float | None,
     tmp_suffix: str,
     activity_mode: str,
     activity_spatial_patch_size: int,
@@ -1814,7 +1818,7 @@ def process_dataset_root(
     representation: str,
     event_image_percentile: float,
     save_mp4: bool,
-    mp4_fps: float,
+    mp4_fps: float | None,
     tmp_suffix: str,
     num_processes: int,
     activity_mode: str,
@@ -1966,7 +1970,7 @@ def process_dataset_root(
                 "representation": str(representation),
                 "event_image_percentile": float(event_image_percentile),
                 "save_mp4": bool(save_mp4),
-                "mp4_fps": float(mp4_fps),
+                "mp4_fps": None if mp4_fps is None else float(mp4_fps),
                 "tmp_suffix": tmp_suffix,
                 "activity_mode": str(activity_mode),
                 "activity_spatial_patch_size": int(activity_spatial_patch_size),
@@ -2161,8 +2165,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mp4_fps",
         type=float,
-        default=10.0,
-        help="FPS used for companion MP4 export when --save_mp4 is enabled.",
+        default=None,
+        help="Optional FPS for companion MP4 export. If omitted, infer from timestamp spacing.",
     )
     parser.add_argument(
         "--t_bins",

@@ -27,7 +27,8 @@ are supported.
 
 When preprocessing with `representation=event_image`, each script can also emit a companion `.mp4`
 beside the HDF5 by enabling `save_mp4=true` / `--save_mp4`. The HDF5 still stores `(N, 3, H, W)`
-RGB event images, and the MP4 stores the same windows as standard video frames.
+RGB event images, and the MP4 stores the same windows as standard video frames. If `mp4_fps` is
+omitted, the exporter infers FPS from timestamp spacing between generated windows/anchors.
 
 ## Dataset behavior
 

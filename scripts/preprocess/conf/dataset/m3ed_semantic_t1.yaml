@@ -17,7 +17,7 @@ t_bins: 1
 representation: voxel_grid
 event_image_percentile: 99.0
 save_mp4: false
-mp4_fps: 10.0
+mp4_fps: null
 split_polarity: true
 accum_time: 50000
 stride_time: null

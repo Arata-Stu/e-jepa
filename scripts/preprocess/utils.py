@@ -174,3 +174,122 @@ class RgbMp4Writer:
         if writer is not None:
             writer.release()
             self._writer = None
+
+
+def infer_mp4_fps_from_timestamps_us(
+    timestamps_us: np.ndarray | list[int] | tuple[int, ...],
+) -> tuple[float | None, str]:
+    timestamps = np.asarray(timestamps_us, dtype=np.int64).reshape(-1)
+    if timestamps.size < 2:
+        return None, "insufficient_timestamps"
+
+    deltas_us = np.diff(timestamps)
+    positive_deltas_us = deltas_us[deltas_us > 0]
+    if positive_deltas_us.size == 0:
+        return None, "nonpositive_timestamp_deltas"
+
+    median_delta_us = float(np.median(positive_deltas_us))
+    if median_delta_us <= 0.0:
+        return None, "invalid_median_timestamp_delta"
+    return float(1_000_000.0 / median_delta_us), "inferred_median_timestamp_delta_us"
+
+
+def resolve_mp4_fps(
+    requested_fps: float | None,
+    timestamps_us: np.ndarray | list[int] | tuple[int, ...],
+    *,
+    fallback_fps: float = 10.0,
+) -> tuple[float, str]:
+    if requested_fps is not None and float(requested_fps) > 0.0:
+        return float(requested_fps), "explicit"
+
+    inferred_fps, inferred_source = infer_mp4_fps_from_timestamps_us(timestamps_us)
+    if inferred_fps is not None:
+        return inferred_fps, inferred_source
+
+    fallback = float(fallback_fps)
+    if fallback <= 0.0:
+        raise ValueError("fallback_fps must be > 0")
+    return fallback, f"fallback:{inferred_source}"
+
+
+class LazyRgbMp4Writer:
+    def __init__(
+        self,
+        output_path: Path,
+        *,
+        fps: float | None,
+        fallback_fps: float = 10.0,
+    ):
+        self.output_path = Path(output_path)
+        self.requested_fps = None if fps is None else float(fps)
+        if self.requested_fps is not None and self.requested_fps <= 0.0:
+            self.requested_fps = None
+        self.fallback_fps = float(fallback_fps)
+        if self.fallback_fps <= 0.0:
+            raise ValueError("fallback_fps must be > 0")
+
+        self.resolved_fps: float | None = None
+        self.fps_source: str = ""
+        self._writer: RgbMp4Writer | None = None
+        self._pending_frames: list[np.ndarray] = []
+        self._pending_timestamps_us: list[int] = []
+
+    def _flush_pending_frames(self) -> None:
+        if self._writer is None:
+            return
+        for frame_rgb in self._pending_frames:
+            self._writer.write_rgb(frame_rgb)
+        self._pending_frames.clear()
+
+    def _open_writer(self, fps: float, fps_source: str) -> None:
+        if self._writer is not None:
+            return
+        if len(self._pending_frames) == 0:
+            raise RuntimeError("cannot open MP4 writer without any pending frames")
+        first_frame = np.asarray(self._pending_frames[0])
+        if first_frame.ndim != 3 or first_frame.shape[2] != 3:
+            raise ValueError(f"frame_rgb must be HxWx3, got shape={first_frame.shape}")
+        self._writer = RgbMp4Writer(
+            self.output_path,
+            fps=float(fps),
+            width=int(first_frame.shape[1]),
+            height=int(first_frame.shape[0]),
+        )
+        self.resolved_fps = float(fps)
+        self.fps_source = str(fps_source)
+        self._flush_pending_frames()
+
+    def _try_open_writer(self) -> None:
+        if self._writer is not None or len(self._pending_frames) == 0:
+            return
+        if self.requested_fps is not None:
+            self._open_writer(fps=float(self.requested_fps), fps_source="explicit")
+            return
+        inferred_fps, inferred_source = infer_mp4_fps_from_timestamps_us(self._pending_timestamps_us)
+        if inferred_fps is None:
+            return
+        self._open_writer(fps=inferred_fps, fps_source=inferred_source)
+
+    def write_rgb(self, frame_rgb: np.ndarray, *, timestamp_us: int | None = None) -> None:
+        frame = np.asarray(frame_rgb)
+        if self._writer is not None:
+            self._writer.write_rgb(frame)
+            return
+
+        self._pending_frames.append(frame)
+        if timestamp_us is not None:
+            self._pending_timestamps_us.append(int(timestamp_us))
+        self._try_open_writer()
+
+    def close(self) -> None:
+        if self._writer is None and len(self._pending_frames) > 0:
+            fps, fps_source = resolve_mp4_fps(
+                requested_fps=self.requested_fps,
+                timestamps_us=self._pending_timestamps_us,
+                fallback_fps=self.fallback_fps,
+            )
+            self._open_writer(fps=fps, fps_source=fps_source)
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None

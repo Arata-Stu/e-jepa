@@ -49,6 +49,10 @@ def tmp_output_path(output_path: Path, tmp_suffix: str) -> Path:
     return output_path.with_name(f"{output_path.name}{tmp_suffix}")
 
 
+def tmp_media_output_path(output_path: Path, tmp_suffix: str) -> Path:
+    return output_path.with_name(f"{output_path.stem}{tmp_suffix}{output_path.suffix}")
+
+
 def cleanup_tmp_file(tmp_path: Path, context: str, strict: bool = True) -> bool:
     if not tmp_path.exists():
         return True
@@ -126,3 +130,47 @@ def normalize_polarity_to_binary(
     bin_arr = arr > 0
     out_dtype = np.uint8 if dtype is None else dtype
     return bin_arr.astype(out_dtype, copy=False)
+
+
+class RgbMp4Writer:
+    def __init__(
+        self,
+        output_path: Path,
+        *,
+        fps: float,
+        width: int,
+        height: int,
+    ):
+        try:
+            import cv2
+        except Exception as exc:
+            raise RuntimeError("OpenCV is required for MP4 export. Install via `pip install opencv-python`.") from exc
+
+        self._cv2 = cv2
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._writer = cv2.VideoWriter(
+            str(self.output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(max(fps, 1e-6)),
+            (int(width), int(height)),
+        )
+        if not self._writer.isOpened():
+            raise RuntimeError(f"failed to open VideoWriter for {self.output_path}")
+
+    def write_rgb(self, frame_rgb: np.ndarray) -> None:
+        frame = np.asarray(frame_rgb)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"frame_rgb must be HxWx3, got shape={frame.shape}")
+        if np.issubdtype(frame.dtype, np.floating):
+            frame = np.clip(frame, 0.0, 1.0)
+            frame = np.round(frame * 255.0).astype(np.uint8)
+        else:
+            frame = np.clip(frame, 0, 255).astype(np.uint8, copy=False)
+        self._writer.write(self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR))
+
+    def close(self) -> None:
+        writer = getattr(self, "_writer", None)
+        if writer is not None:
+            writer.release()
+            self._writer = None

@@ -50,6 +50,10 @@ def _optional_int(value: object | None) -> int | None:
     return int(value)
 
 
+def _cfg_get(cfg: DictConfig, key: str, default):
+    return cfg.get(key, default)
+
+
 def _run_dsec(cfg: DictConfig) -> None:
     from scripts.preprocess.preprocess_dsec import process_dataset_root
 
@@ -75,6 +79,10 @@ def _run_dsec(cfg: DictConfig) -> None:
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
         use_trilinear=bool(cfg.use_trilinear),
+        representation=str(_cfg_get(cfg, "representation", "voxel_grid")),
+        event_image_percentile=float(_cfg_get(cfg, "event_image_percentile", 99.0)),
+        save_mp4=bool(_cfg_get(cfg, "save_mp4", False)),
+        mp4_fps=float(_cfg_get(cfg, "mp4_fps", 10.0)),
         sync_segmentation=bool(cfg.sync_segmentation),
         segmentation_root=_optional_path(cfg.segmentation_root),
         segmentation_subdir=str(cfg.segmentation_subdir),
@@ -122,6 +130,10 @@ def _run_1mpx(cfg: DictConfig) -> None:
         output_dtype=str(cfg.output_dtype),
         compression_level=int(cfg.compression_level),
         use_trilinear=bool(cfg.use_trilinear),
+        representation=str(_cfg_get(cfg, "representation", "voxel_grid")),
+        event_image_percentile=float(_cfg_get(cfg, "event_image_percentile", 99.0)),
+        save_mp4=bool(_cfg_get(cfg, "save_mp4", False)),
+        mp4_fps=float(_cfg_get(cfg, "mp4_fps", 10.0)),
         activity_mode=str(cfg.activity_mode),
         activity_spatial_patch_size=int(cfg.activity_spatial_patch_size),
         activity_temporal_patch_size=int(cfg.activity_temporal_patch_size),
@@ -175,6 +187,10 @@ def _run_m3ed(cfg: DictConfig) -> None:
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
         use_trilinear=bool(cfg.use_trilinear),
+        representation=str(_cfg_get(cfg, "representation", "voxel_grid")),
+        event_image_percentile=float(_cfg_get(cfg, "event_image_percentile", 99.0)),
+        save_mp4=bool(_cfg_get(cfg, "save_mp4", False)),
+        mp4_fps=float(_cfg_get(cfg, "mp4_fps", 10.0)),
         activity_mode=str(cfg.activity_mode),
         activity_spatial_patch_size=int(cfg.activity_spatial_patch_size),
         activity_temporal_patch_size=int(cfg.activity_temporal_patch_size),
@@ -213,6 +229,10 @@ def _run_eventscape(cfg: DictConfig) -> None:
         normalize=bool(cfg.normalize),
         output_dtype=str(cfg.output_dtype),
         use_trilinear=bool(cfg.use_trilinear),
+        representation=str(_cfg_get(cfg, "representation", "voxel_grid")),
+        event_image_percentile=float(_cfg_get(cfg, "event_image_percentile", 99.0)),
+        save_mp4=bool(_cfg_get(cfg, "save_mp4", False)),
+        mp4_fps=float(_cfg_get(cfg, "mp4_fps", 10.0)),
         activity_mode=str(cfg.activity_mode),
         activity_spatial_patch_size=int(cfg.activity_spatial_patch_size),
         activity_temporal_patch_size=int(cfg.activity_temporal_patch_size),

@@ -26,14 +26,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.representations import EventVoxelGrid
+from src.representations import EventVoxelGrid, accumulate_events_to_rgb
 from scripts.preprocess.utils import (
+    RgbMp4Writer,
     cleanup_tmp_file,
     ensure_scale_tag_in_filename,
     get_h5_compression_flags,
     normalize_polarity_to_binary,
     normalized_output_subdir,
     normalized_output_suffix,
+    tmp_media_output_path,
     tmp_output_path,
 )
 from scripts.preprocess.split_voxel_h5_by_duration import split_voxel_h5_file
@@ -42,6 +44,7 @@ from scripts.preprocess.split_voxel_h5_by_duration import split_voxel_h5_file
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
 MS_TO_IDX_BUILD_CHUNK_EVENTS = 5_000_000
 ACTIVITY_MODES = {"full", "light"}
+REPRESENTATION_MODES = {"voxel_grid", "event_image"}
 
 
 def _empty_events() -> dict[str, np.ndarray]:
@@ -220,6 +223,34 @@ def _events_to_voxel_numpy(
     }
     voxel = voxelizer.convert(events_torch)
     return voxel.cpu().numpy().astype(np.float32, copy=False)
+
+
+def _events_to_event_image_numpy(
+    events: dict[str, np.ndarray],
+    input_height: int,
+    input_width: int,
+    downsample_factor: int,
+    percentile: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    output_height, output_width = _resolve_output_resolution(
+        input_height=input_height,
+        input_width=input_width,
+        downsample_factor=downsample_factor,
+    )
+    normalized = _downsample_events_nearest(
+        events=events,
+        input_height=input_height,
+        input_width=input_width,
+        downsample_factor=downsample_factor,
+    )
+    return accumulate_events_to_rgb(
+        normalized["x"],
+        normalized["y"],
+        normalized["p"],
+        (output_height, output_width),
+        percentile=percentile,
+        dtype=np.float32,
+    )
 
 
 def _resolve_output_resolution(input_height: int, input_width: int, downsample_factor: int) -> tuple[int, int]:
@@ -408,6 +439,12 @@ def _load_segmentation_label(segmentation_dir: Path, relpath: str) -> np.ndarray
     )
 
 
+def _event_image_chw_to_hwc_uint8(image_chw: np.ndarray) -> np.ndarray:
+    if image_chw.ndim != 3 or image_chw.shape[0] != 3:
+        raise ValueError(f"expected event image [3,H,W], got shape={image_chw.shape}")
+    return np.moveaxis(np.asarray(image_chw), 0, -1)
+
+
 def _compute_activity_metadata(
     voxel: np.ndarray,
     *,
@@ -424,6 +461,27 @@ def _compute_activity_metadata(
         activity_volume = np.abs(voxel).reshape(2, temporal_bins, height, width).sum(axis=0)
     else:
         activity_volume = np.abs(voxel)
+    return _compute_activity_metadata_from_volume(
+        activity_volume=activity_volume,
+        spatial_patch_size=spatial_patch_size,
+        temporal_patch_size=temporal_patch_size,
+        activity_mode=activity_mode,
+    )
+
+
+def _compute_activity_metadata_from_volume(
+    activity_volume: np.ndarray,
+    *,
+    spatial_patch_size: int,
+    temporal_patch_size: int,
+    activity_mode: str,
+) -> tuple[np.ndarray, float, float]:
+    if activity_mode not in ACTIVITY_MODES:
+        raise ValueError(f"unsupported activity_mode: {activity_mode}")
+    if activity_volume.ndim != 3:
+        raise ValueError(f"activity_volume must be [T,H,W], got shape={activity_volume.shape}")
+
+    temporal_bins, height, width = activity_volume.shape
     nonzero_voxel_ratio = float(np.count_nonzero(activity_volume) / float(max(1, activity_volume.size)))
     active_pixel_ratio = float(np.count_nonzero(activity_volume.sum(axis=0) > 0) / float(max(1, height * width)))
     if activity_mode == "light":
@@ -690,6 +748,10 @@ def process_single_file(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    representation: str,
+    event_image_percentile: float,
+    save_mp4: bool,
+    mp4_fps: float,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -715,6 +777,8 @@ def process_single_file(
         raise ValueError(f"unsupported window_mode: {window_mode}")
     if window_mode == "image_middle" and image_timestamps_path is None:
         raise ValueError("window_mode=image_middle requires image_timestamps_path")
+    if representation not in REPRESENTATION_MODES:
+        raise ValueError(f"unsupported representation: {representation}")
     if activity_mode not in ACTIVITY_MODES:
         raise ValueError(f"unsupported activity_mode: {activity_mode}")
 
@@ -723,11 +787,12 @@ def process_single_file(
         input_width=width,
         downsample_factor=downsample_factor,
     )
-    voxel_channels = int(t_bins) * (2 if split_polarity else 1)
+    representation_channels = int(t_bins) * (2 if split_polarity else 1) if representation == "voxel_grid" else 3
+    activity_temporal_bins = int(t_bins) if representation == "voxel_grid" else 1
     voxel_dtype = np.float16 if output_dtype == "float16" else np.float32
     activity_grid_shape = (
         (
-            (int(t_bins) + int(activity_temporal_patch_size) - 1) // int(activity_temporal_patch_size),
+            (int(activity_temporal_bins) + int(activity_temporal_patch_size) - 1) // int(activity_temporal_patch_size),
             (int(output_height) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
             (int(output_width) + int(activity_spatial_patch_size) - 1) // int(activity_spatial_patch_size),
         )
@@ -746,8 +811,15 @@ def process_single_file(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_output_path(output_path=output_path, tmp_suffix=tmp_suffix)
     cleanup_tmp_file(tmp_path=tmp_path, context=f"start processing {input_path}", strict=True)
+    mp4_path = output_path.with_suffix(".mp4")
+    tmp_mp4_path = tmp_media_output_path(output_path=mp4_path, tmp_suffix=tmp_suffix)
+    if save_mp4 and representation != "event_image":
+        raise ValueError("save_mp4 is only supported when representation=event_image")
+    if save_mp4:
+        cleanup_tmp_file(tmp_path=tmp_mp4_path, context=f"start MP4 processing {input_path}", strict=True)
 
     writer = None
+    mp4_writer = None
     pbar = None
     try:
         with h5py.File(str(input_path), "r") as h5f:
@@ -764,29 +836,31 @@ def process_single_file(
             if t_first is None or t_last_exclusive is None:
                 writer = VoxelH5Writer(
                     outfile=tmp_path,
-                    t_bins=voxel_channels,
+                    t_bins=representation_channels,
                     height=output_height,
                     width=output_width,
                     voxel_dtype=voxel_dtype,
                     with_segmentation_meta=sync_segmentation,
                     activity_grid_shape=activity_grid_shape,
                 )
-                writer.h5f.attrs["representation"] = "event_voxel_grid"
+                writer.h5f.attrs["representation"] = "event_voxel_grid" if representation == "voxel_grid" else "event_image"
+                writer.h5f.attrs["representation_kind"] = str(representation)
                 writer.h5f.attrs["input_height"] = int(height)
                 writer.h5f.attrs["input_width"] = int(width)
                 writer.h5f.attrs["height"] = int(output_height)
                 writer.h5f.attrs["width"] = int(output_width)
                 writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
                 writer.h5f.attrs["spatial_resize_mode"] = "nearest"
-                writer.h5f.attrs["t_bins"] = int(t_bins)
-                writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
-                writer.h5f.attrs["split_polarity"] = int(split_polarity)
-                writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
+                writer.h5f.attrs["t_bins"] = int(activity_temporal_bins)
+                writer.h5f.attrs["voxel_channels"] = int(representation_channels)
+                writer.h5f.attrs["split_polarity"] = int(split_polarity if representation == "voxel_grid" else False)
+                writer.h5f.attrs["polarity_channels"] = 2
                 writer.h5f.attrs["window_mode"] = window_mode
                 writer.h5f.attrs["accum_time_us"] = int(accum_time)
                 writer.h5f.attrs["stride_time_us"] = int(stride_time)
                 writer.h5f.attrs["normalize"] = int(normalize)
                 writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+                writer.h5f.attrs["event_image_percentile"] = float(event_image_percentile)
                 writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
                 writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
                 writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
@@ -794,6 +868,8 @@ def process_single_file(
                 writer.h5f.attrs["activity_mode"] = str(activity_mode)
                 writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
                 writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
+                writer.h5f.attrs["has_companion_mp4"] = int(save_mp4)
+                writer.h5f.attrs["companion_mp4_relpath"] = mp4_path.name if save_mp4 else ""
                 writer.h5f.attrs["time_origin_us"] = -1
                 writer.close()
                 writer = None
@@ -842,7 +918,7 @@ def process_single_file(
 
             writer = VoxelH5Writer(
                 outfile=tmp_path,
-                t_bins=voxel_channels,
+                t_bins=representation_channels,
                 height=output_height,
                 width=output_width,
                 voxel_dtype=voxel_dtype,
@@ -852,22 +928,24 @@ def process_single_file(
                 embedded_segmentation_dtype=(embedded_segmentation_dtype if embedded_segmentation_dtype is not None else np.uint8),
                 activity_grid_shape=activity_grid_shape,
             )
-            writer.h5f.attrs["representation"] = "event_voxel_grid"
+            writer.h5f.attrs["representation"] = "event_voxel_grid" if representation == "voxel_grid" else "event_image"
+            writer.h5f.attrs["representation_kind"] = str(representation)
             writer.h5f.attrs["input_height"] = int(height)
             writer.h5f.attrs["input_width"] = int(width)
             writer.h5f.attrs["height"] = int(output_height)
             writer.h5f.attrs["width"] = int(output_width)
             writer.h5f.attrs["downsample_factor"] = int(downsample_factor)
             writer.h5f.attrs["spatial_resize_mode"] = "nearest"
-            writer.h5f.attrs["t_bins"] = int(t_bins)
-            writer.h5f.attrs["voxel_channels"] = int(voxel_channels)
-            writer.h5f.attrs["split_polarity"] = int(split_polarity)
-            writer.h5f.attrs["polarity_channels"] = 2 if split_polarity else 1
+            writer.h5f.attrs["t_bins"] = int(activity_temporal_bins)
+            writer.h5f.attrs["voxel_channels"] = int(representation_channels)
+            writer.h5f.attrs["split_polarity"] = int(split_polarity if representation == "voxel_grid" else False)
+            writer.h5f.attrs["polarity_channels"] = 2
             writer.h5f.attrs["window_mode"] = window_mode
             writer.h5f.attrs["accum_time_us"] = int(accum_time)
             writer.h5f.attrs["stride_time_us"] = int(stride_time)
             writer.h5f.attrs["normalize"] = int(normalize)
             writer.h5f.attrs["trilinear_interpolation"] = int(use_trilinear)
+            writer.h5f.attrs["event_image_percentile"] = float(event_image_percentile)
             writer.h5f.attrs["sync_segmentation"] = int(sync_segmentation)
             writer.h5f.attrs["segmentation_tolerance_us"] = int(segmentation_tolerance_us)
             writer.h5f.attrs["image_timestamps_path"] = str(image_timestamps_path) if image_timestamps_path is not None else ""
@@ -875,6 +953,8 @@ def process_single_file(
             writer.h5f.attrs["activity_mode"] = str(activity_mode)
             writer.h5f.attrs["activity_spatial_patch_size"] = int(activity_spatial_patch_size)
             writer.h5f.attrs["activity_temporal_patch_size"] = int(activity_temporal_patch_size)
+            writer.h5f.attrs["has_companion_mp4"] = int(save_mp4)
+            writer.h5f.attrs["companion_mp4_relpath"] = mp4_path.name if save_mp4 else ""
             writer.h5f.attrs["time_origin_us"] = int(time_origin_us)
             if image_timestamps is not None:
                 writer.h5f.attrs["num_image_timestamps"] = int(len(image_timestamps))
@@ -882,12 +962,14 @@ def process_single_file(
                 writer.h5f.attrs["embedded_label_dataset"] = "embedded_segmentation"
                 writer.h5f.attrs["embedded_label_source_path"] = ""
 
-            voxelizer = EventVoxelGrid(
-                input_size=(t_bins, output_height, output_width),
-                normalize=normalize,
-                separate_polarity=split_polarity,
-                trilinear_interpolation=use_trilinear,
-            )
+            voxelizer = None
+            if representation == "voxel_grid":
+                voxelizer = EventVoxelGrid(
+                    input_size=(t_bins, output_height, output_width),
+                    normalize=normalize,
+                    separate_polarity=split_polarity,
+                    trilinear_interpolation=use_trilinear,
+                )
 
             if show_pbar:
                 pbar = tqdm.tqdm(total=len(windows), desc=input_path.name, leave=False)
@@ -899,22 +981,48 @@ def process_single_file(
                     end_us=end_us_int,
                     ms_to_idx=ms_to_idx,
                 )
-                voxel = _events_to_voxel_numpy(
-                    events=events,
-                    voxelizer=voxelizer,
-                    input_height=height,
-                    input_width=width,
-                    downsample_factor=downsample_factor,
-                )
-                voxel = voxel.astype(voxel_dtype, copy=False)
-                activity_grid, activity_score, active_pixel_ratio = _compute_activity_metadata(
-                    voxel=voxel,
-                    temporal_bins=int(t_bins),
-                    split_polarity=bool(split_polarity),
-                    spatial_patch_size=int(activity_spatial_patch_size),
-                    temporal_patch_size=int(activity_temporal_patch_size),
-                    activity_mode=str(activity_mode),
-                )
+                if representation == "voxel_grid":
+                    assert voxelizer is not None
+                    window_tensor = _events_to_voxel_numpy(
+                        events=events,
+                        voxelizer=voxelizer,
+                        input_height=height,
+                        input_width=width,
+                        downsample_factor=downsample_factor,
+                    )
+                    activity_grid, activity_score, active_pixel_ratio = _compute_activity_metadata(
+                        voxel=window_tensor,
+                        temporal_bins=int(t_bins),
+                        split_polarity=bool(split_polarity),
+                        spatial_patch_size=int(activity_spatial_patch_size),
+                        temporal_patch_size=int(activity_temporal_patch_size),
+                        activity_mode=str(activity_mode),
+                    )
+                else:
+                    window_tensor, activity_volume = _events_to_event_image_numpy(
+                        events=events,
+                        input_height=height,
+                        input_width=width,
+                        downsample_factor=downsample_factor,
+                        percentile=float(event_image_percentile),
+                    )
+                    activity_grid, activity_score, active_pixel_ratio = _compute_activity_metadata_from_volume(
+                        activity_volume=activity_volume,
+                        spatial_patch_size=int(activity_spatial_patch_size),
+                        temporal_patch_size=int(activity_temporal_patch_size),
+                        activity_mode=str(activity_mode),
+                    )
+                    if save_mp4:
+                        frame_rgb = _event_image_chw_to_hwc_uint8(window_tensor)
+                        if mp4_writer is None:
+                            mp4_writer = RgbMp4Writer(
+                                tmp_mp4_path,
+                                fps=float(mp4_fps),
+                                width=int(frame_rgb.shape[1]),
+                                height=int(frame_rgb.shape[0]),
+                            )
+                        mp4_writer.write_rgb(frame_rgb)
+                window_tensor = window_tensor.astype(voxel_dtype, copy=False)
                 seg_available = 0
                 seg_timestamp = -1
                 seg_delta = -1
@@ -942,7 +1050,7 @@ def process_single_file(
                             dtype=embedded_segmentation_dtype if embedded_segmentation_dtype is not None else np.uint8,
                         )
                 writer.add_window(
-                    voxel=voxel,
+                    voxel=window_tensor,
                     t_start_us=start_us_int,
                     t_end_us=end_us_int,
                     event_count=len(events["t"]),
@@ -961,11 +1069,19 @@ def process_single_file(
 
         writer.close()
         writer = None
+        if mp4_writer is not None:
+            mp4_writer.close()
+            mp4_writer = None
+            os.replace(tmp_mp4_path, mp4_path)
         os.replace(tmp_path, output_path)
     except Exception:
         if writer is not None:
             writer.close()
+        if mp4_writer is not None:
+            mp4_writer.close()
         cleanup_tmp_file(tmp_path=tmp_path, context=f"exception cleanup for {input_path}", strict=False)
+        if save_mp4:
+            cleanup_tmp_file(tmp_path=tmp_mp4_path, context=f"exception MP4 cleanup for {input_path}", strict=False)
         raise
     finally:
         if pbar is not None:
@@ -988,6 +1104,10 @@ def _process_file_with_retry(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    representation: str,
+    event_image_percentile: float,
+    save_mp4: bool,
+    mp4_fps: float,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -1056,6 +1176,10 @@ def _process_file_with_retry(
                 normalize=normalize,
                 output_dtype=output_dtype,
                 use_trilinear=use_trilinear,
+                representation=representation,
+                event_image_percentile=event_image_percentile,
+                save_mp4=save_mp4,
+                mp4_fps=mp4_fps,
                 activity_mode=activity_mode,
                 activity_spatial_patch_size=activity_spatial_patch_size,
                 activity_temporal_patch_size=activity_temporal_patch_size,
@@ -1120,6 +1244,10 @@ def _worker_process_file(job: dict) -> tuple[str, bool, str | None]:
         normalize=job["normalize"],
         output_dtype=job["output_dtype"],
         use_trilinear=job["use_trilinear"],
+        representation=job["representation"],
+        event_image_percentile=job["event_image_percentile"],
+        save_mp4=job["save_mp4"],
+        mp4_fps=job["mp4_fps"],
         activity_mode=job["activity_mode"],
         activity_spatial_patch_size=job["activity_spatial_patch_size"],
         activity_temporal_patch_size=job["activity_temporal_patch_size"],
@@ -1313,6 +1441,10 @@ def process_dataset_root(
     normalize: bool,
     output_dtype: str,
     use_trilinear: bool,
+    representation: str,
+    event_image_percentile: float,
+    save_mp4: bool,
+    mp4_fps: float,
     activity_mode: str,
     activity_spatial_patch_size: int,
     activity_temporal_patch_size: int,
@@ -1338,8 +1470,12 @@ def process_dataset_root(
 ):
     if int(num_processes) < 1:
         raise ValueError("num_processes must be >= 1")
+    if save_mp4 and representation != "event_image":
+        raise ValueError("save_mp4 requires representation=event_image")
     if output_name is not None and output_suffix is not None:
         raise ValueError("use either output_name or output_suffix, not both")
+    if representation not in REPRESENTATION_MODES:
+        raise ValueError(f"unsupported representation: {representation}")
     if activity_mode not in ACTIVITY_MODES:
         raise ValueError(f"unsupported activity_mode: {activity_mode}")
     if split_chunk_duration_s is not None and float(split_chunk_duration_s) <= 0:
@@ -1499,6 +1635,10 @@ def process_dataset_root(
                 "normalize": bool(normalize),
                 "output_dtype": output_dtype,
                 "use_trilinear": bool(use_trilinear),
+                "representation": str(representation),
+                "event_image_percentile": float(event_image_percentile),
+                "save_mp4": bool(save_mp4),
+                "mp4_fps": float(mp4_fps),
                 "activity_mode": str(activity_mode),
                 "activity_spatial_patch_size": int(activity_spatial_patch_size),
                 "activity_temporal_patch_size": int(activity_temporal_patch_size),
@@ -1634,7 +1774,7 @@ def process_dsec_root(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("""Build event voxel representations from DSEC events.h5 files.""")
+    parser = argparse.ArgumentParser("""Build event representations from DSEC events.h5 files.""")
     parser.add_argument("--input_path", type=Path, help="Path to input events.h5.")
     parser.add_argument("--output_path", type=Path, help="Path where output voxel .h5 will be written.")
     parser.add_argument("--dsec_root", type=Path, help="Path to DSEC root (contains train/test splits).")
@@ -1755,7 +1895,36 @@ if __name__ == "__main__":
         default=1,
         help="Nearest-neighbor spatial downsample factor (2 means 1/2 resolution).",
     )
-    parser.add_argument("--t_bins", type=int, default=10, help="Number of temporal bins for voxel representation.")
+    parser.add_argument(
+        "--representation",
+        choices=["voxel_grid", "event_image"],
+        default="voxel_grid",
+        help="Output representation. event_image stores one 3-channel red/blue image per window.",
+    )
+    parser.add_argument(
+        "--event_image_percentile",
+        type=float,
+        default=99.0,
+        help="Percentile clip used when normalizing event_image counts; ignored for voxel_grid.",
+    )
+    parser.add_argument(
+        "--save_mp4",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When representation=event_image, also save a companion MP4 beside each output H5.",
+    )
+    parser.add_argument(
+        "--mp4_fps",
+        type=float,
+        default=10.0,
+        help="FPS used for companion MP4 export when --save_mp4 is enabled.",
+    )
+    parser.add_argument(
+        "--t_bins",
+        type=int,
+        default=10,
+        help="Number of temporal bins for voxel_grid. Ignored for event_image.",
+    )
     parser.add_argument(
         "--split_polarity",
         action=argparse.BooleanOptionalAction,
@@ -1802,19 +1971,19 @@ if __name__ == "__main__":
         "--normalize",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Normalize non-zero voxel values per sample.",
+        help="Normalize non-zero voxel values per sample (voxel_grid only).",
     )
     parser.add_argument(
         "--output_dtype",
         choices=["float16", "float32"],
         default="float16",
-        help="Stored dtype for voxel tensor in output HDF5.",
+        help="Stored dtype for the output representation tensor in HDF5.",
     )
     parser.add_argument(
         "--use_trilinear",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use trilinear interpolation in voxelization (disable for nearest-bin assignment).",
+        help="Use trilinear interpolation in voxelization (voxel_grid only).",
     )
     parser.add_argument(
         "--sync_segmentation",
@@ -1883,6 +2052,10 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            representation=args.representation,
+            event_image_percentile=args.event_image_percentile,
+            save_mp4=args.save_mp4,
+            mp4_fps=args.mp4_fps,
             activity_mode=args.activity_mode,
             activity_spatial_patch_size=args.activity_spatial_patch_size,
             activity_temporal_patch_size=args.activity_temporal_patch_size,
@@ -1925,6 +2098,10 @@ if __name__ == "__main__":
             normalize=args.normalize,
             output_dtype=args.output_dtype,
             use_trilinear=args.use_trilinear,
+            representation=args.representation,
+            event_image_percentile=args.event_image_percentile,
+            save_mp4=args.save_mp4,
+            mp4_fps=args.mp4_fps,
             activity_mode=args.activity_mode,
             activity_spatial_patch_size=args.activity_spatial_patch_size,
             activity_temporal_patch_size=args.activity_temporal_patch_size,

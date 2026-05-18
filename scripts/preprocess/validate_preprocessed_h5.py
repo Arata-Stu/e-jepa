@@ -147,13 +147,13 @@ def _guess_sequence_name(*, file_path: Path, relative_file: str) -> str:
 
 def _infer_dataset_family(file_path: Path, representation: str) -> str:
     rep = str(representation).strip().lower()
-    if rep == "event_voxel_grid_m3ed":
+    if rep in {"event_voxel_grid_m3ed", "event_image_m3ed"}:
         return "m3ed"
-    if rep == "event_voxel_grid_1mpx":
+    if rep in {"event_voxel_grid_1mpx", "event_image_1mpx"}:
         return "1mpx"
-    if rep == "event_voxel_grid_eventscape":
+    if rep in {"event_voxel_grid_eventscape", "event_image_eventscape"}:
         return "eventscape"
-    if rep == "event_voxel_grid":
+    if rep in {"event_voxel_grid", "event_image"}:
         return "dsec"
 
     lower_path = str(file_path).lower()

@@ -6,6 +6,7 @@ run/
 runs/
 output/
 outputs/
+tmp/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

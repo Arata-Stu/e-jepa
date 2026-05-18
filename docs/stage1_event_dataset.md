@@ -14,7 +14,7 @@ This project now includes a stage-1 dataset path compatible with vjepa2-style tr
 Preprocessed HDF5 files with at least:
 
 - `/voxels` with shape `(N, C, H, W)` where `N` is window count.
-  (`scripts/preprocess/*` の既定では `split_polarity=True` のため通常 `C=2*t_bins`。)
+  (`scripts/preprocess/*` の既定では `representation=voxel_grid` かつ `split_polarity=True` のため通常 `C=2*t_bins`。`representation=event_image` では `C=3` の RGB イベント画像。)
 
 All preprocess outputs created by:
 
@@ -24,6 +24,10 @@ All preprocess outputs created by:
 - `scripts/preprocess/preprocess_m3ed.py`
 
 are supported.
+
+When preprocessing with `representation=event_image`, each script can also emit a companion `.mp4`
+beside the HDF5 by enabling `save_mp4=true` / `--save_mp4`. The HDF5 still stores `(N, 3, H, W)`
+RGB event images, and the MP4 stores the same windows as standard video frames.
 
 ## Dataset behavior
 
@@ -55,3 +59,13 @@ from src.masks.presets import STAGE1_EVENT_MASKS, STAGE1_IMAGE_MASKS
   - `num_blocks=2`, `spatial_scale=(0.7, 0.7)`, `aspect_ratio=(0.75, 1.5)`
 - `STAGE1_IMAGE_MASKS`:
   - `num_blocks=10`, `spatial_scale=(0.15, 0.15)`, `aspect_ratio=(0.75, 1.5)`
+
+## VJEPA2 Interop
+
+`tmp/vjepa2/src/datasets/video_dataset.py` treats `.jpg/.png/.jpeg` as still images and sends all
+other paths such as `.mp4` through `decord.VideoReader`, so exported event-image MP4s can be used
+as regular video inputs for `vjepa2_1`.
+
+For label-free retraining / pretraining style runs, the simplest manifest is a `.npy` list of MP4
+paths because `VideoDataset` assigns dummy label `0` for `.npy` entries. Classification-style
+fine-tuning later would still need a labeled `.csv`.

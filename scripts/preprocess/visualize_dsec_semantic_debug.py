@@ -29,6 +29,7 @@ class LabelDebugInfo:
     source: str
     missing_reason: str
     unique_classes: list[int]
+    label_shape: tuple[int, int] | None
 
 
 def _decode_h5_string(value: Any) -> str:
@@ -255,9 +256,48 @@ def _alpha_blend(base_rgb: np.ndarray, label_rgb: np.ndarray, valid_mask: np.nda
     base = np.asarray(base_rgb, dtype=np.float32)
     label = np.asarray(label_rgb, dtype=np.float32)
     mask = np.asarray(valid_mask, dtype=bool)
+    if base.shape != label.shape:
+        raise ValueError(f"shape mismatch for alpha blend: base={base.shape}, label={label.shape}")
+    if mask.shape != base.shape[:2]:
+        raise ValueError(f"mask shape mismatch for alpha blend: mask={mask.shape}, expected={base.shape[:2]}")
     out = base.copy()
     out[mask] = (1.0 - float(alpha)) * base[mask] + float(alpha) * label[mask]
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
+def _format_hw(shape: tuple[int, int] | None) -> str:
+    if shape is None or len(shape) != 2:
+        return "n/a"
+    return f"{int(shape[0])}x{int(shape[1])}"
+
+
+def _align_semantic_label_to_hw(
+    label: np.ndarray,
+    *,
+    target_h: int,
+    target_w: int,
+    ignore_index: int,
+) -> np.ndarray:
+    arr = np.asarray(label, dtype=np.int64)
+    if arr.ndim != 2:
+        raise ValueError(f"expected semantic label [H,W], got shape={arr.shape}")
+    if arr.shape == (int(target_h), int(target_w)):
+        return arr
+
+    src_h, src_w = int(arr.shape[0]), int(arr.shape[1])
+
+    # DSEC semantic labels are commonly shorter in height than the event frame.
+    # Preserve the original top-left alignment and pad/crop only on the bottom/right.
+    if src_w == int(target_w) or src_h == int(target_h) or (src_h <= int(target_h) and src_w <= int(target_w)):
+        out = np.full((int(target_h), int(target_w)), int(ignore_index), dtype=arr.dtype)
+        copy_h = min(src_h, int(target_h))
+        copy_w = min(src_w, int(target_w))
+        out[:copy_h, :copy_w] = arr[:copy_h, :copy_w]
+        return out
+
+    image = Image.fromarray(np.asarray(arr, dtype=np.uint8), mode="L")
+    resized = image.resize((int(target_w), int(target_h)), resample=_RESAMPLING.NEAREST)
+    return np.asarray(resized, dtype=np.int64)
 
 
 def _load_label_for_window(h5f: h5py.File, window_idx: int, ignore_index: int) -> tuple[np.ndarray | None, LabelDebugInfo]:
@@ -317,6 +357,7 @@ def _load_label_for_window(h5f: h5py.File, window_idx: int, ignore_index: int) -
         source=source,
         missing_reason=missing_reason,
         unique_classes=unique_classes,
+        label_shape=(None if label is None else (int(label.shape[0]), int(label.shape[1]))),
     )
     return label, info
 
@@ -383,8 +424,18 @@ def _render_preview(
         split_polarity=split_polarity,
         polarity_order=polarity_order,
     )
+    target_h = int(activity_rgb.shape[0])
+    target_w = int(activity_rgb.shape[1])
+    aligned_label_shape: tuple[int, int] | None = None
 
     if label is not None:
+        label = _align_semantic_label_to_hw(
+            label,
+            target_h=target_h,
+            target_w=target_w,
+            ignore_index=ignore_index,
+        )
+        aligned_label_shape = (int(label.shape[0]), int(label.shape[1]))
         label_rgb = _label_to_rgb(label, ignore_index=ignore_index)
         valid_mask = np.asarray(label, dtype=np.int64) != int(ignore_index)
         overlay_rgb = _alpha_blend(activity_rgb, label_rgb, valid_mask=valid_mask, alpha=overlay_alpha)
@@ -422,6 +473,7 @@ def _render_preview(
         f"label_source={label_info.source or 'missing'} | "
         f"relpath={_truncate_middle(label_info.relpath, 72) or 'n/a'}",
         f"classes={_format_unique_classes(label_info.unique_classes)} | "
+        f"label_shape={_format_hw(label_info.label_shape)}->{_format_hw(aligned_label_shape)} | "
         f"missing_reason={_truncate_middle(label_info.missing_reason or 'none', 72)}",
     ]
     header_text = "\n".join(header_lines)

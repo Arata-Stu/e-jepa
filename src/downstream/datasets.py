@@ -167,6 +167,33 @@ def _resize_label_to_hw(
     return resized.to(torch.float32)
 
 
+def _pad_or_crop_semantic_label_to_hw(
+    label: torch.Tensor,
+    *,
+    target_h: int,
+    target_w: int,
+    pad_value: int,
+) -> torch.Tensor:
+    if label.ndim != 2:
+        raise ValueError(f"expected semantic label [H,W], got shape={tuple(label.shape)}")
+    if int(label.shape[-2]) == int(target_h) and int(label.shape[-1]) == int(target_w):
+        return label.to(torch.int64)
+
+    # DSEC semantic labels can be shorter than the event frame height (for example 440 vs 480).
+    # Preserve the native top-left alignment and only pad/crop on the bottom/right.
+    out = torch.full(
+        (int(target_h), int(target_w)),
+        int(pad_value),
+        dtype=torch.int64,
+        device=label.device,
+    )
+    src = label.to(torch.int64)
+    copy_h = min(int(src.shape[-2]), int(target_h))
+    copy_w = min(int(src.shape[-1]), int(target_w))
+    out[:copy_h, :copy_w] = src[:copy_h, :copy_w]
+    return out
+
+
 def _build_centered_clip_indices(
     *,
     center_idx: int,
@@ -462,7 +489,12 @@ class EventDenseTaskDataset(Dataset):
             label_np = np.asarray(pre_h5[meta.embedded_segmentation_dataset_path][int(center_window)])
             label_np = _squeeze_to_hw(label_np, target="semantic")
             label = torch.from_numpy(label_np.astype(np.int64, copy=False))
-            label = _resize_label_to_hw(label, target_h=h, target_w=w, target="semantic")
+            label = _pad_or_crop_semantic_label_to_hw(
+                label,
+                target_h=h,
+                target_w=w,
+                pad_value=self.ignore_index,
+            )
             return {
                 "input": clip_cthw.to(torch.float32),
                 "target": label.to(torch.int64),

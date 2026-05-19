@@ -1193,6 +1193,7 @@ def _process_file_with_retry(
                 progress_interval_s=float(split_progress_interval_s),
                 log_chunk_progress=bool(split_log_chunk_progress),
                 log_dataset_progress=bool(split_log_dataset_progress),
+                delete_source_companion_mp4=bool(split_delete_source_after_success),
             )
             if bool(split_delete_source_after_success):
                 output_path.unlink(missing_ok=True)
@@ -1246,6 +1247,7 @@ def _process_file_with_retry(
                     progress_interval_s=float(split_progress_interval_s),
                     log_chunk_progress=bool(split_log_chunk_progress),
                     log_dataset_progress=bool(split_log_dataset_progress),
+                    delete_source_companion_mp4=bool(split_delete_source_after_success),
                 )
                 if bool(split_delete_source_after_success):
                     output_path.unlink(missing_ok=True)

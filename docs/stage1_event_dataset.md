@@ -29,6 +29,8 @@ When preprocessing with `representation=event_image`, each script can also emit 
 beside the HDF5 by enabling `save_mp4=true` / `--save_mp4`. The HDF5 still stores `(N, 3, H, W)`
 RGB event images, and the MP4 stores the same windows as standard video frames. If `mp4_fps` is
 omitted, the exporter infers FPS from timestamp spacing between generated windows/anchors.
+When 20-second H5 chunk split is enabled, companion MP4s are split alongside the H5 files using
+the same `_partXXXX.mp4` suffix convention.
 
 Hydra presets for this mode are available as:
 
@@ -36,6 +38,18 @@ Hydra presets for this mode are available as:
 - `dataset=dsec_semantic_event_image`
 - `dataset=m3ed_semantic_event_image`
 - `dataset=1mpx_event_image`
+
+## V-JEPA2.1 Local Config
+
+A minimal local video-only V-JEPA2.1 scratch config is available at:
+
+- `tmp/vjepa2/configs/train_2_1/local/event_video_vitb16_256px_16f_scratch.yaml`
+
+Typical workflow:
+
+1. Build a `.npy` manifest containing absolute paths to event-video `.mp4` files.
+2. Override `data.datasets[0]` and `folder` in the config or on the command line.
+3. Launch `tmp/vjepa2/app/main.py` on one or more GPUs.
 
 ## Dataset behavior
 
@@ -74,6 +88,9 @@ from src.masks.presets import STAGE1_EVENT_MASKS, STAGE1_IMAGE_MASKS
 other paths such as `.mp4` through `decord.VideoReader`, so exported event-image MP4s can be used
 as regular video inputs for `vjepa2_1`.
 
-For label-free retraining / pretraining style runs, the simplest manifest is a `.npy` list of MP4
-paths because `VideoDataset` assigns dummy label `0` for `.npy` entries. Classification-style
-fine-tuning later would still need a labeled `.csv`.
+For label-free retraining / pretraining style runs, the simplest manifest is either:
+
+- a `.npy` list of MP4 paths, because `VideoDataset` assigns dummy label `0` for `.npy` entries
+- or a shell-generated `.csv` with lines like `/abs/path/video.mp4 0`
+
+Classification-style fine-tuning later would still need a labeled `.csv`.

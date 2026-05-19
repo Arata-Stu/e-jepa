@@ -23,7 +23,7 @@ def init_data(
     dataset_fpcs=None,
     frame_sample_rate=None,
     duration=None,  # Kept for compatibility.
-    fps=None,  # Kept for compatibility.
+    fps=None,
     num_clips=1,
     random_clip_sampling=True,
     allow_clip_overlap=False,
@@ -58,6 +58,7 @@ def init_data(
             frames_per_clip=frames_per_clip,
             dataset_fpcs=dataset_fpcs,
             frame_step=frame_step,
+            fps=fps,
             num_clips=num_clips,
             random_clip_sampling=random_clip_sampling,
             allow_clip_overlap=allow_clip_overlap,

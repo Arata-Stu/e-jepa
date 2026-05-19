@@ -47,6 +47,8 @@ Preset file:
 
 `*_event_image` preset は `representation=event_image` と `save_mp4=true` を含みます。event image は
 window 全体を 1 枚の RGB 画像に積算するので、preset 名は `t10` ではなく `event_image` を軸にしています。
+さらに `split_chunk_duration_s` が有効な preset では、companion `mp4` も H5 chunk と同じ suffix
+（例: `_part0000.mp4`）で自動 split されます。
 
 ## DSEC
 
@@ -270,6 +272,7 @@ python3 scripts/preprocess/run_preprocess.py dataset=1mpx_event_image
 
 `dsec_semantic_event_image` は既定で `dataset.segmentation_tolerance_us=5000` を含みます。  
 `mp4_fps` は省略時に timestamp 間隔から自動推定されます。
+既に split H5 が存在する場合でも、source H5 と companion mp4 が残っていれば rerun で不足している split mp4 を補完できます。
 
 ## 解析コマンド（voxel H5）
 

@@ -13,6 +13,8 @@ crop_size: [480, 640]
 patch_size: 16
 # Temporal patch size used by ViT patch embedding.
 tubelet_size: 2
+# Target clip FPS. When set, clips are subsampled from H5 anchor timestamps in
+# a vjepa-style manner. If null, `frame_sample_rate` is used instead.
 fps: 4
 num_workers: 8
 persistent_workers: true
@@ -21,7 +23,7 @@ prefetch_factor: null
 # Max opened HDF5 files per dataloader worker (LRU cache).
 max_open_h5_files: 32
 pin_mem: true
-# Temporal subsampling stride before fpc fitting.
+# Temporal subsampling stride before fpc fitting. Used when `fps` is null.
 frame_sample_rate: 1
 # Number of clips sampled from one sample each iteration.
 num_clips: 1

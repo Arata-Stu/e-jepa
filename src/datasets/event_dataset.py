@@ -161,6 +161,7 @@ class EventVideoDataset(torch.utils.data.Dataset):
         frames_per_clip: int = 8,
         dataset_fpcs: Sequence[int] | None = None,
         frame_step: int = 1,
+        fps=None,
         num_clips: int = 1,
         transform: Callable | None = None,
         shared_transform: Callable | None = None,
@@ -206,6 +207,15 @@ class EventVideoDataset(torch.utils.data.Dataset):
             self.dataset_fpcs = [int(v) for v in dataset_fpcs]
         if any(fpc <= 0 for fpc in self.dataset_fpcs):
             raise ValueError("All dataset_fpcs must be > 0")
+
+        self.target_fps_per_dataset = _expand_optional_per_dataset(
+            fps,
+            num_datasets=len(self.data_paths),
+            field_name="fps",
+        )
+        for resolved_fps in self.target_fps_per_dataset:
+            if resolved_fps is not None and float(resolved_fps) <= 0.0:
+                raise ValueError("fps values must be > 0 when provided")
 
         self.activity_filter_min_clip_mean_active_pixel_ratio = _expand_optional_per_dataset(
             activity_filter_min_clip_mean_active_pixel_ratio,
@@ -264,11 +274,15 @@ class EventVideoDataset(torch.utils.data.Dataset):
         # Worker-local lazy cache. We intentionally avoid sharing handles.
         self._h5_cache: OrderedDict[str, h5py.File] = OrderedDict()
         self._activity_cache: OrderedDict[str, tuple[np.ndarray | None, np.ndarray | None]] = OrderedDict()
-        self._valid_clip_start_cache: dict[tuple[str, int, int, int, int], np.ndarray] = {}
+        self._timestamp_cache: OrderedDict[str, np.ndarray | None] = OrderedDict()
+        self._valid_clip_start_cache: dict[tuple[str, int, int, int, int, int], np.ndarray] = {}
+        self._sampling_step_cache: dict[tuple[str, int, int], int] = {}
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_h5_cache"] = OrderedDict()
+        state["_timestamp_cache"] = OrderedDict()
+        state["_sampling_step_cache"] = {}
         return state
 
     def __del__(self):
@@ -283,9 +297,15 @@ class EventVideoDataset(torch.utils.data.Dataset):
         activity_cache = getattr(self, "_activity_cache", None)
         if isinstance(activity_cache, dict):
             activity_cache.clear()
+        timestamp_cache = getattr(self, "_timestamp_cache", None)
+        if isinstance(timestamp_cache, dict):
+            timestamp_cache.clear()
         valid_cache = getattr(self, "_valid_clip_start_cache", None)
         if isinstance(valid_cache, dict):
             valid_cache.clear()
+        sampling_step_cache = getattr(self, "_sampling_step_cache", None)
+        if isinstance(sampling_step_cache, dict):
+            sampling_step_cache.clear()
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -319,6 +339,87 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 self.activity_filter_min_clip_active_window_ratio[dataset_idx] is not None,
             )
         )
+
+    def _get_anchor_timestamps_us(
+        self,
+        sample_path: str,
+        total_windows: int,
+    ) -> np.ndarray | None:
+        if sample_path in self._timestamp_cache:
+            cached = self._timestamp_cache[sample_path]
+            self._timestamp_cache.move_to_end(sample_path, last=True)
+            return cached
+
+        h5f = self._get_h5(sample_path)
+        timestamps = None
+        for key in ("anchor_timestamp_us", "anchor_rel_timestamp_us"):
+            if key in h5f:
+                arr = np.asarray(h5f[key], dtype=np.int64).reshape(-1)
+                if arr.size > 0:
+                    timestamps = arr
+                    break
+
+        if timestamps is None:
+            stride_us = int(h5f.attrs.get("stride_time_us", 0) or 0)
+            if stride_us <= 0:
+                stride_us = int(h5f.attrs.get("accum_time_us", 0) or 0)
+            if stride_us > 0 and total_windows > 0:
+                timestamps = np.arange(total_windows, dtype=np.int64) * np.int64(stride_us)
+
+        if timestamps is not None:
+            if timestamps.shape[0] < total_windows:
+                timestamps = None
+            else:
+                timestamps = timestamps[:total_windows].astype(np.int64, copy=False)
+                if timestamps.size > 1 and np.any(np.diff(timestamps) < 0):
+                    timestamps = None
+
+        self._timestamp_cache[sample_path] = timestamps
+        self._timestamp_cache.move_to_end(sample_path, last=True)
+        while len(self._timestamp_cache) > self.max_open_h5_files:
+            self._timestamp_cache.popitem(last=False)
+        return timestamps
+
+    def _resolve_sampling_step(
+        self,
+        *,
+        sample_path: str,
+        dataset_idx: int,
+        total_windows: int,
+    ) -> int:
+        target_fps = self.target_fps_per_dataset[dataset_idx]
+        if target_fps is None:
+            return self.frame_step
+
+        cache_key = (sample_path, int(dataset_idx), int(total_windows))
+        cached = self._sampling_step_cache.get(cache_key)
+        if cached is not None:
+            return int(cached)
+
+        median_delta_us = None
+        timestamps = self._get_anchor_timestamps_us(sample_path, total_windows)
+        if timestamps is not None and timestamps.size >= 2:
+            deltas_us = np.diff(timestamps)
+            deltas_us = deltas_us[deltas_us > 0]
+            if deltas_us.size > 0:
+                median_delta_us = float(np.median(deltas_us))
+
+        if median_delta_us is None:
+            h5f = self._get_h5(sample_path)
+            stride_us = int(h5f.attrs.get("stride_time_us", 0) or 0)
+            if stride_us <= 0:
+                stride_us = int(h5f.attrs.get("accum_time_us", 0) or 0)
+            if stride_us > 0:
+                median_delta_us = float(stride_us)
+
+        if median_delta_us is None or median_delta_us <= 0.0:
+            sampling_step = int(self.frame_step)
+        else:
+            source_fps = int(np.ceil(1_000_000.0 / median_delta_us))
+            sampling_step = max(int(source_fps // float(target_fps)), 1)
+
+        self._sampling_step_cache[cache_key] = int(sampling_step)
+        return int(sampling_step)
 
     def _get_activity_arrays(self, sample_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
         cached = self._activity_cache.get(sample_path)
@@ -367,24 +468,30 @@ class EventVideoDataset(torch.utils.data.Dataset):
             anchor = min(max(segment_start, 0), total_windows - 1)
             return np.full((fpc,), anchor, dtype=np.int64)
 
+        sampling_step = self._resolve_sampling_step(
+            sample_path=sample_path,
+            dataset_idx=dataset_idx,
+            total_windows=total_windows,
+        )
+
         def _candidate_local_starts() -> np.ndarray:
-            clip_span = max(1, fpc * self.frame_step)
+            clip_span = max(1, fpc * sampling_step)
             if segment_length > clip_span:
                 max_local_start = segment_length - clip_span
                 return np.arange(0, max_local_start + 1, dtype=np.int64)
             return np.array([0], dtype=np.int64)
 
         def _indices_from_local_start(local_start: int) -> np.ndarray:
-            clip_span = max(1, fpc * self.frame_step)
+            clip_span = max(1, fpc * sampling_step)
             if segment_length > clip_span:
                 local_indices = np.arange(
                     int(local_start),
                     int(local_start) + clip_span,
-                    self.frame_step,
+                    sampling_step,
                     dtype=np.int64,
                 )
             else:
-                local_indices = np.arange(0, segment_length, self.frame_step, dtype=np.int64)
+                local_indices = np.arange(0, segment_length, sampling_step, dtype=np.int64)
             if local_indices.size == 0:
                 local_indices = np.array([0], dtype=np.int64)
             local_indices = self._fit_indices_length(
@@ -430,7 +537,14 @@ class EventVideoDataset(torch.utils.data.Dataset):
 
         candidate_local_starts = _candidate_local_starts()
         if self._dataset_activity_filter_enabled(dataset_idx):
-            cache_key = (sample_path, int(dataset_idx), int(segment_start), int(segment_length), int(fpc))
+            cache_key = (
+                sample_path,
+                int(dataset_idx),
+                int(segment_start),
+                int(segment_length),
+                int(fpc),
+                int(sampling_step),
+            )
             valid_local_starts = self._valid_clip_start_cache.get(cache_key)
             if valid_local_starts is None:
                 valid = []
@@ -448,7 +562,7 @@ class EventVideoDataset(torch.utils.data.Dataset):
                 chosen_local_start = int(valid_local_starts[valid_local_starts.size // 2])
             return _indices_from_local_start(chosen_local_start)
 
-        clip_span = max(1, fpc * self.frame_step)
+        clip_span = max(1, fpc * sampling_step)
         if segment_length > clip_span:
             max_local_start = segment_length - clip_span
             if self.random_clip_sampling:
@@ -458,11 +572,11 @@ class EventVideoDataset(torch.utils.data.Dataset):
             local_indices = np.arange(
                 local_start,
                 local_start + clip_span,
-                self.frame_step,
+                sampling_step,
                 dtype=np.int64,
             )
         else:
-            local_indices = np.arange(0, segment_length, self.frame_step, dtype=np.int64)
+            local_indices = np.arange(0, segment_length, sampling_step, dtype=np.int64)
 
         if local_indices.size == 0:
             local_indices = np.array([0], dtype=np.int64)
@@ -606,6 +720,7 @@ def make_eventdataset(
     frames_per_clip: int = 8,
     dataset_fpcs: Sequence[int] | None = None,
     frame_step: int = 1,
+    fps=None,
     num_clips: int = 1,
     random_clip_sampling: bool = True,
     allow_clip_overlap: bool = False,
@@ -636,6 +751,7 @@ def make_eventdataset(
         frames_per_clip=frames_per_clip,
         dataset_fpcs=dataset_fpcs,
         frame_step=frame_step,
+        fps=fps,
         num_clips=num_clips,
         transform=transform,
         shared_transform=shared_transform,

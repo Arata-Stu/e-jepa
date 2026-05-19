@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -18,11 +19,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.preprocess.utils import cleanup_tmp_file, get_h5_compression_flags, tmp_output_path
+from scripts.preprocess.utils import (
+    RgbMp4Writer,
+    cleanup_tmp_file,
+    get_h5_compression_flags,
+    tmp_media_output_path,
+    tmp_output_path,
+)
 
 
 H5_COMPRESSION_FLAGS = get_h5_compression_flags()
 _PROGRESS_QUEUE = None
+
+
+@dataclass(frozen=True)
+class CompanionMp4Info:
+    source_path: Path
+    fps: float
+    fps_source: str
 
 
 def _is_voxel_h5(path: Path) -> bool:
@@ -157,6 +171,153 @@ def _load_h5_attr_str(h5f: h5py.File, key: str, default: str = "") -> str:
     if key not in h5f.attrs:
         return default
     return _decode_h5_string(h5f.attrs[key]).strip()
+
+
+def _safe_attr(attrs: h5py.AttributeManager, key: str, default=None):
+    if key not in attrs:
+        return default
+    value = attrs[key]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _resolve_companion_mp4_info(src_h5: h5py.File, input_path: Path) -> CompanionMp4Info | None:
+    has_companion = bool(int(_safe_attr(src_h5.attrs, "has_companion_mp4", 0) or 0))
+    relpath = _load_h5_attr_str(src_h5, "companion_mp4_relpath", default="")
+    if not has_companion and len(relpath) == 0:
+        return None
+
+    source_path = Path(relpath) if len(relpath) > 0 else input_path.with_suffix(".mp4")
+    if not source_path.is_absolute():
+        source_path = input_path.parent / source_path
+    if not source_path.exists():
+        raise FileNotFoundError(f"companion mp4 not found for {input_path}: {source_path}")
+
+    fps = float(_safe_attr(src_h5.attrs, "companion_mp4_fps", 0.0) or 0.0)
+    fps_source = _load_h5_attr_str(src_h5, "companion_mp4_fps_source", default="")
+    return CompanionMp4Info(
+        source_path=source_path,
+        fps=fps,
+        fps_source=fps_source,
+    )
+
+
+def _read_video_fps(source_path: Path) -> float:
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError("OpenCV is required for companion MP4 splitting.") from exc
+
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"failed to open companion mp4 for reading: {source_path}")
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+    finally:
+        cap.release()
+    return fps
+
+
+def _resolved_companion_mp4_fps(info: CompanionMp4Info) -> tuple[float, str]:
+    if float(info.fps) > 0.0:
+        return float(info.fps), (info.fps_source or "source_h5_attr")
+    detected_fps = _read_video_fps(info.source_path)
+    if detected_fps > 0.0:
+        return float(detected_fps), "source_mp4_detected"
+    raise RuntimeError(f"could not determine FPS for companion mp4: {info.source_path}")
+
+
+def _chunk_h5_has_matching_companion(out_h5_path: Path, out_mp4_path: Path) -> bool:
+    if not out_h5_path.exists():
+        return False
+    try:
+        with h5py.File(str(out_h5_path), "r") as h5f:
+            has_companion = bool(int(_safe_attr(h5f.attrs, "has_companion_mp4", 0) or 0))
+            relpath = _load_h5_attr_str(h5f, "companion_mp4_relpath", default="")
+            return has_companion and relpath == out_mp4_path.name
+    except Exception:
+        return False
+
+
+def _update_chunk_companion_mp4_attrs(
+    *,
+    out_h5_path: Path,
+    out_mp4_path: Path,
+    fps: float,
+    fps_source: str,
+) -> None:
+    with h5py.File(str(out_h5_path), "r+") as out_h5:
+        out_h5.attrs["has_companion_mp4"] = 1
+        out_h5.attrs["companion_mp4_relpath"] = out_mp4_path.name
+        out_h5.attrs["companion_mp4_fps"] = float(fps)
+        out_h5.attrs["companion_mp4_fps_source"] = str(fps_source)
+
+
+def _write_chunk_companion_mp4(
+    *,
+    source_mp4_path: Path,
+    out_mp4_path: Path,
+    src_start: int,
+    src_end: int,
+    fps: float,
+) -> None:
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError("OpenCV is required for companion MP4 splitting.") from exc
+
+    out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_mp4_path = tmp_media_output_path(out_mp4_path, ".tmp")
+    cleanup_tmp_file(tmp_mp4_path, context=f"start chunk MP4 write {out_mp4_path}", strict=True)
+
+    cap = cv2.VideoCapture(str(source_mp4_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"failed to open companion mp4 for reading: {source_mp4_path}")
+
+    writer: RgbMp4Writer | None = None
+    frames_written = 0
+    expected_frames = int(src_end - src_start)
+    try:
+        if int(src_start) > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(src_start))
+
+        for _ in range(expected_frames):
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                raise RuntimeError(
+                    f"unexpected end of companion mp4 while reading "
+                    f"frames [{src_start}:{src_end}) from {source_mp4_path}"
+                )
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if writer is None:
+                writer = RgbMp4Writer(
+                    tmp_mp4_path,
+                    fps=float(fps),
+                    width=int(frame_rgb.shape[1]),
+                    height=int(frame_rgb.shape[0]),
+                )
+            writer.write_rgb(frame_rgb)
+            frames_written += 1
+
+        if frames_written != expected_frames:
+            raise RuntimeError(
+                f"chunk mp4 frame count mismatch for {out_mp4_path}: "
+                f"expected {expected_frames}, wrote {frames_written}"
+            )
+    except Exception:
+        if writer is not None:
+            writer.close()
+        cleanup_tmp_file(tmp_mp4_path, context=f"exception chunk MP4 cleanup {out_mp4_path}", strict=False)
+        raise
+    finally:
+        cap.release()
+
+    assert writer is not None
+    writer.close()
+    os.replace(tmp_mp4_path, out_mp4_path)
 
 
 def _progress_write(message: str) -> None:
@@ -509,10 +670,12 @@ def _process_one_file(
     progress_interval_s: float,
     log_chunk_progress: bool,
     log_dataset_progress: bool,
+    delete_source_companion_mp4: bool,
 ) -> tuple[str, int, int]:
     with h5py.File(str(input_path), "r") as h5f:
         n_samples = int(h5f["voxels"].shape[0])
         anchors = _anchor_times_us(h5f=h5f, n_samples=n_samples)
+        companion_mp4_info = _resolve_companion_mp4_info(h5f, input_path)
 
     chunk_duration_us = int(round(float(chunk_duration_s) * 1e6))
     ranges = _contiguous_chunk_ranges(anchors_us=anchors, chunk_duration_us=chunk_duration_us)
@@ -520,31 +683,74 @@ def _process_one_file(
         ranges = [(s, e) for (s, e) in ranges if (e - s) >= int(min_windows_per_chunk)]
 
     done = 0
+    companion_fps: float | None = None
+    companion_fps_source = ""
+    if companion_mp4_info is not None:
+        companion_fps, companion_fps_source = _resolved_companion_mp4_fps(companion_mp4_info)
+
     for chunk_idx, (src_start, src_end) in enumerate(ranges):
         out_name = f"{output_base_path.stem}_part{chunk_idx:0{int(chunk_index_pad)}d}{output_base_path.suffix}"
         out_path = output_base_path.with_name(out_name)
+        out_mp4_path = out_path.with_suffix(".mp4")
 
-        if out_path.exists():
-            if overwrite:
-                out_path.unlink()
-            else:
-                continue
+        need_h5 = bool(overwrite) or not out_path.exists()
+        need_mp4 = False
+        need_attr_update = False
+        if companion_mp4_info is not None:
+            need_mp4 = bool(overwrite) or not out_mp4_path.exists()
+            need_attr_update = (not need_mp4) and (not _chunk_h5_has_matching_companion(out_path, out_mp4_path))
 
-        _write_chunk_file(
-            src_h5_path=input_path,
-            out_h5_path=out_path,
-            src_start=src_start,
-            src_end=src_end,
-            copy_batch_size=copy_batch_size,
-            chunk_index=chunk_idx,
-            total_chunks=len(ranges),
-            chunk_duration_s=float(chunk_duration_s),
-            metadata_mode=metadata_mode,
-            progress_interval_s=float(progress_interval_s),
-            log_chunk_progress=bool(log_chunk_progress),
-            log_dataset_progress=bool(log_dataset_progress),
-        )
-        done += 1
+        if not need_h5 and not need_mp4 and not need_attr_update:
+            continue
+
+        if bool(overwrite):
+            out_path.unlink(missing_ok=True)
+            out_mp4_path.unlink(missing_ok=True)
+
+        try:
+            if need_h5:
+                _write_chunk_file(
+                    src_h5_path=input_path,
+                    out_h5_path=out_path,
+                    src_start=src_start,
+                    src_end=src_end,
+                    copy_batch_size=copy_batch_size,
+                    chunk_index=chunk_idx,
+                    total_chunks=len(ranges),
+                    chunk_duration_s=float(chunk_duration_s),
+                    metadata_mode=metadata_mode,
+                    progress_interval_s=float(progress_interval_s),
+                    log_chunk_progress=bool(log_chunk_progress),
+                    log_dataset_progress=bool(log_dataset_progress),
+                )
+                done += 1
+            if companion_mp4_info is not None:
+                if need_mp4:
+                    assert companion_fps is not None
+                    _write_chunk_companion_mp4(
+                        source_mp4_path=companion_mp4_info.source_path,
+                        out_mp4_path=out_mp4_path,
+                        src_start=src_start,
+                        src_end=src_end,
+                        fps=float(companion_fps),
+                    )
+                if need_h5 or need_mp4 or need_attr_update:
+                    assert companion_fps is not None
+                    _update_chunk_companion_mp4_attrs(
+                        out_h5_path=out_path,
+                        out_mp4_path=out_mp4_path,
+                        fps=float(companion_fps),
+                        fps_source=str(companion_fps_source),
+                    )
+        except Exception:
+            if need_h5:
+                out_path.unlink(missing_ok=True)
+            if need_mp4:
+                out_mp4_path.unlink(missing_ok=True)
+            raise
+
+    if bool(delete_source_companion_mp4) and companion_mp4_info is not None:
+        companion_mp4_info.source_path.unlink(missing_ok=True)
 
     return str(input_path), int(n_samples), int(done)
 
@@ -562,6 +768,7 @@ def split_voxel_h5_file(
     progress_interval_s: float = 0.0,
     log_chunk_progress: bool = False,
     log_dataset_progress: bool = False,
+    delete_source_companion_mp4: bool = False,
 ) -> tuple[int, int]:
     _, n_samples, n_written = _process_one_file(
         input_path=input_path,
@@ -575,6 +782,7 @@ def split_voxel_h5_file(
         progress_interval_s=float(progress_interval_s),
         log_chunk_progress=bool(log_chunk_progress),
         log_dataset_progress=bool(log_dataset_progress),
+        delete_source_companion_mp4=bool(delete_source_companion_mp4),
     )
     return int(n_samples), int(n_written)
 
@@ -595,6 +803,7 @@ def _worker(job: dict) -> tuple[str, bool, str | None, int, int]:
             progress_interval_s=float(job["progress_interval_s"]),
             log_chunk_progress=bool(job["log_chunk_progress"]),
             log_dataset_progress=bool(job["log_dataset_progress"]),
+            delete_source_companion_mp4=bool(job.get("delete_source_companion_mp4", False)),
         )
         return file_path, True, None, n_samples, n_written
     except Exception as exc:
@@ -652,6 +861,11 @@ def main() -> None:
         default=False,
         help="Print dataset-level start/end logs inside each chunk (useful for crash localization).",
     )
+    parser.add_argument(
+        "--delete_source_companion_mp4",
+        action="store_true",
+        help="After successful split, also delete the source companion MP4 when one is declared in the H5.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing split files.")
     parser.add_argument("--num_processes", type=int, default=1, help="Parallel workers.")
     args = parser.parse_args()
@@ -698,6 +912,7 @@ def main() -> None:
                 "progress_interval_s": float(args.progress_interval_s),
                 "log_chunk_progress": bool(args.log_chunk_progress),
                 "log_dataset_progress": bool(args.log_dataset_progress),
+                "delete_source_companion_mp4": bool(args.delete_source_companion_mp4),
             }
         )
 

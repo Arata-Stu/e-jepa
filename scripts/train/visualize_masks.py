@@ -385,6 +385,7 @@ def _build_dataset(
         frames_per_clip=int(max(dataset_fpcs)),
         dataset_fpcs=dataset_fpcs,
         frame_step=int(cfg_data.get("frame_sample_rate", 1)),
+        fps=cfg_data.get("fps", None),
         num_clips=int(cfg_data.get("num_clips", 1)),
         transform=transform,
         shared_transform=None,
@@ -702,6 +703,8 @@ def main() -> None:
         f"patch_size={patch_size}",
         f"tubelet_size={tubelet_size}",
         f"dataset_fpcs={dataset_fpcs}",
+        f"fps={cfg_data.get('fps', None)}",
+        f"frame_sample_rate={cfg_data.get('frame_sample_rate', 1)}",
         "",
     ]
     written_images: list[Path] = []

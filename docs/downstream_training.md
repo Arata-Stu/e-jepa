@@ -54,6 +54,32 @@ python3 scripts/downstream/run_downstream.py \
   model.freeze_encoder=true
 ```
 
+## Validation visualization
+
+After training, you can load the saved downstream checkpoint and render validation examples as PNGs:
+
+```bash
+python3 scripts/downstream/visualize_val.py \
+  --run-dir outputs/downstream_dsec_sem/2026-05-21/12-34-56 \
+  --checkpoint-tag best \
+  --num-samples 12
+```
+
+Useful options:
+
+- `--checkpoint /path/to/custom_downstream.pth.tar`
+- `--sample-indices 0 10 42`
+- `--split train` (default is `val`)
+- `--output-dir /path/to/output_dir`
+
+Outputs:
+
+- `sample_*.png`: per-sample activity / target / prediction visualization
+- `contact_sheet.png`: grid view of all rendered samples
+- `manifest.csv`: sample index, file path, window index, and per-sample metrics
+
+The script reads `<run-dir>/params-downstream-resolved.yaml`, so you do not need to repeat the original Hydra overrides.
+
 ## Notes
 
 - Input is voxel clips sampled around each anchor window (`task.clip_num_frames`, `task.clip_frame_stride`).

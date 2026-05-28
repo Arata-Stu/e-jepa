@@ -18,6 +18,8 @@ ema: [0.99925, 0.99925]
 use_radamw: false
 betas: [0.9, 0.999]
 eps: 1.0e-8
+# Optional gradient clipping. null keeps the original behavior.
+clip_grad: null
 # Optional loss outlier guard (off by default).
 loss_reg_std_mult: null
 loss_reg_num_tracking_steps: 300

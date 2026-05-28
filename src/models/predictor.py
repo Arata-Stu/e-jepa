@@ -295,13 +295,21 @@ class VisionTransformerPredictor(nn.Module):
             else:
                 x += self.video_mod_embed.repeat(B, 1, 1)
 
+        rope_grid_kwargs = {
+            "H_patches": self.grid_height,
+            "W_patches": self.grid_width,
+        }
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
                 x, attn = torch.utils.checkpoint.checkpoint(
-                    blk, x, masks, use_reentrant=False
+                    blk,
+                    x,
+                    masks,
+                    use_reentrant=False,
+                    **rope_grid_kwargs,
                 )
             else:
-                x, attn = blk(x, mask=masks)
+                x, attn = blk(x, mask=masks, **rope_grid_kwargs)
         x = self.predictor_norm(x)
 
         if not self.return_all_tokens:

@@ -377,6 +377,11 @@ def main(args, resume_preempt: bool = False):
     use_radamw = bool(cfgs_opt.get("use_radamw", False))
     betas = tuple(float(v) for v in cfgs_opt.get("betas", [0.9, 0.999]))
     eps = float(cfgs_opt.get("eps", 1e-8))
+    clip_grad = cfgs_opt.get("clip_grad", None)
+    if clip_grad is not None:
+        clip_grad = float(clip_grad)
+        if clip_grad <= 0.0:
+            clip_grad = None
 
     loss_reg_std_mult = cfgs_opt.get("loss_reg_std_mult", None)
     if loss_reg_std_mult is not None:
@@ -903,10 +908,30 @@ def main(args, resume_preempt: bool = False):
                     if mixed_precision:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
+                        if clip_grad is not None:
+                            torch.nn.utils.clip_grad_norm_(
+                                (
+                                    p
+                                    for group in optimizer.param_groups
+                                    for p in group["params"]
+                                    if p.grad is not None
+                                ),
+                                clip_grad,
+                            )
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
+                        if clip_grad is not None:
+                            torch.nn.utils.clip_grad_norm_(
+                                (
+                                    p
+                                    for group in optimizer.param_groups
+                                    for p in group["params"]
+                                    if p.grad is not None
+                                ),
+                                clip_grad,
+                            )
                         optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 

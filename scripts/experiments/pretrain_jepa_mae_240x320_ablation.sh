@@ -17,6 +17,13 @@ MAE_FOLDER="${MAE_FOLDER:-outputs/stage1_mae_1gpu_mix_2ch_240x320_w015_070_015}"
 RUN_JEPA="${RUN_JEPA:-1}"
 RUN_MAE="${RUN_MAE:-1}"
 
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-5000}"
+PRETRAIN_IPE_SCALE="${PRETRAIN_IPE_SCALE:-1.25}"
+PRETRAIN_START_LR="${PRETRAIN_START_LR:-1.0e-6}"
+PRETRAIN_LR="${PRETRAIN_LR:-1.0e-4}"
+PRETRAIN_FINAL_LR="${PRETRAIN_FINAL_LR:-1.0e-6}"
+PRETRAIN_WARMUP="${PRETRAIN_WARMUP:-40}"
+
 COMMON_DATA_ARGS=(
   "data.datasets=${DATASETS}"
   "data.dataset_fpcs=${DATASET_FPCS}"
@@ -31,12 +38,12 @@ COMMON_DATA_ARGS=(
 )
 
 COMMON_OPT_ARGS=(
-  "optimization.epochs=1000"
-  "optimization.ipe_scale=1.25"
-  "optimization.start_lr=1.0e-6"
-  "optimization.lr=1.0e-4"
-  "optimization.final_lr=1.0e-6"
-  "optimization.warmup=40"
+  "optimization.epochs=${PRETRAIN_EPOCHS}"
+  "optimization.ipe_scale=${PRETRAIN_IPE_SCALE}"
+  "optimization.start_lr=${PRETRAIN_START_LR}"
+  "optimization.lr=${PRETRAIN_LR}"
+  "optimization.final_lr=${PRETRAIN_FINAL_LR}"
+  "optimization.warmup=${PRETRAIN_WARMUP}"
   "optimization.clip_grad=1.0"
   "meta.use_tqdm=true"
 )

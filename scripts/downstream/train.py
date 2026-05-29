@@ -323,6 +323,22 @@ def _semantic_metrics_from_confusion(conf: torch.Tensor) -> tuple[float, float]:
     return pix_acc, miou
 
 
+def _resize_logits_to_target(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    target_hw = tuple(int(v) for v in target.shape[-2:])
+    if tuple(int(v) for v in logits.shape[-2:]) == target_hw:
+        return logits
+    mode = str(mode).lower()
+    kwargs = {"size": target_hw, "mode": mode}
+    if mode in {"bilinear", "bicubic"}:
+        kwargs["align_corners"] = False
+    return F.interpolate(logits.float(), **kwargs)
+
+
 def _depth_metrics_reduce(
     abs_err_sum: torch.Tensor,
     sq_err_sum: torch.Tensor,
@@ -439,6 +455,9 @@ def main(args: dict):
         ignore_index=int(cfg_task.get("ignore_index", 255)),
         depth_scale=float(cfg_task.get("depth_scale", 1.0)),
         require_labels=bool(cfg_task.get("require_labels", True)),
+        input_size=cfg_task.get("input_size", None),
+        input_resize_mode=str(cfg_task.get("input_resize_mode", "bilinear")),
+        return_eval_target=False,
     )
     val_dataset = EventDenseTaskDataset(
         roots=val_roots,
@@ -451,6 +470,9 @@ def main(args: dict):
         ignore_index=int(cfg_task.get("ignore_index", 255)),
         depth_scale=float(cfg_task.get("depth_scale", 1.0)),
         require_labels=bool(cfg_task.get("require_labels", True)),
+        input_size=cfg_task.get("input_size", None),
+        input_resize_mode=str(cfg_task.get("input_resize_mode", "bilinear")),
+        return_eval_target=bool(cfg_task.get("eval_original_resolution", True)),
     )
 
     if _is_distributed():
@@ -631,6 +653,7 @@ def main(args: dict):
     clip_grad = float(cfg_opt.get("clip_grad", 0.0))
     depth_valid_min = float(cfg_task.get("depth_valid_min", 0.0))
     depth_valid_max = float(cfg_task.get("depth_valid_max", 1e9))
+    eval_logits_resize_mode = str(cfg_task.get("eval_logits_resize_mode", "bilinear"))
 
     for epoch in range(start_epoch, epochs):
         if train_sampler is not None:
@@ -720,10 +743,19 @@ def main(args: dict):
                 val_loss_meter.update(float(loss.item()), n=int(x.size(0)))
 
                 if target == "semantic":
+                    y_eval = batch.get("eval_target", batch["target"]).to(
+                        device,
+                        non_blocking=True,
+                    )
+                    pred_eval = _resize_logits_to_target(
+                        pred,
+                        y_eval,
+                        mode=eval_logits_resize_mode,
+                    )
                     _semantic_confusion_update(
                         conf=conf,
-                        pred_logits=pred,
-                        target=y,
+                        pred_logits=pred_eval,
+                        target=y_eval,
                         num_classes=num_classes,
                         ignore_index=ignore_index,
                     )

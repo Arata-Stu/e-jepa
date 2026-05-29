@@ -1,0 +1,33 @@
+# Encoder architecture (must match 240x320 ViT-Tiny JEPA pretraining).
+model_name: vit_tiny
+img_size: [240, 320] # [H, W]
+patch_size: 16
+num_frames: 8
+tubelet_size: 2
+in_chans: 2
+
+uniform_power: true
+use_sdpa: true
+use_rope: true
+use_silu: false
+wide_silu: true
+is_causal: false
+init_type: default
+img_temporal_dim_size: null
+n_registers: 0
+has_cls_first: false
+interpolate_rope: true
+modality_embedding: false
+use_activation_checkpointing: false
+
+# Pretrained JEPA checkpoint path.
+checkpoint_path: null
+checkpoint_key: encoder
+
+# Downstream mode:
+# - true: linear probe (freeze encoder, train head only)
+# - false: fine-tune (train encoder + head)
+freeze_encoder: true
+
+# Regularization on top of token map before 1x1 head.
+head_dropout: 0.0

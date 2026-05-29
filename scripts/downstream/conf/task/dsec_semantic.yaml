@@ -11,6 +11,12 @@ recursive: true
 # Input clip sampling around each labeled anchor window.
 clip_num_frames: 2
 clip_frame_stride: 1
+# Optional spatial resize before the downstream model. null keeps H5 resolution.
+input_size: null
+input_resize_mode: bilinear
+# For validation, compute mIoU after resizing logits back to the raw label-aligned HxW.
+eval_original_resolution: true
+eval_logits_resize_mode: bilinear
 
 # Loader.
 batch_size: 4
@@ -28,4 +34,3 @@ require_labels: true
 depth_scale: 1.0
 depth_valid_min: 0.0
 depth_valid_max: 1000000000.0
-

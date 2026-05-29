@@ -167,6 +167,38 @@ def _resize_label_to_hw(
     return resized.to(torch.float32)
 
 
+def _to_optional_hw_tuple(value, *, field_name: str) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        v = int(value)
+        return (v, v)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (int(value[0]), int(value[1]))
+    raise ValueError(f"{field_name} must be null, int, or [H, W], got: {value}")
+
+
+def _resize_clip_cthw(
+    clip: torch.Tensor,
+    *,
+    target_hw: tuple[int, int] | None,
+    mode: str,
+) -> torch.Tensor:
+    if target_hw is None:
+        return clip
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    if int(clip.shape[-2]) == target_h and int(clip.shape[-1]) == target_w:
+        return clip
+
+    clip_tchw = clip.permute(1, 0, 2, 3).contiguous()
+    mode = str(mode).lower()
+    kwargs = {"size": (target_h, target_w), "mode": mode}
+    if mode in {"bilinear", "bicubic"}:
+        kwargs["align_corners"] = False
+    resized = F.interpolate(clip_tchw, **kwargs)
+    return resized.permute(1, 0, 2, 3).contiguous()
+
+
 def _pad_or_crop_semantic_label_to_hw(
     label: torch.Tensor,
     *,
@@ -326,6 +358,9 @@ class EventDenseTaskDataset(Dataset):
         ignore_index: int = 255,
         depth_scale: float = 1.0,
         require_labels: bool = True,
+        input_size: Sequence[int] | int | None = None,
+        input_resize_mode: str = "bilinear",
+        return_eval_target: bool = False,
     ):
         self.dataset_kind = str(dataset_kind).lower()
         self.target = str(target).lower()
@@ -341,6 +376,9 @@ class EventDenseTaskDataset(Dataset):
         self.ignore_index = int(ignore_index)
         self.depth_scale = float(depth_scale)
         self.require_labels = bool(require_labels)
+        self.input_size = _to_optional_hw_tuple(input_size, field_name="input_size")
+        self.input_resize_mode = str(input_resize_mode).lower()
+        self.return_eval_target = bool(return_eval_target)
 
         self.files: list[_FileMeta] = []
         self.samples: list[tuple[int, int]] = []  # (file_idx, window_idx)
@@ -481,25 +519,40 @@ class EventDenseTaskDataset(Dataset):
             frame_stride=self.clip_frame_stride,
         )
         clip_tchw = _read_voxels_tchw(voxels_ds, clip_indices)  # [T,C,H,W]
-        _, _, h, w = clip_tchw.shape
+        _, _, raw_h, raw_w = clip_tchw.shape
         clip_cthw = torch.from_numpy(clip_tchw).permute(1, 0, 2, 3).contiguous()  # [C,T,H,W]
+        clip_cthw = _resize_clip_cthw(
+            clip_cthw,
+            target_hw=self.input_size,
+            mode=self.input_resize_mode,
+        )
+        target_h, target_w = int(clip_cthw.shape[-2]), int(clip_cthw.shape[-1])
 
         if self.dataset_kind == "dsec":
             assert meta.embedded_segmentation_dataset_path is not None
             label_np = np.asarray(pre_h5[meta.embedded_segmentation_dataset_path][int(center_window)])
             label_np = _squeeze_to_hw(label_np, target="semantic")
             label = torch.from_numpy(label_np.astype(np.int64, copy=False))
-            label = _pad_or_crop_semantic_label_to_hw(
+            eval_label = _pad_or_crop_semantic_label_to_hw(
                 label,
-                target_h=h,
-                target_w=w,
+                target_h=raw_h,
+                target_w=raw_w,
                 pad_value=self.ignore_index,
             )
-            return {
+            label = _resize_label_to_hw(
+                eval_label,
+                target_h=target_h,
+                target_w=target_w,
+                target="semantic",
+            )
+            sample = {
                 "input": clip_cthw.to(torch.float32),
                 "target": label.to(torch.int64),
                 "is_semantic": True,
             }
+            if self.return_eval_target:
+                sample["eval_target"] = eval_label.to(torch.int64)
+            return sample
 
         assert meta.window_index is not None
         assert meta.label_lookup_index is not None
@@ -512,17 +565,45 @@ class EventDenseTaskDataset(Dataset):
 
         if self.target == "semantic":
             label = torch.from_numpy(label_arr.astype(np.int64, copy=False))
-            label = _resize_label_to_hw(label, target_h=h, target_w=w, target="semantic")
-            return {
+            eval_label = _resize_label_to_hw(
+                label,
+                target_h=raw_h,
+                target_w=raw_w,
+                target="semantic",
+            )
+            label = _resize_label_to_hw(
+                eval_label,
+                target_h=target_h,
+                target_w=target_w,
+                target="semantic",
+            )
+            sample = {
                 "input": clip_cthw.to(torch.float32),
                 "target": label.to(torch.int64),
                 "is_semantic": True,
             }
+            if self.return_eval_target:
+                sample["eval_target"] = eval_label.to(torch.int64)
+            return sample
 
         depth = torch.from_numpy(label_arr.astype(np.float32, copy=False) * self.depth_scale)
-        depth = _resize_label_to_hw(depth, target_h=h, target_w=w, target="depth")
-        return {
+        eval_depth = _resize_label_to_hw(
+            depth,
+            target_h=raw_h,
+            target_w=raw_w,
+            target="depth",
+        )
+        depth = _resize_label_to_hw(
+            eval_depth,
+            target_h=target_h,
+            target_w=target_w,
+            target="depth",
+        )
+        sample = {
             "input": clip_cthw.to(torch.float32),
             "target": depth.to(torch.float32),
             "is_semantic": False,
         }
+        if self.return_eval_target:
+            sample["eval_target"] = eval_depth.to(torch.float32)
+        return sample

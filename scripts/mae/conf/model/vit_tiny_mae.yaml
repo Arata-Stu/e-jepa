@@ -1,0 +1,29 @@
+# Encoder backbone matching the ViT-Tiny JEPA ablation setup.
+compile_model: false
+use_activation_checkpointing: true
+model_name: vit_tiny
+# tbin1 + split_polarity => 2 channels.
+in_chans: 2
+
+uniform_power: true
+use_rope: true
+use_silu: false
+wide_silu: true
+is_causal: false
+init_type: default
+img_temporal_dim_size: null
+n_registers: 0
+has_cls_first: false
+interpolate_rope: true
+modality_embedding: false
+
+# MAE objective params.
+mask_ratio: 0.75
+loss_type: l2 # l1 or l2
+norm_pix_loss: false
+
+# Lightweight decoder for ViT-Tiny.
+decoder_embed_dim: 192
+decoder_depth: 4
+decoder_num_heads: 3
+decoder_mlp_ratio: 4.0

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+DSEC_ROOT="${DSEC_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s_tbin1}"
+MPX_ROOT="${MPX_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s_tbin1}"
+EVENTSCAPE_ROOT="${EVENTSCAPE_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels_tbin1/Town01-03_train}"
+
+DATASETS="[${DSEC_ROOT}/train,${MPX_ROOT}/train,${EVENTSCAPE_ROOT}]"
+DATASET_FPCS="${DATASET_FPCS:-[8,8,8]}"
+DATASET_WEIGHTS="${DATASET_WEIGHTS:-[0.15,0.7,0.15]}"
+
+JEPA_FOLDER="${JEPA_FOLDER:-outputs/stage1_jepa_1gpu_mix_2ch_240x320_w015_070_015}"
+MAE_FOLDER="${MAE_FOLDER:-outputs/stage1_mae_1gpu_mix_2ch_240x320_w015_070_015}"
+
+RUN_JEPA="${RUN_JEPA:-1}"
+RUN_MAE="${RUN_MAE:-1}"
+
+COMMON_DATA_ARGS=(
+  "data.datasets=${DATASETS}"
+  "data.dataset_fpcs=${DATASET_FPCS}"
+  "data.datasets_weights=${DATASET_WEIGHTS}"
+  "data.batch_size=64"
+  "data.crop_size=[240,320]"
+  "data_aug.preserve_input_size=false"
+  "data_aug.pad_to_hw=null"
+  "data_aug.allowed_input_hw=null"
+  "data_aug.random_resize_scale=[1.0,1.0]"
+  "data_aug.random_resize_aspect_ratio=[1.3333333333,1.3333333333]"
+)
+
+COMMON_OPT_ARGS=(
+  "optimization.epochs=1000"
+  "optimization.ipe_scale=1.25"
+  "optimization.start_lr=1.0e-6"
+  "optimization.lr=1.0e-4"
+  "optimization.final_lr=1.0e-6"
+  "optimization.warmup=40"
+  "optimization.clip_grad=1.0"
+  "meta.use_tqdm=true"
+)
+
+if [[ "${RUN_JEPA}" == "1" ]]; then
+  python3 scripts/train/run_train.py \
+    "folder=${JEPA_FOLDER}" \
+    "${COMMON_DATA_ARGS[@]}" \
+    "model=vit_tiny_2_1" \
+    "model.in_chans=2" \
+    "model.lambda_value_vid=0.1" \
+    "mask=stage1_event_activity_adaptive" \
+    "loss.predict_all=true" \
+    "loss.weight_distance_loss=false" \
+    "${COMMON_OPT_ARGS[@]}"
+fi
+
+if [[ "${RUN_MAE}" == "1" ]]; then
+  python3 scripts/mae/run_mae.py \
+    "folder=${MAE_FOLDER}" \
+    "model=vit_tiny_mae" \
+    "${COMMON_DATA_ARGS[@]}" \
+    "optimization.weight_decay=0.04" \
+    "optimization.final_weight_decay=0.04" \
+    "${COMMON_OPT_ARGS[@]}"
+fi

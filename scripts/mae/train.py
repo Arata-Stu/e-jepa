@@ -521,6 +521,11 @@ def main(args, resume_preempt: bool = False):
     ipe_scale = float(cfgs_opt.get("ipe_scale", 1.0))
     betas = tuple(float(v) for v in cfgs_opt.get("betas", [0.9, 0.95]))
     eps = float(cfgs_opt.get("eps", 1.0e-8))
+    clip_grad = cfgs_opt.get("clip_grad", None)
+    if clip_grad is not None:
+        clip_grad = float(clip_grad)
+        if clip_grad <= 0.0:
+            clip_grad = None
 
     logger.info(
         f"Dataset setup: type={dataset_type}, paths={dataset_paths}, "
@@ -796,10 +801,20 @@ def main(args, resume_preempt: bool = False):
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
+                    if clip_grad is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            mae_model.parameters(),
+                            clip_grad,
+                        )
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    if clip_grad is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            mae_model.parameters(),
+                            clip_grad,
+                        )
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 return float(loss), float(new_lr), float(new_wd)

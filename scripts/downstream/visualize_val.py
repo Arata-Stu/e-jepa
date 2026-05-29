@@ -19,7 +19,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.downstream.train import DenseLinearProbe, _build_encoder_from_cfg, _to_dtype
+from scripts.downstream.train import (
+    DenseLinearProbe,
+    _build_encoder_from_cfg,
+    _resize_logits_to_target,
+    _to_dtype,
+)
 from src.downstream.datasets import EventDenseTaskDataset
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 
@@ -425,6 +430,15 @@ def _to_pil(rgb: np.ndarray) -> Image.Image:
     return Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
 
 
+def _resize_rgb_to_hw(rgb: np.ndarray, *, target_hw: tuple[int, int]) -> np.ndarray:
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    if int(rgb.shape[0]) == target_h and int(rgb.shape[1]) == target_w:
+        return np.asarray(rgb, dtype=np.uint8)
+    image = _to_pil(rgb)
+    resized = image.resize((target_w, target_h), resample=_RESAMPLING.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
+
+
 def _resize_panel(image: Image.Image, *, panel_width: int, is_label: bool) -> Image.Image:
     w, h = image.size
     if w <= 0 or h <= 0:
@@ -581,13 +595,15 @@ def _render_semantic_sample(
     ignore_index: int,
 ) -> tuple[Image.Image, dict[str, Any]]:
     clip = sample["input"].detach().cpu().numpy()
-    target = sample["target"].detach().cpu().numpy().astype(np.int64, copy=False)
+    target_tensor = sample.get("eval_target", sample["target"])
+    target = target_tensor.detach().cpu().numpy().astype(np.int64, copy=False)
     clip_entries, center_rgb = _make_clip_entries(clip)
+    diag_base_rgb = _resize_rgb_to_hw(center_rgb, target_hw=target.shape[-2:])
 
     metrics = _sample_semantic_metrics(target, prediction, ignore_index=ignore_index)
     target_rgb = _semantic_to_rgb(target, ignore_index=ignore_index)
     pred_rgb = _semantic_to_rgb(prediction, ignore_index=ignore_index)
-    diag_rgb = _semantic_diagnostic_rgb(center_rgb, target, prediction, ignore_index=ignore_index)
+    diag_rgb = _semantic_diagnostic_rgb(diag_base_rgb, target, prediction, ignore_index=ignore_index)
 
     title_lines = [
         f"sample={sample_idx} file={file_path.name} window={center_window}",
@@ -719,6 +735,9 @@ def main() -> None:
         ignore_index=int(cfg_task.get("ignore_index", 255)),
         depth_scale=float(cfg_task.get("depth_scale", 1.0)),
         require_labels=bool(cfg_task.get("require_labels", True)),
+        input_size=cfg_task.get("input_size", None),
+        input_resize_mode=str(cfg_task.get("input_resize_mode", "bilinear")),
+        return_eval_target=bool(cfg_task.get("eval_original_resolution", True)),
     )
 
     device = _resolve_device(args.device)
@@ -747,6 +766,7 @@ def main() -> None:
     ignore_index = int(cfg_task.get("ignore_index", 255))
     depth_valid_min = float(cfg_task.get("depth_valid_min", 0.0))
     depth_valid_max = float(cfg_task.get("depth_valid_max", 1e9))
+    eval_logits_resize_mode = str(cfg_task.get("eval_logits_resize_mode", "bilinear"))
 
     print(f"Loaded config from: {config_path}")
     print(f"Loaded checkpoint: {checkpoint_path}")
@@ -769,7 +789,13 @@ def main() -> None:
                 pred = model(x)
 
             if target == "semantic":
-                pred_map = pred.argmax(dim=1)[0].detach().cpu().numpy().astype(np.int64, copy=False)
+                eval_target = sample.get("eval_target", sample["target"]).unsqueeze(0).to(device)
+                pred_eval = _resize_logits_to_target(
+                    pred,
+                    eval_target,
+                    mode=eval_logits_resize_mode,
+                )
+                pred_map = pred_eval.argmax(dim=1)[0].detach().cpu().numpy().astype(np.int64, copy=False)
                 image, row = _render_semantic_sample(
                     sample=sample,
                     sample_idx=dataset_idx,

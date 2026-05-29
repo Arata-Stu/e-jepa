@@ -13,6 +13,37 @@ _GLOBAL_SEED = 0
 logger = getLogger()
 
 
+def _iter_clip_tensors(value):
+    if torch.is_tensor(value):
+        if value.ndim == 5:
+            yield value
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_clip_tensors(item)
+
+
+def _estimate_batch_active_pixel_ratio(collated_batch, threshold=1e-6):
+    sample_activity = []
+    for clip in _iter_clip_tensors(collated_batch):
+        # clip: [B, C, T, H, W]. Count a pixel active if any channel/time is active.
+        active_hw = clip.detach().abs().amax(dim=(1, 2)) > float(threshold)
+        sample_activity.append(active_hw.float().mean(dim=(1, 2)))
+
+    if len(sample_activity) == 0:
+        return None
+
+    return float(torch.stack(sample_activity, dim=0).mean().item())
+
+
+def _clip_pair(value, min_value, max_value):
+    v0 = min(max(float(value[0]), min_value), max_value)
+    v1 = min(max(float(value[1]), min_value), max_value)
+    if v1 < v0:
+        v1 = v0
+    return (v0, v1)
+
+
 class MaskCollator(object):
 
     def __init__(
@@ -43,6 +74,18 @@ class MaskCollator(object):
                     full_complement=m.get("full_complement", False),
                     pred_full_complement=m.get("pred_full_complement", False),
                     inv_block=m.get("inv_block", False),
+                    activity_adaptive=m.get("activity_adaptive", False),
+                    activity_threshold=m.get("activity_threshold", 1e-6),
+                    activity_low=m.get("activity_low", 0.005),
+                    activity_high=m.get("activity_high", 0.03),
+                    activity_low_scale=m.get("activity_low_scale", 0.6),
+                    activity_high_scale=m.get("activity_high_scale", 1.15),
+                    activity_min_spatial_scale=m.get(
+                        "activity_min_spatial_scale", 0.02
+                    ),
+                    activity_max_spatial_scale=m.get(
+                        "activity_max_spatial_scale", 0.5
+                    ),
                 )
                 self.mask_generators[fpc].append(mask_generator)
 
@@ -80,7 +123,16 @@ class MaskCollator(object):
             collated_batch = torch.utils.data.default_collate(fpc_batch)
             collated_masks_pred, collated_masks_enc = [], []
             for i, mask_generator in enumerate(self.mask_generators[fpc]):
-                masks_enc, masks_pred = mask_generator(batch_size)
+                batch_activity = None
+                if mask_generator.activity_adaptive:
+                    batch_activity = _estimate_batch_active_pixel_ratio(
+                        collated_batch,
+                        threshold=mask_generator.activity_threshold,
+                    )
+                masks_enc, masks_pred = mask_generator(
+                    batch_size,
+                    batch_activity=batch_activity,
+                )
                 collated_masks_enc.append(masks_enc)
                 collated_masks_pred.append(masks_pred)
             fpc_collations += [
@@ -107,6 +159,14 @@ class _MaskGenerator(object):
         inv_block=False,
         full_complement=False,
         pred_full_complement=False,
+        activity_adaptive=False,
+        activity_threshold=1e-6,
+        activity_low=0.005,
+        activity_high=0.03,
+        activity_low_scale=0.6,
+        activity_high_scale=1.15,
+        activity_min_spatial_scale=0.02,
+        activity_max_spatial_scale=0.5,
     ):
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
@@ -134,6 +194,14 @@ class _MaskGenerator(object):
         self.max_keep = max_keep  # maximum number of patches to keep in context
         self._itr_counter = Value("i", -1)  # collator is shared across worker processes
         self.inv_block = inv_block
+        self.activity_adaptive = bool(activity_adaptive)
+        self.activity_threshold = float(activity_threshold)
+        self.activity_low = float(activity_low)
+        self.activity_high = float(activity_high)
+        self.activity_low_scale = float(activity_low_scale)
+        self.activity_high_scale = float(activity_high_scale)
+        self.activity_min_spatial_scale = float(activity_min_spatial_scale)
+        self.activity_max_spatial_scale = float(activity_max_spatial_scale)
 
     def step(self):
         i = self._itr_counter
@@ -155,7 +223,10 @@ class _MaskGenerator(object):
         _rand = torch.rand(1, generator=generator).item()
         min_s, max_s = spatial_scale
         spatial_mask_scale = min_s + _rand * (max_s - min_s)
-        spatial_num_keep = int(self.height * self.width * spatial_mask_scale)
+        spatial_num_keep = max(
+            1,
+            int(self.height * self.width * spatial_mask_scale),
+        )
 
         # -- Sample block aspect-ratio
         _rand = torch.rand(1, generator=generator).item()
@@ -169,6 +240,31 @@ class _MaskGenerator(object):
         w = min(w, self.width)
 
         return (t, h, w)
+
+    def _adapt_spatial_scale(self, batch_activity):
+        if not self.activity_adaptive or batch_activity is None:
+            return self.spatial_pred_mask_scale
+
+        low = self.activity_low
+        high = self.activity_high
+        if high <= low:
+            alpha = 1.0 if batch_activity >= high else 0.0
+        else:
+            alpha = (float(batch_activity) - low) / (high - low)
+            alpha = min(max(alpha, 0.0), 1.0)
+
+        scale = self.activity_low_scale + alpha * (
+            self.activity_high_scale - self.activity_low_scale
+        )
+        spatial_scale = (
+            float(self.spatial_pred_mask_scale[0]) * scale,
+            float(self.spatial_pred_mask_scale[1]) * scale,
+        )
+        return _clip_pair(
+            spatial_scale,
+            min_value=self.activity_min_spatial_scale,
+            max_value=self.activity_max_spatial_scale,
+        )
 
     def _sample_block_mask(self, b_size):
         t, h, w = b_size
@@ -187,7 +283,7 @@ class _MaskGenerator(object):
         # --
         return mask
 
-    def __call__(self, batch_size):
+    def __call__(self, batch_size, batch_activity=None):
         """
         Create encoder and predictor masks when collating imgs into a batch
         # 1. sample pred block size using seed
@@ -197,10 +293,11 @@ class _MaskGenerator(object):
         seed = self.step()
         g = torch.Generator()
         g.manual_seed(seed)
+        spatial_scale = self._adapt_spatial_scale(batch_activity)
         p_size = self._sample_block_size(
             generator=g,
             temporal_scale=self.temporal_pred_mask_scale,
-            spatial_scale=self.spatial_pred_mask_scale,
+            spatial_scale=spatial_scale,
             aspect_ratio_scale=self.aspect_ratio,
         )
 

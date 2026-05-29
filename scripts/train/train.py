@@ -718,6 +718,10 @@ def main(args, resume_preempt: bool = False):
             data_sampler.set_epoch(epoch)
 
         loss_meter = AverageMeter()
+        loss_pred_meter = AverageMeter()
+        loss_context_meter = AverageMeter()
+        loss_context_weighted_meter = AverageMeter()
+        context_lambda_meter = AverageMeter()
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -861,13 +865,18 @@ def main(args, resume_preempt: bool = False):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
 
-                    loss = loss_fn(
+                    loss_context = None
+                    loss_context_weighted = None
+                    lambda_value_step = 0.0
+
+                    loss_pred = loss_fn(
                         z_pred,
                         h,
                         masks_pred,
                         cls_loss=has_cls_first,
                         d_weights=None,
                     )
+                    loss = loss_pred
 
                     if predict_all:
                         distance_weights = compute_mask_distance(
@@ -890,7 +899,8 @@ def main(args, resume_preempt: bool = False):
                             if lambda_progressive
                             else lambda_value
                         )
-                        loss = loss + loss_context * lambda_value_step
+                        loss_context_weighted = loss_context * lambda_value_step
+                        loss = loss + loss_context_weighted
 
                 run_step = True
                 if loss_reg_std_mult is not None and len(trailing_losses) > 0:
@@ -945,12 +955,31 @@ def main(args, resume_preempt: bool = False):
                     torch._foreach_mul_(params_k, m)
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
-                return float(loss), float(new_lr), float(new_wd), run_step
+                loss_context_value = (
+                    0.0 if loss_context is None else float(loss_context.detach())
+                )
+                loss_context_weighted_value = (
+                    0.0
+                    if loss_context_weighted is None
+                    else float(loss_context_weighted.detach())
+                )
+                loss_details = {
+                    "loss_pred": float(loss_pred.detach()),
+                    "loss_context": loss_context_value,
+                    "loss_context_weighted": loss_context_weighted_value,
+                    "context_lambda": float(lambda_value_step),
+                }
 
-            (loss, new_lr, new_wd, run_step), gpu_etime_ms = gpu_timer(train_step)
+                return float(loss.detach()), float(new_lr), float(new_wd), run_step, loss_details
+
+            (loss, new_lr, new_wd, run_step, loss_details), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             loss_meter.update(loss)
+            loss_pred_meter.update(loss_details["loss_pred"])
+            loss_context_meter.update(loss_details["loss_context"])
+            loss_context_weighted_meter.update(loss_details["loss_context_weighted"])
+            context_lambda_meter.update(loss_details["context_lambda"])
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
@@ -975,6 +1004,23 @@ def main(args, resume_preempt: bool = False):
             if tb_writer is not None:
                 global_step = epoch * ipe + itr
                 tb_writer.add_scalar("train/loss", loss, global_step)
+                tb_writer.add_scalar("train/loss_total", loss, global_step)
+                tb_writer.add_scalar(
+                    "train/loss_pred", loss_details["loss_pred"], global_step
+                )
+                tb_writer.add_scalar(
+                    "train/loss_context", loss_details["loss_context"], global_step
+                )
+                tb_writer.add_scalar(
+                    "train/loss_context_weighted",
+                    loss_details["loss_context_weighted"],
+                    global_step,
+                )
+                tb_writer.add_scalar(
+                    "train/context_lambda",
+                    loss_details["context_lambda"],
+                    global_step,
+                )
                 tb_writer.add_scalar("train/lr", new_lr, global_step)
                 tb_writer.add_scalar("train/wd", new_wd, global_step)
                 tb_writer.add_scalar("time/iter_ms", iter_elapsed_time_ms, global_step)
@@ -1028,6 +1074,18 @@ def main(args, resume_preempt: bool = False):
 
         if tb_writer is not None:
             tb_writer.add_scalar("epoch/loss_avg", loss_meter.avg, epoch + 1)
+            tb_writer.add_scalar("epoch/loss_pred_avg", loss_pred_meter.avg, epoch + 1)
+            tb_writer.add_scalar(
+                "epoch/loss_context_avg", loss_context_meter.avg, epoch + 1
+            )
+            tb_writer.add_scalar(
+                "epoch/loss_context_weighted_avg",
+                loss_context_weighted_meter.avg,
+                epoch + 1,
+            )
+            tb_writer.add_scalar(
+                "epoch/context_lambda_avg", context_lambda_meter.avg, epoch + 1
+            )
 
         logger.info(f"Epoch {epoch + 1} avg loss: {loss_meter.avg:.6f}")
         if (epoch + 1) % checkpoint_freq == 0 or epoch == (num_epochs - 1):

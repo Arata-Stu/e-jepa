@@ -511,6 +511,13 @@ def main(args: dict):
         persistent_workers=(num_workers > 0) and persistent_workers,
         drop_last=False,
     )
+    logger.info(
+        f"Downstream dataset setup: task={dataset_kind}/{target}, "
+        f"train_samples={len(train_dataset)}, val_samples={len(val_dataset)}, "
+        f"batch_size={batch_size}, num_workers={num_workers}, "
+        f"persistent_workers={persistent_workers}, "
+        f"clip_num_frames={clip_num_frames}, input_size={cfg_task.get('input_size', None)}"
+    )
 
     num_classes = int(cfg_task.get("num_classes", 0))
     ignore_index = int(cfg_task.get("ignore_index", 255))

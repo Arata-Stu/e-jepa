@@ -533,6 +533,7 @@ def main(args, resume_preempt: bool = False):
     logger.info(
         f"Dataset setup: type={dataset_type}, paths={dataset_paths}, "
         f"dataset_fpcs={dataset_fpcs}, batch_size={batch_size}, num_clips={num_clips}, "
+        f"num_workers={num_workers}, persistent_workers={persistent_workers}, "
         f"activity_filter_enabled={activity_filter_enabled}, "
         f"min_clip_mean_active={activity_filter_min_clip_mean_active_pixel_ratio}, "
         f"min_clip_mean_score={activity_filter_min_clip_mean_activity_score}, "

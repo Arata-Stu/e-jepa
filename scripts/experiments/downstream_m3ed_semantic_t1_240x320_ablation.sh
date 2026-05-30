@@ -21,6 +21,7 @@ JEPA_CKPT="${JEPA_CKPT:-}"
 MAE_CKPT="${MAE_CKPT:-}"
 
 DOWNSTREAM_EPOCHS="${DOWNSTREAM_EPOCHS:-100}"
+DOWNSTREAM_CLIP_NUM_FRAMES="${DOWNSTREAM_CLIP_NUM_FRAMES:-8}"
 
 RUN_JEPA_LINEAR="${RUN_JEPA_LINEAR:-1}"
 RUN_JEPA_FINETUNE="${RUN_JEPA_FINETUNE:-1}"
@@ -79,7 +80,8 @@ COMMON_TASK_ARGS=(
   "task.input_size=[240,320]"
   "task.eval_original_resolution=true"
   "task.eval_logits_resize_mode=nearest"
-  "task.clip_num_frames=8"
+  "task.clip_num_frames=${DOWNSTREAM_CLIP_NUM_FRAMES}"
+  "model.num_frames=${DOWNSTREAM_CLIP_NUM_FRAMES}"
   "optimization.epochs=${DOWNSTREAM_EPOCHS}"
 )
 

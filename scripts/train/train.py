@@ -30,6 +30,7 @@ from src.training.jepa21_utils import (
 )
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.pretrain_debug_vis import make_jepa_debug_images
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -223,6 +224,8 @@ def main(args, resume_preempt: bool = False):
             logger.warning("tensorboard is unavailable; SummaryWriter import failed.")
         else:
             tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+    vis_interval = int(cfgs_meta.get("vis_interval", 0) or 0)
+    vis_max_temporal_slices = int(cfgs_meta.get("vis_max_temporal_slices", 8) or 8)
 
     # -- Model params
     compile_model = bool(cfgs_model.get("compile_model", False))
@@ -787,6 +790,14 @@ def main(args, resume_preempt: bool = False):
             if sync_gc and (itr + 1) % gc_collect_itr_freq == 0:
                 gc.collect()
 
+            global_step = epoch * ipe + itr
+            should_visualize = (
+                tb_writer is not None
+                and vis_interval > 0
+                and (global_step == 0 or global_step % vis_interval == 0)
+                and not has_cls_first
+            )
+
             def train_step():
                 new_lr = scheduler.step()
                 new_wd = wd_scheduler.step()
@@ -902,6 +913,22 @@ def main(args, resume_preempt: bool = False):
                         loss_context_weighted = loss_context * lambda_value_step
                         loss = loss + loss_context_weighted
 
+                    debug_images = None
+                    if should_visualize:
+                        with torch.no_grad():
+                            debug_images = make_jepa_debug_images(
+                                clips=clips,
+                                z_pred=z_pred,
+                                z_context=z_context,
+                                target_tokens=h,
+                                masks_pred=masks_pred,
+                                masks_enc=masks_enc,
+                                patch_size=patch_size,
+                                tubelet_size=tubelet_size,
+                                loss_exp=loss_exp,
+                                max_slices=vis_max_temporal_slices,
+                            )
+
                 run_step = True
                 if loss_reg_std_mult is not None and len(trailing_losses) > 0:
                     meanval = np.mean(trailing_losses)
@@ -970,9 +997,23 @@ def main(args, resume_preempt: bool = False):
                     "context_lambda": float(lambda_value_step),
                 }
 
-                return float(loss.detach()), float(new_lr), float(new_wd), run_step, loss_details
+                return (
+                    float(loss.detach()),
+                    float(new_lr),
+                    float(new_wd),
+                    run_step,
+                    loss_details,
+                    debug_images,
+                )
 
-            (loss, new_lr, new_wd, run_step, loss_details), gpu_etime_ms = gpu_timer(train_step)
+            (
+                loss,
+                new_lr,
+                new_wd,
+                run_step,
+                loss_details,
+                debug_images,
+            ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             loss_meter.update(loss)
@@ -1002,7 +1043,6 @@ def main(args, resume_preempt: bool = False):
             )
 
             if tb_writer is not None:
-                global_step = epoch * ipe + itr
                 tb_writer.add_scalar("train/loss", loss, global_step)
                 tb_writer.add_scalar("train/loss_total", loss, global_step)
                 tb_writer.add_scalar(
@@ -1026,6 +1066,9 @@ def main(args, resume_preempt: bool = False):
                 tb_writer.add_scalar("time/iter_ms", iter_elapsed_time_ms, global_step)
                 tb_writer.add_scalar("time/gpu_ms", gpu_etime_ms, global_step)
                 tb_writer.add_scalar("time/data_ms", data_elapsed_time_ms, global_step)
+                if debug_images is not None:
+                    for tag, image in debug_images.items():
+                        tb_writer.add_image(tag, image, global_step)
 
             max_mem_mb = (
                 torch.cuda.max_memory_allocated() / (1024.0**2)

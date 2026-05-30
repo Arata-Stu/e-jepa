@@ -20,6 +20,7 @@ from src.models.utils.modules import Block
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.pretrain_debug_vis import make_mae_debug_images
 from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
 
 try:
@@ -396,6 +397,8 @@ def main(args, resume_preempt: bool = False):
             logger.warning("tensorboard is unavailable; SummaryWriter import failed.")
         else:
             tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+    vis_interval = int(cfgs_meta.get("vis_interval", 0) or 0)
+    vis_max_temporal_slices = int(cfgs_meta.get("vis_max_temporal_slices", 8) or 8)
 
     # -- Data params
     dataset_type = str(cfgs_data.get("dataset_type", "eventdataset"))
@@ -788,6 +791,13 @@ def main(args, resume_preempt: bool = False):
 
                 gc.collect()
 
+            global_step = epoch * ipe + itr
+            should_visualize = (
+                tb_writer is not None
+                and vis_interval > 0
+                and (global_step == 0 or global_step % vis_interval == 0)
+            )
+
             def train_step():
                 new_lr = scheduler.step()
                 new_wd = wd_scheduler.step()
@@ -796,7 +806,20 @@ def main(args, resume_preempt: bool = False):
                     dtype=dtype,
                     enabled=(mixed_precision and torch.cuda.is_available()),
                 ):
-                    loss, _, _ = mae_model(clips)
+                    loss, pred, mask = mae_model(clips)
+                    debug_images = None
+                    if should_visualize:
+                        with torch.no_grad():
+                            debug_images = make_mae_debug_images(
+                                clips=clips,
+                                pred=pred,
+                                mask=mask,
+                                patch_size=patch_size,
+                                tubelet_size=tubelet_size,
+                                loss_type=loss_type,
+                                norm_pix_loss=norm_pix_loss,
+                                max_slices=vis_max_temporal_slices,
+                            )
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -817,9 +840,9 @@ def main(args, resume_preempt: bool = False):
                         )
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                return float(loss), float(new_lr), float(new_wd)
+                return float(loss), float(new_lr), float(new_wd), debug_images
 
-            (loss, new_lr, new_wd), gpu_etime_ms = gpu_timer(train_step)
+            (loss, new_lr, new_wd, debug_images), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             loss_meter.update(loss)
@@ -837,13 +860,15 @@ def main(args, resume_preempt: bool = False):
             )
 
             if tb_writer is not None:
-                global_step = epoch * ipe + itr
                 tb_writer.add_scalar("train/loss", loss, global_step)
                 tb_writer.add_scalar("train/lr", new_lr, global_step)
                 tb_writer.add_scalar("train/wd", new_wd, global_step)
                 tb_writer.add_scalar("time/iter_ms", iter_elapsed_time_ms, global_step)
                 tb_writer.add_scalar("time/gpu_ms", gpu_etime_ms, global_step)
                 tb_writer.add_scalar("time/data_ms", data_elapsed_time_ms, global_step)
+                if debug_images is not None:
+                    for tag, image in debug_images.items():
+                        tb_writer.add_image(tag, image, global_step)
 
             max_mem_mb = (
                 torch.cuda.max_memory_allocated() / (1024.0**2)

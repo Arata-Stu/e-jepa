@@ -15,6 +15,9 @@ log_all_ranks: false
 log_freq: 10
 # Use tqdm progress bar instead of per-step logger.info output.
 use_tqdm: false
+# TensorBoard debug images. 0 disables image logging.
+vis_interval: 0
+vis_max_temporal_slices: 8
 checkpoint_freq: 1
 save_every_freq: 50
 skip_batches: -1

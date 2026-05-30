@@ -23,6 +23,8 @@ PRETRAIN_START_LR="${PRETRAIN_START_LR:-1.0e-6}"
 PRETRAIN_LR="${PRETRAIN_LR:-1.0e-4}"
 PRETRAIN_FINAL_LR="${PRETRAIN_FINAL_LR:-1.0e-6}"
 PRETRAIN_WARMUP="${PRETRAIN_WARMUP:-40}"
+VIS_INTERVAL="${VIS_INTERVAL:-500}"
+VIS_MAX_TEMPORAL_SLICES="${VIS_MAX_TEMPORAL_SLICES:-8}"
 
 COMMON_DATA_ARGS=(
   "data.datasets=${DATASETS}"
@@ -46,6 +48,8 @@ COMMON_OPT_ARGS=(
   "optimization.warmup=${PRETRAIN_WARMUP}"
   "optimization.clip_grad=1.0"
   "meta.use_tqdm=true"
+  "meta.vis_interval=${VIS_INTERVAL}"
+  "meta.vis_max_temporal_slices=${VIS_MAX_TEMPORAL_SLICES}"
 )
 
 if [[ "${RUN_JEPA}" == "1" ]]; then

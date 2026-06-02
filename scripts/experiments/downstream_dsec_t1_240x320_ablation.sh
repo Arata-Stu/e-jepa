@@ -12,7 +12,7 @@ if [[ -z "${DSEC_ROOT:-}" ]]; then
   if [[ "${TBIN}" == "1" ]]; then
     DSEC_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s_tbin1"
   else
-    DSEC_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s"
+    DSEC_ROOT="/mnt/data/arata/t_10/DSEC_voxels_semantic_20s"
   fi
 fi
 

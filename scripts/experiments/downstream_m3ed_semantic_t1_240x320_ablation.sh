@@ -12,7 +12,7 @@ if [[ -z "${M3ED_ROOT:-}" ]]; then
   if [[ "${TBIN}" == "1" ]]; then
     M3ED_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/m3ed_voxels_semantic_20s_tbin1"
   else
-    M3ED_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/m3ed_voxels_semantic_20s"
+    M3ED_ROOT="/mnt/data/arata/t_10/m3ed_voxels_semantic_20s"
   fi
 fi
 M3ED_TRAIN_ROOT="${M3ED_TRAIN_ROOT:-${M3ED_ROOT}/train}"

@@ -3,7 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-M3ED_ROOT="${M3ED_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/m3ed_voxels_semantic_20s_tbin1}"
+TBIN="${TBIN:-1}"
+if [[ -z "${IN_CHANS:-}" ]]; then
+  IN_CHANS=$((2 * TBIN))
+fi
+
+if [[ -z "${M3ED_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    M3ED_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/m3ed_voxels_semantic_20s_tbin1"
+  else
+    M3ED_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/m3ed_voxels_semantic_20s"
+  fi
+fi
 M3ED_TRAIN_ROOT="${M3ED_TRAIN_ROOT:-${M3ED_ROOT}/train}"
 M3ED_VAL_ROOT="${M3ED_VAL_ROOT:-}"
 if [[ -z "${M3ED_VAL_ROOT}" ]]; then
@@ -14,8 +25,20 @@ if [[ -z "${M3ED_VAL_ROOT}" ]]; then
   fi
 fi
 
-JEPA_FOLDER="${JEPA_FOLDER:-outputs/stage1_jepa_1gpu_mix_2ch_240x320_w015_070_015}"
-MAE_FOLDER="${MAE_FOLDER:-outputs/stage1_mae_1gpu_mix_2ch_240x320_w015_070_015}"
+if [[ -z "${JEPA_FOLDER:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    JEPA_FOLDER="outputs/stage1_jepa_1gpu_mix_2ch_240x320_w015_070_015"
+  else
+    JEPA_FOLDER="outputs/stage1_jepa_1gpu_mix_${IN_CHANS}ch_240x320_tbin${TBIN}_w015_070_015"
+  fi
+fi
+if [[ -z "${MAE_FOLDER:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    MAE_FOLDER="outputs/stage1_mae_1gpu_mix_2ch_240x320_w015_070_015"
+  else
+    MAE_FOLDER="outputs/stage1_mae_1gpu_mix_${IN_CHANS}ch_240x320_tbin${TBIN}_w015_070_015"
+  fi
+fi
 
 JEPA_CKPT="${JEPA_CKPT:-}"
 MAE_CKPT="${MAE_CKPT:-}"
@@ -73,6 +96,12 @@ echo "M3ED_TRAIN_ROOT=${M3ED_TRAIN_ROOT}"
 echo "M3ED_VAL_ROOT=${M3ED_VAL_ROOT}"
 echo "JEPA_CKPT=${JEPA_CKPT}"
 echo "MAE_CKPT=${MAE_CKPT}"
+if [[ "${TBIN}" == "1" ]]; then
+  M3ED_RUN_TAG="m3ed_sem_t1"
+else
+  M3ED_RUN_TAG="m3ed_sem_tbin${TBIN}_${IN_CHANS}ch"
+fi
+RUN_SUFFIX="w015_070_015"
 
 COMMON_TASK_ARGS=(
   "task=m3ed_semantic"
@@ -84,12 +113,13 @@ COMMON_TASK_ARGS=(
   "task.clip_num_frames=${DOWNSTREAM_CLIP_NUM_FRAMES}"
   "task.num_workers=${DOWNSTREAM_NUM_WORKERS}"
   "model.num_frames=${DOWNSTREAM_CLIP_NUM_FRAMES}"
+  "model.in_chans=${IN_CHANS}"
   "optimization.epochs=${DOWNSTREAM_EPOCHS}"
 )
 
 if [[ "${RUN_JEPA_LINEAR}" == "1" ]]; then
   python3 scripts/downstream/run_downstream.py \
-    "folder=outputs/downstream_m3ed_sem_t1_vit_tiny_jepa_linear_probe_w015_070_015" \
+    "folder=outputs/downstream_${M3ED_RUN_TAG}_vit_tiny_jepa_linear_probe_${RUN_SUFFIX}" \
     "model=vit_tiny_linear_probe" \
     "model.checkpoint_path=${JEPA_CKPT}" \
     "model.checkpoint_key=encoder" \
@@ -100,7 +130,7 @@ fi
 
 if [[ "${RUN_JEPA_FINETUNE}" == "1" ]]; then
   python3 scripts/downstream/run_downstream.py \
-    "folder=outputs/downstream_m3ed_sem_t1_vit_tiny_jepa_finetune_w015_070_015" \
+    "folder=outputs/downstream_${M3ED_RUN_TAG}_vit_tiny_jepa_finetune_${RUN_SUFFIX}" \
     "model=vit_tiny_linear_probe" \
     "model.checkpoint_path=${JEPA_CKPT}" \
     "model.checkpoint_key=encoder" \
@@ -113,7 +143,7 @@ fi
 
 if [[ "${RUN_SCRATCH}" == "1" ]]; then
   python3 scripts/downstream/run_downstream.py \
-    "folder=outputs/downstream_m3ed_sem_t1_vit_tiny_scratch_w015_070_015" \
+    "folder=outputs/downstream_${M3ED_RUN_TAG}_vit_tiny_scratch_${RUN_SUFFIX}" \
     "model=vit_tiny_linear_probe" \
     "model.checkpoint_path=null" \
     "model.freeze_encoder=false" \
@@ -125,7 +155,7 @@ fi
 
 if [[ "${RUN_MAE_LINEAR}" == "1" ]]; then
   python3 scripts/downstream/run_downstream.py \
-    "folder=outputs/downstream_m3ed_sem_t1_vit_tiny_mae_linear_probe_w015_070_015" \
+    "folder=outputs/downstream_${M3ED_RUN_TAG}_vit_tiny_mae_linear_probe_${RUN_SUFFIX}" \
     "model=vit_tiny_linear_probe" \
     "model.checkpoint_path=${MAE_CKPT}" \
     "model.checkpoint_key=encoder" \
@@ -136,7 +166,7 @@ fi
 
 if [[ "${RUN_MAE_FINETUNE}" == "1" ]]; then
   python3 scripts/downstream/run_downstream.py \
-    "folder=outputs/downstream_m3ed_sem_t1_vit_tiny_mae_finetune_w015_070_015" \
+    "folder=outputs/downstream_${M3ED_RUN_TAG}_vit_tiny_mae_finetune_${RUN_SUFFIX}" \
     "model=vit_tiny_linear_probe" \
     "model.checkpoint_path=${MAE_CKPT}" \
     "model.checkpoint_key=encoder" \

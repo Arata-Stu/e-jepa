@@ -3,16 +3,51 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-DSEC_ROOT="${DSEC_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s_tbin1}"
-MPX_ROOT="${MPX_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s_tbin1}"
-EVENTSCAPE_ROOT="${EVENTSCAPE_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels_tbin1/Town01-03_train}"
+TBIN="${TBIN:-1}"
+if [[ -z "${IN_CHANS:-}" ]]; then
+  IN_CHANS=$((2 * TBIN))
+fi
+
+if [[ -z "${DSEC_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    DSEC_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s_tbin1"
+  else
+    DSEC_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s"
+  fi
+fi
+if [[ -z "${MPX_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    MPX_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s_tbin1"
+  else
+    MPX_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s"
+  fi
+fi
+if [[ -z "${EVENTSCAPE_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    EVENTSCAPE_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels_tbin1/Town01-03_train"
+  else
+    EVENTSCAPE_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels/Town01-03_train"
+  fi
+fi
 
 DATASETS="[${DSEC_ROOT}/train,${MPX_ROOT}/train,${EVENTSCAPE_ROOT}]"
 DATASET_FPCS="${DATASET_FPCS:-[8,8,8]}"
 DATASET_WEIGHTS="${DATASET_WEIGHTS:-[0.15,0.7,0.15]}"
 
-JEPA_FOLDER="${JEPA_FOLDER:-outputs/stage1_jepa_1gpu_mix_2ch_240x320_w015_070_015}"
-MAE_FOLDER="${MAE_FOLDER:-outputs/stage1_mae_1gpu_mix_2ch_240x320_w015_070_015}"
+if [[ -z "${JEPA_FOLDER:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    JEPA_FOLDER="outputs/stage1_jepa_1gpu_mix_2ch_240x320_w015_070_015"
+  else
+    JEPA_FOLDER="outputs/stage1_jepa_1gpu_mix_${IN_CHANS}ch_240x320_tbin${TBIN}_w015_070_015"
+  fi
+fi
+if [[ -z "${MAE_FOLDER:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    MAE_FOLDER="outputs/stage1_mae_1gpu_mix_2ch_240x320_w015_070_015"
+  else
+    MAE_FOLDER="outputs/stage1_mae_1gpu_mix_${IN_CHANS}ch_240x320_tbin${TBIN}_w015_070_015"
+  fi
+fi
 
 RUN_JEPA="${RUN_JEPA:-1}"
 RUN_MAE="${RUN_MAE:-1}"
@@ -59,7 +94,7 @@ if [[ "${RUN_JEPA}" == "1" ]]; then
     "folder=${JEPA_FOLDER}" \
     "${COMMON_DATA_ARGS[@]}" \
     "model=vit_tiny_2_1" \
-    "model.in_chans=2" \
+    "model.in_chans=${IN_CHANS}" \
     "model.lambda_value_vid=0.1" \
     "mask=stage1_event_activity_adaptive" \
     "loss.predict_all=true" \
@@ -71,6 +106,7 @@ if [[ "${RUN_MAE}" == "1" ]]; then
   python3 scripts/mae/run_mae.py \
     "folder=${MAE_FOLDER}" \
     "model=vit_tiny_mae" \
+    "model.in_chans=${IN_CHANS}" \
     "${COMMON_DATA_ARGS[@]}" \
     "optimization.weight_decay=0.04" \
     "optimization.final_weight_decay=0.04" \

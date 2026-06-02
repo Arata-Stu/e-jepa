@@ -3,9 +3,32 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-DSEC_ROOT="${DSEC_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s_tbin1}"
-MPX_ROOT="${MPX_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s_tbin1}"
-EVENTSCAPE_ROOT="${EVENTSCAPE_ROOT:-/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels_tbin1/Town01-03_train}"
+TBIN="${TBIN:-1}"
+if [[ -z "${IN_CHANS:-}" ]]; then
+  IN_CHANS=$((2 * TBIN))
+fi
+
+if [[ -z "${DSEC_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    DSEC_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s_tbin1"
+  else
+    DSEC_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/DSEC_voxels_semantic_20s"
+  fi
+fi
+if [[ -z "${MPX_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    MPX_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s_tbin1"
+  else
+    MPX_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/1mpx_voxels_20s"
+  fi
+fi
+if [[ -z "${EVENTSCAPE_ROOT:-}" ]]; then
+  if [[ "${TBIN}" == "1" ]]; then
+    EVENTSCAPE_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels_tbin1/Town01-03_train"
+  else
+    EVENTSCAPE_ROOT="/media/apollo-22/AT_2TB/dataset/t_1/EventScape_voxels/Town01-03_train"
+  fi
+fi
 
 DATASETS="[${DSEC_ROOT}/train,${MPX_ROOT}/train,${EVENTSCAPE_ROOT}]"
 DATASET_FPCS="${DATASET_FPCS:-[8,8,8]}"
@@ -39,7 +62,7 @@ COMMON_ARGS=(
   "data_aug.random_resize_scale=[1.0,1.0]"
   "data_aug.random_resize_aspect_ratio=[1.3333333333,1.3333333333]"
   "model=vit_tiny_2_1"
-  "model.in_chans=2"
+  "model.in_chans=${IN_CHANS}"
   "loss.weight_distance_loss=false"
   "optimization.epochs=${SWEEP_EPOCHS}"
   "optimization.ipe_scale=${SWEEP_IPE_SCALE}"
@@ -55,9 +78,13 @@ COMMON_ARGS=(
 run_jepa() {
   local name="$1"
   shift
-  echo "==== Running ${name} ===="
+  local folder_name="${name}"
+  if [[ "${TBIN}" != "1" ]]; then
+    folder_name="${name}_tbin${TBIN}_${IN_CHANS}ch"
+  fi
+  echo "==== Running ${folder_name} ===="
   python3 scripts/train/run_train.py \
-    "folder=outputs/${name}" \
+    "folder=outputs/${folder_name}" \
     "${COMMON_ARGS[@]}" \
     "$@"
 }

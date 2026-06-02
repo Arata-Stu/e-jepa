@@ -17,5 +17,5 @@
 - stage1 学習エントリは `scripts/train/run_train.py`（詳細: `docs/stage1_training.md`）
 - MAE 学習エントリは `scripts/mae/run_mae.py`（詳細: `docs/mae_pretraining.md`）
 - downstream 学習エントリは `scripts/downstream/run_downstream.py`（詳細: `docs/downstream_training.md`）
-- downstream 可視化は `scripts/downstream/visualize_val.py`（詳細: `docs/downstream_training.md`）
+- downstream 可視化 / MP4 出力は `scripts/downstream/visualize_val.py`（詳細: `docs/downstream_training.md`）
 - Hydra config には `img_data` / `img_mask` グループを追加済み（`img_data=event_h5_single_frame` で 1時刻サンプル branch を有効化可能）

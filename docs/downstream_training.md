@@ -80,6 +80,29 @@ Outputs:
 
 The script reads `<run-dir>/params-downstream-resolved.yaml`, so you do not need to repeat the original Hydra overrides.
 
+To make an MP4 from semantic segmentation results, use contiguous samples:
+
+```bash
+python3 scripts/downstream/visualize_val.py \
+  --run-dir outputs/downstream_dsec_sem/2026-05-21/12-34-56 \
+  --checkpoint-tag best \
+  --split val \
+  --sample-mode contiguous \
+  --start-index 0 \
+  --num-samples 240 \
+  --write-video \
+  --video-fps 12 \
+  --video-width 1280
+```
+
+Video-related options:
+
+- `--write-video`: write `<output-dir>/val_visualizations_best.mp4`
+- `--video-path /path/to/result.mp4`: custom MP4 path; this also enables video export
+- `--video-fps 12`: MP4 frame rate
+- `--video-width 1280`: resize rendered visualization frames before encoding; `0` keeps original size
+- `--sample-mode contiguous --start-index N --sample-stride K`: useful for smooth sequence videos
+
 ## Notes
 
 - Input is voxel clips sampled around each anchor window (`task.clip_num_frames`, `task.clip_frame_stride`).

@@ -25,6 +25,7 @@ from scripts.downstream.train import (
     _resize_logits_to_target,
     _to_dtype,
 )
+from scripts.preprocess.utils import RgbMp4Writer
 from src.downstream.datasets import EventDenseTaskDataset
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 
@@ -89,6 +90,27 @@ def _parse_args() -> argparse.Namespace:
         help="Explicit dataset indices from the validation set to visualize.",
     )
     parser.add_argument(
+        "--sample-mode",
+        choices=("spread", "contiguous"),
+        default="spread",
+        help=(
+            "How to choose samples when --sample-indices is not set. "
+            "'spread' keeps the old evenly-spaced behavior; 'contiguous' is useful for MP4 export."
+        ),
+    )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="First dataset index when --sample-mode=contiguous.",
+    )
+    parser.add_argument(
+        "--sample-stride",
+        type=int,
+        default=1,
+        help="Dataset-index stride when --sample-mode=contiguous.",
+    )
+    parser.add_argument(
         "--split",
         choices=("val", "train"),
         default="val",
@@ -99,6 +121,29 @@ def _parse_args() -> argparse.Namespace:
         choices=("auto", "cpu", "cuda"),
         default="auto",
         help="Inference device.",
+    )
+    parser.add_argument(
+        "--write-video",
+        action="store_true",
+        help="Also write an MP4 from the rendered sample visualizations.",
+    )
+    parser.add_argument(
+        "--video-path",
+        type=Path,
+        default=None,
+        help="Optional MP4 output path. Setting this also enables video export.",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=8.0,
+        help="Frames per second for --write-video.",
+    )
+    parser.add_argument(
+        "--video-width",
+        type=int,
+        default=0,
+        help="Resize rendered video frames to this width before encoding. Use 0 to keep original size.",
     )
     return parser.parse_args()
 
@@ -148,6 +193,12 @@ def _resolve_output_dir(args: argparse.Namespace, *, run_dir: Path | None, cfg: 
     return (folder / f"{args.split}_visualizations_{args.checkpoint_tag}").resolve()
 
 
+def _resolve_video_path(args: argparse.Namespace, *, output_dir: Path) -> Path:
+    if args.video_path is None:
+        return (output_dir / f"{args.split}_visualizations_{args.checkpoint_tag}.mp4").resolve()
+    return _resolve_path(args.video_path, base_dir=output_dir)
+
+
 def _resolve_device(device_name: str) -> torch.device:
     if device_name == "cpu":
         return torch.device("cpu")
@@ -160,7 +211,15 @@ def _resolve_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def _pick_sample_indices(total: int, *, num_samples: int, sample_indices: list[int] | None) -> list[int]:
+def _pick_sample_indices(
+    total: int,
+    *,
+    num_samples: int,
+    sample_indices: list[int] | None,
+    sample_mode: str,
+    start_index: int,
+    sample_stride: int,
+) -> list[int]:
     if total <= 0:
         return []
     if sample_indices:
@@ -170,7 +229,20 @@ def _pick_sample_indices(total: int, *, num_samples: int, sample_indices: list[i
                 raise IndexError(f"sample index out of range: {idx} (dataset size={total})")
             picked.append(int(idx))
         return picked
+
     count = max(1, min(int(num_samples), total))
+    if sample_mode == "contiguous":
+        start = int(start_index)
+        stride = int(sample_stride)
+        if start < 0 or start >= total:
+            raise IndexError(f"--start-index out of range: {start} (dataset size={total})")
+        if stride <= 0:
+            raise ValueError(f"--sample-stride must be positive, got {stride}")
+        return list(range(start, total, stride))[:count]
+
+    if sample_mode != "spread":
+        raise ValueError(f"Unsupported sample mode: {sample_mode}")
+
     if count == total:
         return list(range(total))
     grid = np.linspace(0, total - 1, num=count)
@@ -428,6 +500,35 @@ def _sample_depth_metrics(
 
 def _to_pil(rgb: np.ndarray) -> Image.Image:
     return Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
+
+
+def _pil_to_video_rgb(image: Image.Image, *, target_width: int) -> np.ndarray:
+    frame = image.convert("RGB")
+    width, height = frame.size
+    if int(target_width) > 0 and width != int(target_width):
+        scale = float(target_width) / float(width)
+        width = int(target_width)
+        height = max(1, int(round(float(height) * scale)))
+        frame = frame.resize((width, height), resample=_RESAMPLING.BILINEAR)
+
+    width, height = frame.size
+    even_width = width if width % 2 == 0 else width + 1
+    even_height = height if height % 2 == 0 else height + 1
+    if even_width != width or even_height != height:
+        padded = Image.new("RGB", (even_width, even_height), color=(248, 248, 248))
+        padded.paste(frame, (0, 0))
+        frame = padded
+
+    return np.asarray(frame, dtype=np.uint8)
+
+
+def _resize_video_rgb_to_size(frame_rgb: np.ndarray, *, size: tuple[int, int]) -> np.ndarray:
+    target_w, target_h = int(size[0]), int(size[1])
+    if int(frame_rgb.shape[1]) == target_w and int(frame_rgb.shape[0]) == target_h:
+        return np.asarray(frame_rgb, dtype=np.uint8)
+    image = _to_pil(frame_rgb)
+    resized = image.resize((target_w, target_h), resample=_RESAMPLING.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
 
 
 def _resize_rgb_to_hw(rgb: np.ndarray, *, target_hw: tuple[int, int]) -> np.ndarray:
@@ -757,12 +858,19 @@ def main() -> None:
         len(dataset),
         num_samples=int(args.num_samples),
         sample_indices=args.sample_indices,
+        sample_mode=str(args.sample_mode),
+        start_index=int(args.start_index),
+        sample_stride=int(args.sample_stride),
     )
     if len(picked_indices) == 0:
         raise RuntimeError("No samples were selected for visualization.")
 
     manifest_rows: list[dict[str, Any]] = []
     rendered_images: list[Image.Image] = []
+    write_video = bool(args.write_video or args.video_path is not None)
+    video_path = _resolve_video_path(args, output_dir=output_dir) if write_video else None
+    video_writer: RgbMp4Writer | None = None
+    video_frame_size: tuple[int, int] | None = None
     ignore_index = int(cfg_task.get("ignore_index", 255))
     depth_valid_min = float(cfg_task.get("depth_valid_min", 0.0))
     depth_valid_max = float(cfg_task.get("depth_valid_max", 1e9))
@@ -771,60 +879,86 @@ def main() -> None:
     print(f"Loaded config from: {config_path}")
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Writing visualizations to: {output_dir}")
+    if write_video:
+        if float(args.video_fps) <= 0.0:
+            raise ValueError(f"--video-fps must be positive, got {args.video_fps}")
+        if int(args.video_width) < 0:
+            raise ValueError(f"--video-width must be non-negative, got {args.video_width}")
+        assert video_path is not None
+        print(f"Writing MP4 to: {video_path}")
     if "epoch" in ckpt:
         print(f"Checkpoint epoch: {ckpt['epoch']}")
 
-    with torch.inference_mode():
-        for order, dataset_idx in enumerate(picked_indices):
-            sample = dataset[dataset_idx]
-            file_idx, center_window = dataset.samples[dataset_idx]
-            file_path = dataset.files[file_idx].preprocessed_h5
+    try:
+        with torch.inference_mode():
+            for order, dataset_idx in enumerate(picked_indices):
+                sample = dataset[dataset_idx]
+                file_idx, center_window = dataset.samples[dataset_idx]
+                file_path = dataset.files[file_idx].preprocessed_h5
 
-            x = sample["input"].unsqueeze(0).to(device)
-            with torch.autocast(
-                device_type=autocast_device_type,
-                dtype=dtype,
-                enabled=use_autocast,
-            ):
-                pred = model(x)
+                x = sample["input"].unsqueeze(0).to(device)
+                with torch.autocast(
+                    device_type=autocast_device_type,
+                    dtype=dtype,
+                    enabled=use_autocast,
+                ):
+                    pred = model(x)
 
-            if target == "semantic":
-                eval_target = sample.get("eval_target", sample["target"]).unsqueeze(0).to(device)
-                pred_eval = _resize_logits_to_target(
-                    pred,
-                    eval_target,
-                    mode=eval_logits_resize_mode,
-                )
-                pred_map = pred_eval.argmax(dim=1)[0].detach().cpu().numpy().astype(np.int64, copy=False)
-                image, row = _render_semantic_sample(
-                    sample=sample,
-                    sample_idx=dataset_idx,
-                    file_path=file_path,
-                    center_window=int(center_window),
-                    prediction=pred_map,
-                    ignore_index=ignore_index,
-                )
-            else:
-                pred_map = pred[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-                image, row = _render_depth_sample(
-                    sample=sample,
-                    sample_idx=dataset_idx,
-                    file_path=file_path,
-                    center_window=int(center_window),
-                    prediction=pred_map,
-                    depth_valid_min=depth_valid_min,
-                    depth_valid_max=depth_valid_max,
-                )
+                if target == "semantic":
+                    eval_target = sample.get("eval_target", sample["target"]).unsqueeze(0).to(device)
+                    pred_eval = _resize_logits_to_target(
+                        pred,
+                        eval_target,
+                        mode=eval_logits_resize_mode,
+                    )
+                    pred_map = pred_eval.argmax(dim=1)[0].detach().cpu().numpy().astype(np.int64, copy=False)
+                    image, row = _render_semantic_sample(
+                        sample=sample,
+                        sample_idx=dataset_idx,
+                        file_path=file_path,
+                        center_window=int(center_window),
+                        prediction=pred_map,
+                        ignore_index=ignore_index,
+                    )
+                else:
+                    pred_map = pred[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+                    image, row = _render_depth_sample(
+                        sample=sample,
+                        sample_idx=dataset_idx,
+                        file_path=file_path,
+                        center_window=int(center_window),
+                        prediction=pred_map,
+                        depth_valid_min=depth_valid_min,
+                        depth_valid_max=depth_valid_max,
+                    )
 
-            output_name = f"sample_{order:03d}_idx{dataset_idx:06d}_{file_path.stem}_w{int(center_window):06d}.png"
-            output_path = output_dir / output_name
-            image.save(output_path)
-            rendered_images.append(image)
+                output_name = f"sample_{order:03d}_idx{dataset_idx:06d}_{file_path.stem}_w{int(center_window):06d}.png"
+                output_path = output_dir / output_name
+                image.save(output_path)
+                rendered_images.append(image)
 
-            row["order"] = int(order)
-            row["output_png"] = str(output_path)
-            manifest_rows.append(row)
-            print(f"[{order + 1}/{len(picked_indices)}] wrote {output_path.name}")
+                if write_video:
+                    assert video_path is not None
+                    frame_rgb = _pil_to_video_rgb(image, target_width=int(args.video_width))
+                    if video_writer is None:
+                        video_frame_size = (int(frame_rgb.shape[1]), int(frame_rgb.shape[0]))
+                        video_writer = RgbMp4Writer(
+                            video_path,
+                            fps=float(args.video_fps),
+                            width=video_frame_size[0],
+                            height=video_frame_size[1],
+                        )
+                    elif video_frame_size is not None:
+                        frame_rgb = _resize_video_rgb_to_size(frame_rgb, size=video_frame_size)
+                    video_writer.write_rgb(frame_rgb)
+
+                row["order"] = int(order)
+                row["output_png"] = str(output_path)
+                manifest_rows.append(row)
+                print(f"[{order + 1}/{len(picked_indices)}] wrote {output_path.name}")
+    finally:
+        if video_writer is not None:
+            video_writer.close()
 
     contact_sheet = _make_contact_sheet(rendered_images, columns=2 if len(rendered_images) > 1 else 1)
     contact_sheet_path = output_dir / "contact_sheet.png"
@@ -840,6 +974,9 @@ def main() -> None:
     print(f"Wrote {len(rendered_images)} sample image(s) to {output_dir}")
     print(f"Contact sheet: {contact_sheet_path}")
     print(f"Manifest: {manifest_path}")
+    if write_video:
+        assert video_path is not None
+        print(f"MP4: {video_path}")
 
 
 if __name__ == "__main__":

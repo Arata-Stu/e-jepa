@@ -8,6 +8,7 @@ from logging import getLogger
 from multiprocessing import Value
 
 import torch
+import torch.nn.functional as F
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -34,6 +35,84 @@ def _estimate_batch_active_pixel_ratio(collated_batch, threshold=1e-6):
         return None
 
     return float(torch.stack(sample_activity, dim=0).mean().item())
+
+
+def _clip_to_patch_activity(
+    clip,
+    *,
+    threshold,
+    duration,
+    height,
+    width,
+    temporal_patch_size,
+    spatial_patch_size,
+):
+    if not torch.is_tensor(clip) or clip.ndim != 5:
+        return None
+
+    patch_h, patch_w = spatial_patch_size
+    required_t = int(duration * temporal_patch_size)
+    required_h = int(height * patch_h)
+    required_w = int(width * patch_w)
+    if (
+        clip.shape[2] < required_t
+        or clip.shape[3] < required_h
+        or clip.shape[4] < required_w
+    ):
+        return None
+
+    # clip: [B, C, T, H, W]. Collapse channels, then measure active ratio per tubelet patch.
+    active = (
+        clip.detach()
+        .abs()[:, :, :required_t, :required_h, :required_w]
+        .amax(dim=1)
+        .gt(float(threshold))
+        .float()
+    )
+    active = active.contiguous().view(
+        active.shape[0],
+        duration,
+        temporal_patch_size,
+        height,
+        patch_h,
+        width,
+        patch_w,
+    )
+    return active.mean(dim=(2, 4, 6))
+
+
+def _estimate_batch_patch_activity(
+    collated_batch,
+    *,
+    threshold,
+    duration,
+    height,
+    width,
+    temporal_patch_size,
+    spatial_patch_size,
+):
+    patch_activity = []
+    for clip in _iter_clip_tensors(collated_batch):
+        activity = _clip_to_patch_activity(
+            clip,
+            threshold=threshold,
+            duration=duration,
+            height=height,
+            width=width,
+            temporal_patch_size=temporal_patch_size,
+            spatial_patch_size=spatial_patch_size,
+        )
+        if activity is not None:
+            patch_activity.append(activity)
+
+    if len(patch_activity) == 0:
+        return None
+
+    batch_size = min(activity.shape[0] for activity in patch_activity)
+    if batch_size <= 0:
+        return None
+
+    return torch.stack([activity[:batch_size] for activity in patch_activity], dim=0).mean(dim=0)
 
 
 def _clip_pair(value, min_value, max_value):
@@ -86,6 +165,12 @@ class MaskCollator(object):
                     activity_max_spatial_scale=m.get(
                         "activity_max_spatial_scale", 0.5
                     ),
+                    location_strategy=m.get("location_strategy", "random"),
+                    activity_location_floor=m.get("activity_location_floor", 0.0),
+                    activity_location_random_prob=m.get(
+                        "activity_location_random_prob", 0.0
+                    ),
+                    activity_location_power=m.get("activity_location_power", 1.0),
                 )
                 self.mask_generators[fpc].append(mask_generator)
 
@@ -129,9 +214,21 @@ class MaskCollator(object):
                         collated_batch,
                         threshold=mask_generator.activity_threshold,
                     )
+                patch_activity = None
+                if mask_generator.location_strategy == "activity_weighted":
+                    patch_activity = _estimate_batch_patch_activity(
+                        collated_batch,
+                        threshold=mask_generator.activity_threshold,
+                        duration=mask_generator.duration,
+                        height=mask_generator.height,
+                        width=mask_generator.width,
+                        temporal_patch_size=mask_generator.temporal_patch_size,
+                        spatial_patch_size=mask_generator.spatial_patch_size,
+                    )
                 masks_enc, masks_pred = mask_generator(
                     batch_size,
                     batch_activity=batch_activity,
+                    patch_activity=patch_activity,
                 )
                 collated_masks_enc.append(masks_enc)
                 collated_masks_pred.append(masks_pred)
@@ -167,6 +264,10 @@ class _MaskGenerator(object):
         activity_high_scale=1.15,
         activity_min_spatial_scale=0.02,
         activity_max_spatial_scale=0.5,
+        location_strategy="random",
+        activity_location_floor=0.0,
+        activity_location_random_prob=0.0,
+        activity_location_power=1.0,
     ):
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
@@ -202,6 +303,16 @@ class _MaskGenerator(object):
         self.activity_high_scale = float(activity_high_scale)
         self.activity_min_spatial_scale = float(activity_min_spatial_scale)
         self.activity_max_spatial_scale = float(activity_max_spatial_scale)
+        self.location_strategy = str(location_strategy)
+        valid_location_strategies = {"random", "activity_weighted"}
+        if self.location_strategy not in valid_location_strategies:
+            raise ValueError(
+                f"Unsupported mask location_strategy={self.location_strategy}. "
+                f"Expected one of {sorted(valid_location_strategies)}."
+            )
+        self.activity_location_floor = float(activity_location_floor)
+        self.activity_location_random_prob = float(activity_location_random_prob)
+        self.activity_location_power = float(activity_location_power)
 
     def step(self):
         i = self._itr_counter
@@ -266,11 +377,71 @@ class _MaskGenerator(object):
             max_value=self.activity_max_spatial_scale,
         )
 
-    def _sample_block_mask(self, b_size):
+    def _sample_random_block_origin(self, b_size):
         t, h, w = b_size
-        top = torch.randint(0, self.height - h + 1, (1,))
-        left = torch.randint(0, self.width - w + 1, (1,))
-        start = torch.randint(0, self.duration - t + 1, (1,))
+        start = int(torch.randint(0, self.duration - t + 1, (1,)).item())
+        top = int(torch.randint(0, self.height - h + 1, (1,)).item())
+        left = int(torch.randint(0, self.width - w + 1, (1,)).item())
+        return start, top, left
+
+    def _sample_activity_weighted_block_origin(self, b_size, patch_activity):
+        if patch_activity is None:
+            return self._sample_random_block_origin(b_size)
+
+        if (
+            float(self.activity_location_random_prob) > 0.0
+            and torch.rand(1).item() < float(self.activity_location_random_prob)
+        ):
+            return self._sample_random_block_origin(b_size)
+
+        t, h, w = b_size
+        if tuple(patch_activity.shape) != (self.duration, self.height, self.width):
+            return self._sample_random_block_origin(b_size)
+
+        kernel = torch.ones(
+            (1, 1, t, h, w),
+            dtype=patch_activity.dtype,
+            device=patch_activity.device,
+        )
+        scores = F.conv3d(
+            patch_activity.float().unsqueeze(0).unsqueeze(0),
+            kernel.float(),
+        ).flatten()
+        scores = scores.clamp_min(0.0)
+        if self.activity_location_power != 1.0:
+            scores = scores.pow(self.activity_location_power)
+
+        if scores.numel() == 0:
+            return self._sample_random_block_origin(b_size)
+
+        max_score = scores.max()
+        if float(max_score.item()) > 0.0 and self.activity_location_floor > 0:
+            scores = scores + max_score * self.activity_location_floor
+
+        total_score = scores.sum()
+        if (
+            not bool(torch.isfinite(total_score).item())
+            or float(total_score.item()) <= 0.0
+        ):
+            return self._sample_random_block_origin(b_size)
+
+        sampled = int(torch.multinomial(scores, num_samples=1).item())
+        spatial_positions = (self.height - h + 1) * (self.width - w + 1)
+        start = sampled // spatial_positions
+        rem = sampled % spatial_positions
+        top = rem // (self.width - w + 1)
+        left = rem % (self.width - w + 1)
+        return int(start), int(top), int(left)
+
+    def _sample_block_mask(self, b_size, patch_activity=None):
+        t, h, w = b_size
+        if self.location_strategy == "activity_weighted":
+            start, top, left = self._sample_activity_weighted_block_origin(
+                b_size,
+                patch_activity,
+            )
+        else:
+            start, top, left = self._sample_random_block_origin(b_size)
 
         mask = torch.ones((self.duration, self.height, self.width), dtype=torch.int32)
         mask[start : start + t, top : top + h, left : left + w] = 0
@@ -283,7 +454,7 @@ class _MaskGenerator(object):
         # --
         return mask
 
-    def __call__(self, batch_size, batch_activity=None):
+    def __call__(self, batch_size, batch_activity=None, patch_activity=None):
         """
         Create encoder and predictor masks when collating imgs into a batch
         # 1. sample pred block size using seed
@@ -303,7 +474,10 @@ class _MaskGenerator(object):
 
         collated_masks_pred, collated_masks_enc = [], []
         min_keep_enc = min_keep_pred = self.duration * self.height * self.width
-        for _ in range(batch_size):
+        for sample_idx in range(batch_size):
+            sample_patch_activity = None
+            if patch_activity is not None and sample_idx < patch_activity.shape[0]:
+                sample_patch_activity = patch_activity[sample_idx]
 
             empty_context = True
             while empty_context:
@@ -312,7 +486,10 @@ class _MaskGenerator(object):
                     (self.duration, self.height, self.width), dtype=torch.int32
                 )
                 for _ in range(self.npred):
-                    mask_e *= self._sample_block_mask(p_size)
+                    mask_e *= self._sample_block_mask(
+                        p_size,
+                        patch_activity=sample_patch_activity,
+                    )
                 mask_e = mask_e.flatten()
 
                 mask_p = torch.argwhere(mask_e == 0).squeeze()

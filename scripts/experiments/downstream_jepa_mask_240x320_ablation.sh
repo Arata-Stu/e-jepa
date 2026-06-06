@@ -108,6 +108,12 @@ COMMON_TASK_ARGS=(
 )
 
 EXTRA_ARGS=("$@")
+for arg in "${EXTRA_ARGS[@]}"; do
+  if [[ "${arg}" == "hydra.run.dir=" ]]; then
+    echo "hydra.run.dir is empty. Set it to a concrete output directory or omit it." >&2
+    exit 1
+  fi
+done
 
 find_stage1_checkpoint() {
   local strategy_name="$1"

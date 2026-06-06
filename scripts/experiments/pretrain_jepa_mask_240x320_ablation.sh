@@ -97,6 +97,12 @@ COMMON_ARGS=(
 )
 
 EXTRA_ARGS=("$@")
+for arg in "${EXTRA_ARGS[@]}"; do
+  if [[ "${arg}" == "hydra.run.dir=" ]]; then
+    echo "hydra.run.dir is empty. Set RUN_DIR to a concrete output directory before resuming." >&2
+    exit 1
+  fi
+done
 
 run_jepa() {
   local name="$1"

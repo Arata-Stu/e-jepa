@@ -37,6 +37,7 @@ DATASET_WEIGHTS="${DATASET_WEIGHTS:-[0.15,0.7,0.15]}"
 RUN_RANDOM="${RUN_RANDOM:-1}"
 RUN_ADAPTIVE_AREA="${RUN_ADAPTIVE_AREA:-1}"
 RUN_STRATEGIC="${RUN_STRATEGIC:-1}"
+RUN_STRATEGIC_SMALL="${RUN_STRATEGIC_SMALL:-0}"
 
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-2000}"
 PRETRAIN_IPE_SCALE="${PRETRAIN_IPE_SCALE:-1.25}"
@@ -128,4 +129,8 @@ fi
 
 if [[ "${RUN_STRATEGIC}" == "1" ]]; then
   run_jepa "03_strategic" "stage1_event_strategic"
+fi
+
+if [[ "${RUN_STRATEGIC_SMALL}" == "1" ]]; then
+  run_jepa "04_strategic_small" "stage1_event_strategic_small"
 fi

@@ -1,0 +1,41 @@
+# Small strategic event masks for Stage-1 JEPA mask ablation.
+# Uses smaller activity-weighted blocks to keep target regions dense under sparse events.
+- num_blocks: 6
+  spatial_scale: [0.04, 0.08]
+  temporal_scale: [1.0, 1.0]
+  aspect_ratio: [0.75, 1.5]
+  max_temporal_keep: 1.0
+  max_keep: null
+  full_complement: false
+  activity_adaptive: true
+  activity_threshold: 1.0e-6
+  activity_low: 0.005
+  activity_high: 0.04
+  activity_low_scale: 0.65
+  activity_high_scale: 1.25
+  activity_min_spatial_scale: 0.015
+  activity_max_spatial_scale: 0.12
+  location_strategy: activity_weighted
+  activity_location_floor: 0.01
+  activity_location_random_prob: 0.05
+  activity_location_power: 1.0
+
+- num_blocks: 2
+  spatial_scale: [0.10, 0.18]
+  temporal_scale: [1.0, 1.0]
+  aspect_ratio: [0.75, 1.5]
+  max_temporal_keep: 1.0
+  max_keep: null
+  full_complement: false
+  activity_adaptive: true
+  activity_threshold: 1.0e-6
+  activity_low: 0.005
+  activity_high: 0.04
+  activity_low_scale: 0.60
+  activity_high_scale: 1.20
+  activity_min_spatial_scale: 0.03
+  activity_max_spatial_scale: 0.25
+  location_strategy: activity_weighted
+  activity_location_floor: 0.01
+  activity_location_random_prob: 0.05
+  activity_location_power: 1.0

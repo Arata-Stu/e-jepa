@@ -25,6 +25,17 @@ def _iter_clip_tensors(value):
 
 
 def _estimate_batch_active_pixel_ratio(collated_batch, threshold=1e-6):
+    sample_activity = _estimate_sample_active_pixel_ratio(
+        collated_batch,
+        threshold=threshold,
+    )
+    if sample_activity is None:
+        return None
+
+    return float(sample_activity.mean().item())
+
+
+def _estimate_sample_active_pixel_ratio(collated_batch, threshold=1e-6):
     sample_activity = []
     for clip in _iter_clip_tensors(collated_batch):
         # clip: [B, C, T, H, W]. Count a pixel active if any channel/time is active.
@@ -34,7 +45,7 @@ def _estimate_batch_active_pixel_ratio(collated_batch, threshold=1e-6):
     if len(sample_activity) == 0:
         return None
 
-    return float(torch.stack(sample_activity, dim=0).mean().item())
+    return torch.stack(sample_activity, dim=0).mean(dim=0)
 
 
 def _clip_to_patch_activity(
@@ -165,6 +176,7 @@ class MaskCollator(object):
                     activity_max_spatial_scale=m.get(
                         "activity_max_spatial_scale", 0.5
                     ),
+                    activity_adaptive_scope=m.get("activity_adaptive_scope", "batch"),
                     location_strategy=m.get("location_strategy", "random"),
                     activity_location_floor=m.get("activity_location_floor", 0.0),
                     activity_location_random_prob=m.get(
@@ -209,11 +221,20 @@ class MaskCollator(object):
             collated_masks_pred, collated_masks_enc = [], []
             for i, mask_generator in enumerate(self.mask_generators[fpc]):
                 batch_activity = None
+                sample_activity = None
                 if mask_generator.activity_adaptive:
-                    batch_activity = _estimate_batch_active_pixel_ratio(
-                        collated_batch,
-                        threshold=mask_generator.activity_threshold,
-                    )
+                    if mask_generator.activity_adaptive_scope == "sample":
+                        sample_activity = _estimate_sample_active_pixel_ratio(
+                            collated_batch,
+                            threshold=mask_generator.activity_threshold,
+                        )
+                        if sample_activity is not None:
+                            batch_activity = float(sample_activity.mean().item())
+                    if batch_activity is None:
+                        batch_activity = _estimate_batch_active_pixel_ratio(
+                            collated_batch,
+                            threshold=mask_generator.activity_threshold,
+                        )
                 patch_activity = None
                 if mask_generator.location_strategy == "activity_weighted":
                     patch_activity = _estimate_batch_patch_activity(
@@ -228,6 +249,7 @@ class MaskCollator(object):
                 masks_enc, masks_pred = mask_generator(
                     batch_size,
                     batch_activity=batch_activity,
+                    sample_activity=sample_activity,
                     patch_activity=patch_activity,
                 )
                 collated_masks_enc.append(masks_enc)
@@ -264,6 +286,7 @@ class _MaskGenerator(object):
         activity_high_scale=1.15,
         activity_min_spatial_scale=0.02,
         activity_max_spatial_scale=0.5,
+        activity_adaptive_scope="batch",
         location_strategy="random",
         activity_location_floor=0.0,
         activity_location_random_prob=0.0,
@@ -303,6 +326,13 @@ class _MaskGenerator(object):
         self.activity_high_scale = float(activity_high_scale)
         self.activity_min_spatial_scale = float(activity_min_spatial_scale)
         self.activity_max_spatial_scale = float(activity_max_spatial_scale)
+        self.activity_adaptive_scope = str(activity_adaptive_scope)
+        valid_activity_adaptive_scopes = {"batch", "sample"}
+        if self.activity_adaptive_scope not in valid_activity_adaptive_scopes:
+            raise ValueError(
+                f"Unsupported mask activity_adaptive_scope={self.activity_adaptive_scope}. "
+                f"Expected one of {sorted(valid_activity_adaptive_scopes)}."
+            )
         self.location_strategy = str(location_strategy)
         valid_location_strategies = {"random", "activity_weighted"}
         if self.location_strategy not in valid_location_strategies:
@@ -454,7 +484,13 @@ class _MaskGenerator(object):
         # --
         return mask
 
-    def __call__(self, batch_size, batch_activity=None, patch_activity=None):
+    def __call__(
+        self,
+        batch_size,
+        batch_activity=None,
+        sample_activity=None,
+        patch_activity=None,
+    ):
         """
         Create encoder and predictor masks when collating imgs into a batch
         # 1. sample pred block size using seed
@@ -464,13 +500,20 @@ class _MaskGenerator(object):
         seed = self.step()
         g = torch.Generator()
         g.manual_seed(seed)
-        spatial_scale = self._adapt_spatial_scale(batch_activity)
-        p_size = self._sample_block_size(
-            generator=g,
-            temporal_scale=self.temporal_pred_mask_scale,
-            spatial_scale=spatial_scale,
-            aspect_ratio_scale=self.aspect_ratio,
+        use_sample_adaptive_area = (
+            self.activity_adaptive
+            and self.activity_adaptive_scope == "sample"
+            and sample_activity is not None
         )
+        batch_p_size = None
+        if not use_sample_adaptive_area:
+            batch_spatial_scale = self._adapt_spatial_scale(batch_activity)
+            batch_p_size = self._sample_block_size(
+                generator=g,
+                temporal_scale=self.temporal_pred_mask_scale,
+                spatial_scale=batch_spatial_scale,
+                aspect_ratio_scale=self.aspect_ratio,
+            )
 
         collated_masks_pred, collated_masks_enc = [], []
         min_keep_enc = min_keep_pred = self.duration * self.height * self.width
@@ -478,6 +521,19 @@ class _MaskGenerator(object):
             sample_patch_activity = None
             if patch_activity is not None and sample_idx < patch_activity.shape[0]:
                 sample_patch_activity = patch_activity[sample_idx]
+            p_size = batch_p_size
+            if use_sample_adaptive_area and sample_idx < len(sample_activity):
+                sample_spatial_scale = self._adapt_spatial_scale(
+                    float(torch.as_tensor(sample_activity[sample_idx]).item())
+                )
+                p_size = self._sample_block_size(
+                    generator=g,
+                    temporal_scale=self.temporal_pred_mask_scale,
+                    spatial_scale=sample_spatial_scale,
+                    aspect_ratio_scale=self.aspect_ratio,
+                )
+            if p_size is None:
+                raise RuntimeError("Failed to sample mask block size")
 
             empty_context = True
             while empty_context:

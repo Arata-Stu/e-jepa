@@ -54,6 +54,125 @@ PRED_COLOR = (217, 48, 37)
 CONTEXT_COLOR = (52, 168, 83)
 
 
+def _normalize_grid(values: np.ndarray, *, percentile: float = 99.0) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros(arr.shape, dtype=np.float32)
+    upper = float(np.percentile(arr, percentile))
+    if upper <= 0.0:
+        upper = float(arr.max()) if arr.size > 0 else 0.0
+    if upper <= 0.0:
+        return np.zeros(arr.shape, dtype=np.float32)
+    return np.clip(arr / upper, 0.0, 1.0)
+
+
+def _activity_grid_to_rgb(
+    activity_grid: np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    norm = _normalize_grid(activity_grid)
+    stops = np.asarray(
+        [
+            [8, 12, 20],
+            [30, 64, 175],
+            [0, 160, 220],
+            [0, 190, 125],
+            [180, 220, 70],
+            [255, 240, 120],
+            [255, 255, 255],
+        ],
+        dtype=np.float32,
+    )
+    scaled = norm * float(len(stops) - 1)
+    lo = np.floor(scaled).astype(np.int64)
+    hi = np.clip(lo + 1, 0, len(stops) - 1)
+    frac = (scaled - lo.astype(np.float32))[..., None]
+    rgb_grid = stops[lo] * (1.0 - frac) + stops[hi] * frac
+
+    grid_h, grid_w = [int(v) for v in rgb_grid.shape[:2]]
+    repeat_h = max(1, int(math.ceil(float(height) / float(max(1, grid_h)))))
+    repeat_w = max(1, int(math.ceil(float(width) / float(max(1, grid_w)))))
+    rgb = np.repeat(np.repeat(rgb_grid, repeat_h, axis=0), repeat_w, axis=1)
+    return np.clip(rgb[:height, :width], 0.0, 255.0).astype(np.uint8)
+
+
+def _clip_patch_activity(
+    clip_np: np.ndarray,
+    *,
+    temporal_dim: int,
+    grid_h: int,
+    grid_w: int,
+    threshold: float,
+) -> np.ndarray:
+    if clip_np.ndim != 4:
+        raise ValueError(f"clip_np must be [C,T,H,W], got shape={clip_np.shape}")
+    channels, num_frames, height, width = [int(v) for v in clip_np.shape]
+    if temporal_dim <= 0 or grid_h <= 0 or grid_w <= 0:
+        raise ValueError("temporal_dim, grid_h, and grid_w must be positive")
+    required_t = int(temporal_dim)
+    temporal_patch_size = max(1, num_frames // required_t)
+    required_t = int(temporal_dim * temporal_patch_size)
+    patch_h = max(1, height // int(grid_h))
+    patch_w = max(1, width // int(grid_w))
+    required_h = int(grid_h * patch_h)
+    required_w = int(grid_w * patch_w)
+    active = (
+        np.max(
+            np.abs(
+                clip_np[
+                    :,
+                    :required_t,
+                    :required_h,
+                    :required_w,
+                ]
+            ),
+            axis=0,
+        )
+        > float(threshold)
+    ).astype(np.float32)
+    active = active.reshape(
+        int(temporal_dim),
+        int(temporal_patch_size),
+        int(grid_h),
+        int(patch_h),
+        int(grid_w),
+        int(patch_w),
+    )
+    return active.mean(axis=(1, 3, 5))
+
+
+def _spatial_mask_from_volume(volume: np.ndarray) -> np.ndarray:
+    arr = np.asarray(volume, dtype=bool)
+    if arr.ndim != 3:
+        raise ValueError(f"volume must be [T,H,W], got shape={arr.shape}")
+    return arr.any(axis=0)
+
+
+def _mask_activity_stats(
+    *,
+    spatial_activity: np.ndarray,
+    spatial_mask: np.ndarray,
+) -> dict[str, float]:
+    activity = np.asarray(spatial_activity, dtype=np.float32)
+    mask = np.asarray(spatial_mask, dtype=bool)
+    total_activity = float(activity.sum())
+    masked_activity = float(activity[mask].sum()) if np.any(mask) else 0.0
+    mask_area = float(mask.mean()) if mask.size > 0 else 0.0
+    activity_share = masked_activity / total_activity if total_activity > 0.0 else 0.0
+    mean_all = float(activity.mean()) if activity.size > 0 else 0.0
+    mean_masked = float(activity[mask].mean()) if np.any(mask) else 0.0
+    enrichment = mean_masked / mean_all if mean_all > 0.0 else 0.0
+    return {
+        "mask_area": mask_area,
+        "activity_share": activity_share,
+        "mean_all": mean_all,
+        "mean_masked": mean_masked,
+        "enrichment": enrichment,
+    }
+
+
 def _strip_mask_overrides(overrides: list[str]) -> list[str]:
     stripped: list[str] = []
     for override in overrides:
@@ -273,12 +392,22 @@ def _render_comparison_sheet(
     frame_display_height: int,
     max_frames: int,
     mask_view: str,
+    activity_threshold: float,
+    show_activity_heatmap: bool,
 ) -> tuple[Image.Image, list[str]]:
     clip_np = np.asarray(clip_tensor.detach().cpu(), dtype=np.float32)
     if clip_np.ndim != 4:
         raise ValueError(f"clip must be [C,T,H,W], got shape={clip_np.shape}")
     channels, num_frames, height, width = [int(v) for v in clip_np.shape]
     frame_ids = _select_frame_ids(num_frames=num_frames, max_frames=max_frames)
+    patch_activity = _clip_patch_activity(
+        clip_np,
+        temporal_dim=temporal_dim,
+        grid_h=grid_h,
+        grid_w=grid_w,
+        threshold=float(activity_threshold),
+    )
+    spatial_activity = patch_activity.sum(axis=0)
 
     header_lines = [
         f"sample_index={sample_index} draw_index={draw_index}",
@@ -356,14 +485,35 @@ def _render_comparison_sheet(
                     f"pattern={pattern_idx} strategy={strategy_name} missing=true"
                 )
                 continue
+            stats = _mask_activity_stats(
+                spatial_activity=spatial_activity,
+                spatial_mask=_spatial_mask_from_volume(pred_volume),
+            )
             summary_lines.append(
                 (
                     f"pattern={pattern_idx} strategy={strategy_name} cfg={cfg_text} "
                     f"pred={int(pred_volume.sum())}/{total_tokens} ({pred_volume.mean():.2%}) "
-                    f"context={int(enc_volume.sum())}/{total_tokens} ({enc_volume.mean():.2%})"
+                    f"context={int(enc_volume.sum())}/{total_tokens} ({enc_volume.mean():.2%}) "
+                    f"pred_spatial_area={stats['mask_area']:.2%} "
+                    f"activity_in_pred={stats['activity_share']:.2%} "
+                    f"activity_density_enrichment={stats['enrichment']:.3f}x"
                 )
             )
 
+        if show_activity_heatmap and mask_view in {"predictor", "both"}:
+            rows.append(
+                _render_activity_heatmap_grid(
+                    title=(
+                        f"Pattern {pattern_idx} Clip Activity Heatmap + Predictor Mask "
+                        f"| red=mask, bright=more events"
+                    ),
+                    spatial_activity=spatial_activity,
+                    image_hw=(height, width),
+                    strategy_names=strategy_names,
+                    volumes=pred_volumes,
+                    frame_display_height=frame_display_height,
+                )
+            )
         if mask_view in {"predictor", "both"}:
             rows.append(
                 _render_mask_grid(
@@ -447,6 +597,60 @@ def _render_mask_grid(
         title=title,
         panels=panels,
         row_labels=row_labels,
+        col_labels=strategy_names,
+        frame_display_height=frame_display_height,
+    )
+
+
+def _render_activity_heatmap_grid(
+    *,
+    title: str,
+    spatial_activity: np.ndarray,
+    image_hw: tuple[int, int],
+    strategy_names: list[str],
+    volumes: list[np.ndarray | None],
+    frame_display_height: int,
+) -> Image.Image:
+    height, width = [int(v) for v in image_hw]
+    base_rgb = _activity_grid_to_rgb(
+        spatial_activity,
+        height=height,
+        width=width,
+    )
+    row: list[Image.Image] = []
+    for strategy_name, volume in zip(strategy_names, volumes):
+        if volume is None:
+            panel = Image.new("RGB", (width, height), color=(240, 240, 240))
+            row.append(_annotate_panel(panel, f"{strategy_name}: missing"))
+            continue
+        spatial_mask = _spatial_mask_from_volume(volume)
+        stats = _mask_activity_stats(
+            spatial_activity=spatial_activity,
+            spatial_mask=spatial_mask,
+        )
+        overlay = _overlay_patch_mask(
+            base_rgb,
+            spatial_mask,
+            color=PRED_COLOR,
+            dim_alpha=0.58,
+            color_alpha=0.82,
+        )
+        image = _draw_patch_grid(
+            Image.fromarray(overlay, mode="RGB"),
+            grid_h=int(spatial_activity.shape[0]),
+            grid_w=int(spatial_activity.shape[1]),
+            color=(30, 30, 30),
+        )
+        label = (
+            f"{strategy_name} | act={stats['activity_share']:.1%} "
+            f"area={stats['mask_area']:.1%} dens={stats['enrichment']:.2f}x"
+        )
+        row.append(_annotate_panel(image, label))
+
+    return _make_panel_grid(
+        title=title,
+        panels=[row],
+        row_labels=["clip"],
         col_labels=strategy_names,
         frame_display_height=frame_display_height,
     )
@@ -536,6 +740,17 @@ def _parse_args() -> argparse.Namespace:
         help="Which mask side to render.",
     )
     parser.add_argument(
+        "--activity-threshold",
+        type=float,
+        default=1.0e-6,
+        help="Threshold used to compute the visualization-only activity heatmap.",
+    )
+    parser.add_argument(
+        "--hide-activity-heatmap",
+        action="store_true",
+        help="Disable the clip-level activity heatmap with predictor-mask overlay.",
+    )
+    parser.add_argument(
         "--branch",
         choices=["video", "image"],
         default="video",
@@ -615,6 +830,8 @@ def main() -> None:
         f"tubelet_size={tubelet_size}",
         f"dataset_fpcs={dataset_fpcs}",
         f"mask_groups={mask_groups}",
+        f"activity_threshold={cli_args.activity_threshold}",
+        f"show_activity_heatmap={not bool(cli_args.hide_activity_heatmap)}",
         "",
     ]
     written_images: list[Path] = []
@@ -680,6 +897,8 @@ def main() -> None:
                 frame_display_height=int(cli_args.frame_height),
                 max_frames=int(cli_args.max_frames),
                 mask_view=str(cli_args.mask_view),
+                activity_threshold=float(cli_args.activity_threshold),
+                show_activity_heatmap=not bool(cli_args.hide_activity_heatmap),
             )
 
             file_stem = Path(sample_path).stem.replace(" ", "_")

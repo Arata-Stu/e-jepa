@@ -63,6 +63,60 @@ This supports:
 - single-window loading (`dataset_fpcs=1`)
 - multi-window pseudo-video loading (`dataset_fpcs>1`)
 
+## M3ED raw-event loading
+
+M3ED can also be used directly from its raw event HDF5 files. In this mode,
+voxel/event-image representations are generated inside DataLoader workers and
+no preprocessed `/voxels` HDF5 is required.
+
+JEPA:
+
+```bash
+python scripts/train/run_train.py \
+  data=m3ed_raw \
+  data.datasets=[/path/to/M3ED]
+```
+
+MAE:
+
+```bash
+python scripts/mae/run_mae.py \
+  data=m3ed_raw \
+  data.datasets=[/path/to/M3ED]
+```
+
+The `m3ed_raw` preset matches `m3ed_semantic_t10`: semantic-midpoint windows,
+10 temporal bins, split polarity (20 input channels), nearest 2x spatial
+downsampling, non-trilinear voxelization, and float16 round-trip emulation.
+It creates virtual 20-second chunks from semantic anchor timestamps so that
+dataset length and clip sampling remain aligned with the former split-H5
+workflow.
+
+The preset expects the official downloaded tree used by `tmp/f3`:
+
+```text
+M3ED/
+└── <sequence>/
+    ├── <sequence>_data.h5
+    ├── <sequence>_semantics.h5   # optional
+    ├── <sequence>_depth_gt.h5    # optional
+    └── ...
+```
+
+The loader reads left events from
+`<sequence>_data.h5:/prophesee/left/{x,y,t,p}` and uses
+`/prophesee/left/ms_map_idx` when available. For `semantics_middle`,
+`auto` selects the sibling `_semantics.h5:/ts` first and then falls back to
+`_data.h5:/ovc/ts`. Therefore semantic labels are not required for
+frame-aligned self-supervised pretraining. The former extracted layout
+(`semantics/ts`, timestamp maps, root `t_offset`, and root `ms_to_idx`) remains
+supported when an H5 file is supplied directly or `file_pattern` is
+overridden.
+
+When a millisecond index is absent, the loader performs binary searches on the
+raw event timestamp dataset instead of building and storing a preprocessing
+index.
+
 ## Transform behavior
 
 `EventVideoTransform` applies:

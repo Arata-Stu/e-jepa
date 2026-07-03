@@ -451,6 +451,56 @@ def main(args, resume_preempt: bool = False):
         "activity_filter_active_window_threshold",
         None,
     )
+    representation = str(cfgs_data.get("representation", "voxel_grid"))
+    input_height = int(cfgs_data.get("input_height", 720))
+    input_width = int(cfgs_data.get("input_width", 1280))
+    output_height = int(cfgs_data.get("output_height", input_height))
+    output_width = int(cfgs_data.get("output_width", input_width))
+    downsample_factor = int(cfgs_data.get("downsample_factor", 2))
+    t_bins = int(cfgs_data.get("t_bins", 10))
+    split_polarity = bool(cfgs_data.get("split_polarity", True))
+    normalize_representation = bool(cfgs_data.get("normalize", True))
+    use_trilinear = bool(cfgs_data.get("use_trilinear", False))
+    representation_output_dtype = str(
+        cfgs_data.get("output_dtype", "float16")
+    )
+    event_image_percentile = float(
+        cfgs_data.get("event_image_percentile", 99.0)
+    )
+    window_mode = str(cfgs_data.get("window_mode", "semantics_middle"))
+    accum_time_us = int(
+        cfgs_data.get("accum_time_us", cfgs_data.get("accum_time", 50000))
+    )
+    stride_time_us = cfgs_data.get(
+        "stride_time_us",
+        cfgs_data.get("stride_time", None),
+    )
+    if stride_time_us is not None:
+        stride_time_us = int(stride_time_us)
+    start_time_us = cfgs_data.get("start_time_us", None)
+    if start_time_us is not None:
+        start_time_us = int(start_time_us)
+    semantics_ts_source = str(
+        cfgs_data.get("semantics_ts_source", "auto")
+    )
+    semantics_ts_divisor = int(cfgs_data.get("semantics_ts_divisor", 1))
+    depth_ts_source = str(cfgs_data.get("depth_ts_source", "auto"))
+    depth_ts_divisor = int(cfgs_data.get("depth_ts_divisor", 1))
+    filter_known_semantic_sequences = bool(
+        cfgs_data.get("filter_known_semantic_sequences", False)
+    )
+    virtual_chunk_duration_s = cfgs_data.get(
+        "virtual_chunk_duration_s",
+        20.0,
+    )
+    if virtual_chunk_duration_s is not None:
+        virtual_chunk_duration_s = float(virtual_chunk_duration_s)
+    min_windows_per_chunk = int(
+        cfgs_data.get("min_windows_per_chunk", 1)
+    )
+    activity_filter_max_trials = int(
+        cfgs_data.get("activity_filter_max_trials", 8)
+    )
 
     if len(dataset_paths) == 0:
         raise ValueError("data.datasets is empty. Please provide one or more dataset roots/manifests/H5 files.")
@@ -538,7 +588,9 @@ def main(args, resume_preempt: bool = False):
         f"min_clip_mean_active={activity_filter_min_clip_mean_active_pixel_ratio}, "
         f"min_clip_mean_score={activity_filter_min_clip_mean_activity_score}, "
         f"min_clip_active_window_ratio={activity_filter_min_clip_active_window_ratio}, "
-        f"active_window_threshold={activity_filter_active_window_threshold}"
+        f"active_window_threshold={activity_filter_active_window_threshold}, "
+        f"representation={representation}, window_mode={window_mode}, "
+        f"virtual_chunk_duration_s={virtual_chunk_duration_s}"
     )
 
     transform = make_event_transforms(
@@ -632,6 +684,30 @@ def main(args, resume_preempt: bool = False):
         activity_filter_min_clip_mean_activity_score=activity_filter_min_clip_mean_activity_score,
         activity_filter_min_clip_active_window_ratio=activity_filter_min_clip_active_window_ratio,
         activity_filter_active_window_threshold=activity_filter_active_window_threshold,
+        representation=representation,
+        input_height=input_height,
+        input_width=input_width,
+        output_height=output_height,
+        output_width=output_width,
+        downsample_factor=downsample_factor,
+        t_bins=t_bins,
+        split_polarity=split_polarity,
+        normalize=normalize_representation,
+        use_trilinear=use_trilinear,
+        output_dtype=representation_output_dtype,
+        event_image_percentile=event_image_percentile,
+        window_mode=window_mode,
+        accum_time_us=accum_time_us,
+        stride_time_us=stride_time_us,
+        start_time_us=start_time_us,
+        semantics_ts_source=semantics_ts_source,
+        semantics_ts_divisor=semantics_ts_divisor,
+        depth_ts_source=depth_ts_source,
+        depth_ts_divisor=depth_ts_divisor,
+        filter_known_semantic_sequences=filter_known_semantic_sequences,
+        virtual_chunk_duration_s=virtual_chunk_duration_s,
+        min_windows_per_chunk=min_windows_per_chunk,
+        activity_filter_max_trials=activity_filter_max_trials,
     )
 
     dlen = _extract_loader_len(data_loader)
@@ -776,7 +852,7 @@ def main(args, resume_preempt: bool = False):
             if clip_in_chans != in_chans:
                 raise ValueError(
                     f"Input channel mismatch: model.in_chans={in_chans}, but batch clip has C={clip_in_chans}. "
-                    "Please set model.in_chans to match the preprocessed voxel channel count."
+                    "Please set model.in_chans to match the event representation channel count."
                 )
             if preserve_input_size and allowed_input_hw:
                 clip_h = int(clips.shape[-2])

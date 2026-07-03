@@ -1,0 +1,68 @@
+# M3ED raw-event loader for MAE pretraining.
+dataset_type: m3ed_raw
+# One or more downloaded M3ED roots, manifests, or *_data.h5 files.
+datasets: []
+datasets_weights: null
+
+# MAE currently expects one temporal length across all datasets.
+dataset_fpcs: [16]
+batch_size: 8
+fps: 4
+frame_sample_rate: 1
+num_clips: 1
+random_clip_sampling: true
+allow_clip_overlap: false
+
+# Final model geometry after data augmentation.
+crop_size: [480, 640]
+patch_size: 16
+tubelet_size: 2
+
+# DataLoader settings.
+num_workers: 8
+persistent_workers: true
+prefetch_factor: null
+max_open_h5_files: 8
+pin_mem: true
+file_pattern: "*_data.h5"
+recursive: true
+
+# Generate the former t10 representation online from downloaded events.
+representation: voxel_grid
+input_height: 720
+input_width: 1280
+output_height: 720
+output_width: 1280
+downsample_factor: 2
+t_bins: 10
+split_polarity: true
+normalize: true
+use_trilinear: false
+output_dtype: float16
+event_image_percentile: 99.0
+
+# Semantic-frame-aligned variable-duration windows.
+window_mode: semantics_middle
+semantics_ts_source: auto
+semantics_ts_divisor: 1
+# false includes every downloaded sequence using _data.h5:/ovc/ts when a
+# sibling _semantics.h5 is unavailable.
+filter_known_semantic_sequences: false
+depth_ts_source: auto
+depth_ts_divisor: 1
+# Used only when window_mode=fixed.
+accum_time_us: 50000
+stride_time_us: null
+start_time_us: null
+
+# Reproduce the sample units created by the former 20-second H5 split.
+virtual_chunk_duration_s: 20
+min_windows_per_chunk: 1
+
+# Optional online clip activity filtering.
+activity_filter_enabled: false
+activity_filter_min_clip_mean_active_pixel_ratio: null
+activity_filter_min_clip_mean_activity_score: null
+activity_filter_min_clip_active_window_ratio: null
+activity_filter_active_window_threshold: null
+activity_filter_max_trials: 8

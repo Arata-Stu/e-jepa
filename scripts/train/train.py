@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from src.datasets.data_manager import init_data
 from src.datasets.transforms import make_event_transforms
+from src.losses import SIGReg
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
 from src.models.vision_transformer import VIT_EMBED_DIMS
@@ -313,6 +314,56 @@ def main(args, resume_preempt: bool = False):
         "activity_filter_active_window_threshold",
         None,
     )
+    representation = str(cfgs_data.get("representation", "voxel_grid"))
+    input_height = int(cfgs_data.get("input_height", 720))
+    input_width = int(cfgs_data.get("input_width", 1280))
+    output_height = int(cfgs_data.get("output_height", input_height))
+    output_width = int(cfgs_data.get("output_width", input_width))
+    downsample_factor = int(cfgs_data.get("downsample_factor", 2))
+    t_bins = int(cfgs_data.get("t_bins", 10))
+    split_polarity = bool(cfgs_data.get("split_polarity", True))
+    normalize_representation = bool(cfgs_data.get("normalize", True))
+    use_trilinear = bool(cfgs_data.get("use_trilinear", False))
+    representation_output_dtype = str(
+        cfgs_data.get("output_dtype", "float16")
+    )
+    event_image_percentile = float(
+        cfgs_data.get("event_image_percentile", 99.0)
+    )
+    window_mode = str(cfgs_data.get("window_mode", "semantics_middle"))
+    accum_time_us = int(
+        cfgs_data.get("accum_time_us", cfgs_data.get("accum_time", 50000))
+    )
+    stride_time_us = cfgs_data.get(
+        "stride_time_us",
+        cfgs_data.get("stride_time", None),
+    )
+    if stride_time_us is not None:
+        stride_time_us = int(stride_time_us)
+    start_time_us = cfgs_data.get("start_time_us", None)
+    if start_time_us is not None:
+        start_time_us = int(start_time_us)
+    semantics_ts_source = str(
+        cfgs_data.get("semantics_ts_source", "auto")
+    )
+    semantics_ts_divisor = int(cfgs_data.get("semantics_ts_divisor", 1))
+    depth_ts_source = str(cfgs_data.get("depth_ts_source", "auto"))
+    depth_ts_divisor = int(cfgs_data.get("depth_ts_divisor", 1))
+    filter_known_semantic_sequences = bool(
+        cfgs_data.get("filter_known_semantic_sequences", False)
+    )
+    virtual_chunk_duration_s = cfgs_data.get(
+        "virtual_chunk_duration_s",
+        20.0,
+    )
+    if virtual_chunk_duration_s is not None:
+        virtual_chunk_duration_s = float(virtual_chunk_duration_s)
+    min_windows_per_chunk = int(
+        cfgs_data.get("min_windows_per_chunk", 1)
+    )
+    activity_filter_max_trials = int(
+        cfgs_data.get("activity_filter_max_trials", 8)
+    )
 
     # Optional image branch config (vjepa2.1 style rank split)
     cfgs_img_data = args.get("img_data", None)
@@ -352,6 +403,37 @@ def main(args, resume_preempt: bool = False):
     predict_all = bool(cfgs_loss.get("predict_all", True))
     weight_distance_loss = bool(cfgs_loss.get("weight_distance_loss", True))
     offset_context_loss = bool(cfgs_loss.get("offset_context_loss", False))
+    collapse_prevention = str(
+        cfgs_loss.get("collapse_prevention", "stopgrad_ema")
+    ).lower()
+    collapse_prevention_aliases = {
+        "stopgrad": "stopgrad_ema",
+        "ema": "stopgrad_ema",
+        "stopgrad_ema": "stopgrad_ema",
+        "sigreg": "sigreg",
+    }
+    if collapse_prevention not in collapse_prevention_aliases:
+        raise ValueError(
+            "loss.collapse_prevention must be 'stopgrad_ema' or 'sigreg'"
+        )
+    collapse_prevention = collapse_prevention_aliases[collapse_prevention]
+    use_ema_target = collapse_prevention == "stopgrad_ema"
+
+    cfgs_sigreg = cfgs_loss.get("sigreg", {}) or {}
+    sigreg_weight = float(cfgs_sigreg.get("weight", 0.09))
+    sigreg_knots = int(cfgs_sigreg.get("knots", 17))
+    sigreg_num_proj = int(cfgs_sigreg.get("num_proj", 1024))
+    sigreg_projection_chunk_size = int(
+        cfgs_sigreg.get("projection_chunk_size", 64)
+    )
+    sigreg_max_tokens = cfgs_sigreg.get("max_tokens", 512)
+    if sigreg_max_tokens is not None:
+        sigreg_max_tokens = int(sigreg_max_tokens)
+    sigreg_t_max = float(cfgs_sigreg.get("t_max", 3.0))
+    sigreg_per_level = bool(cfgs_sigreg.get("per_level", False))
+    sigreg_use_checkpoint = bool(cfgs_sigreg.get("use_checkpoint", True))
+    if sigreg_weight < 0.0:
+        raise ValueError("loss.sigreg.weight must be >= 0")
 
     # -- Optimization params
     is_anneal = bool(cfgs_opt.get("is_anneal", False))
@@ -487,7 +569,9 @@ def main(args, resume_preempt: bool = False):
         f"min_clip_mean_active={activity_filter_min_clip_mean_active_pixel_ratio}, "
         f"min_clip_mean_score={activity_filter_min_clip_mean_activity_score}, "
         f"min_clip_active_window_ratio={activity_filter_min_clip_active_window_ratio}, "
-        f"active_window_threshold={activity_filter_active_window_threshold}"
+        f"active_window_threshold={activity_filter_active_window_threshold}, "
+        f"representation={representation}, window_mode={window_mode}, "
+        f"virtual_chunk_duration_s={virtual_chunk_duration_s}"
     )
 
     transform = make_event_transforms(
@@ -543,14 +627,37 @@ def main(args, resume_preempt: bool = False):
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
     )
-    target_encoder = copy.deepcopy(encoder)
+    target_encoder = copy.deepcopy(encoder) if use_ema_target else None
+    sigreg = (
+        SIGReg(
+            knots=sigreg_knots,
+            num_proj=sigreg_num_proj,
+            projection_chunk_size=sigreg_projection_chunk_size,
+            max_tokens=sigreg_max_tokens,
+            t_max=sigreg_t_max,
+            use_checkpoint=sigreg_use_checkpoint,
+        ).to(device)
+        if collapse_prevention == "sigreg"
+        else None
+    )
+    logger.info(
+        "Collapse prevention: mode=%s, target_encoder=%s, "
+        "sigreg_weight=%.6f, sigreg_num_proj=%d, sigreg_max_tokens=%s",
+        collapse_prevention,
+        "ema_stopgrad" if target_encoder is not None else "online_gradient",
+        sigreg_weight if sigreg is not None else 0.0,
+        sigreg_num_proj if sigreg is not None else 0,
+        str(sigreg_max_tokens if sigreg is not None else None),
+    )
 
     if compile_model:
-        logger.info("Compiling encoder/predictor/target_encoder")
+        logger.info("Compiling encoder/predictor")
         torch._dynamo.config.optimize_ddp = False
         encoder.compile()
         predictor.compile()
-        target_encoder.compile()
+        if target_encoder is not None:
+            logger.info("Compiling EMA target encoder")
+            target_encoder.compile()
 
     data_loader, data_sampler = init_data(
         data=dataset_type,
@@ -581,6 +688,30 @@ def main(args, resume_preempt: bool = False):
         activity_filter_min_clip_mean_activity_score=activity_filter_min_clip_mean_activity_score,
         activity_filter_min_clip_active_window_ratio=activity_filter_min_clip_active_window_ratio,
         activity_filter_active_window_threshold=activity_filter_active_window_threshold,
+        representation=representation,
+        input_height=input_height,
+        input_width=input_width,
+        output_height=output_height,
+        output_width=output_width,
+        downsample_factor=downsample_factor,
+        t_bins=t_bins,
+        split_polarity=split_polarity,
+        normalize=normalize_representation,
+        use_trilinear=use_trilinear,
+        output_dtype=representation_output_dtype,
+        event_image_percentile=event_image_percentile,
+        window_mode=window_mode,
+        accum_time_us=accum_time_us,
+        stride_time_us=stride_time_us,
+        start_time_us=start_time_us,
+        semantics_ts_source=semantics_ts_source,
+        semantics_ts_divisor=semantics_ts_divisor,
+        depth_ts_source=depth_ts_source,
+        depth_ts_divisor=depth_ts_divisor,
+        filter_known_semantic_sequences=filter_known_semantic_sequences,
+        virtual_chunk_duration_s=virtual_chunk_duration_s,
+        min_windows_per_chunk=min_windows_per_chunk,
+        activity_filter_max_trials=activity_filter_max_trials,
     )
 
     dlen = _extract_loader_len(data_loader)
@@ -610,14 +741,22 @@ def main(args, resume_preempt: bool = False):
 
     encoder = _maybe_ddp(encoder, find_unused_parameters=False)
     predictor = _maybe_ddp(predictor, find_unused_parameters=True)
-    target_encoder = _maybe_ddp(target_encoder, find_unused_parameters=False)
+    if target_encoder is not None:
+        target_encoder = _maybe_ddp(
+            target_encoder,
+            find_unused_parameters=False,
+        )
 
-    for p in target_encoder.parameters():
-        p.requires_grad = False
+        for p in target_encoder.parameters():
+            p.requires_grad = False
 
     momentum_scheduler = (
-        ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
-        for i in range(int(ipe * num_epochs) + 1)
+        (
+            ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
+            for i in range(int(ipe * num_epochs) + 1)
+        )
+        if target_encoder is not None
+        else None
     )
     lambda_sched = Lambda_LinearWarmupHold(lambda_value=lambda_value)
 
@@ -655,7 +794,8 @@ def main(args, resume_preempt: bool = False):
             for _ in range(start_epoch * ipe):
                 scheduler.step()
                 wd_scheduler.step()
-                next(momentum_scheduler)
+                if momentum_scheduler is not None:
+                    next(momentum_scheduler)
                 mask_collator.step()
 
     def save_checkpoint(epoch: int, path: Path, loss_val: float):
@@ -664,7 +804,6 @@ def main(args, resume_preempt: bool = False):
         save_dict = {
             "encoder": encoder.state_dict(),
             "predictor": predictor.state_dict(),
-            "target_encoder": target_encoder.state_dict(),
             "opt": optimizer.state_dict(),
             "scaler": None if scaler is None else scaler.state_dict(),
             "epoch": int(epoch),
@@ -672,7 +811,20 @@ def main(args, resume_preempt: bool = False):
             "batch_size": int(batch_size),
             "world_size": int(world_size),
             "lr": float(lr),
+            "collapse_prevention": collapse_prevention,
+            "sigreg": {
+                "weight": sigreg_weight,
+                "knots": sigreg_knots,
+                "num_proj": sigreg_num_proj,
+                "projection_chunk_size": sigreg_projection_chunk_size,
+                "max_tokens": sigreg_max_tokens,
+                "t_max": sigreg_t_max,
+                "per_level": sigreg_per_level,
+                "use_checkpoint": sigreg_use_checkpoint,
+            },
         }
+        if target_encoder is not None:
+            save_dict["target_encoder"] = target_encoder.state_dict()
         try:
             torch.save(save_dict, str(path))
         except Exception as exc:
@@ -725,6 +877,9 @@ def main(args, resume_preempt: bool = False):
         loss_pred_meter = AverageMeter()
         loss_context_meter = AverageMeter()
         loss_context_weighted_meter = AverageMeter()
+        loss_sigreg_meter = AverageMeter()
+        loss_sigreg_weighted_meter = AverageMeter()
+        target_batch_std_meter = AverageMeter()
         context_lambda_meter = AverageMeter()
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
@@ -777,7 +932,7 @@ def main(args, resume_preempt: bool = False):
                     raise ValueError(
                         f"Input channel mismatch: model.in_chans={in_chans}, "
                         f"but batch clip has C={clip_in_chans}. "
-                        "Please set model.in_chans to match the preprocessed voxel channel count."
+                        "Please set model.in_chans to match the event representation channel count."
                     )
                 if preserve_input_size and allowed_input_hw:
                     clip_h = int(clip.shape[-2])
@@ -803,27 +958,56 @@ def main(args, resume_preempt: bool = False):
                 new_lr = scheduler.step()
                 new_wd = wd_scheduler.step()
 
-                def forward_target(c, embed_dim=embed_dim_encoder):
+                def normalize_target_embeddings(
+                    target_embeddings,
+                    embed_dim=embed_dim_encoder,
+                ):
+                    normalized = []
+                    for embedding in target_embeddings:
+                        if levels_predictor > 1:
+                            level_0 = F.layer_norm(
+                                embedding[:, :, :embed_dim],
+                                (embed_dim,),
+                            )
+                            level_1 = F.layer_norm(
+                                embedding[:, :, embed_dim : embed_dim * 2],
+                                (embed_dim,),
+                            )
+                            level_2 = F.layer_norm(
+                                embedding[:, :, embed_dim * 2 : embed_dim * 3],
+                                (embed_dim,),
+                            )
+                            level_3 = F.layer_norm(
+                                embedding[:, :, -embed_dim:],
+                                (embed_dim,),
+                            )
+                            normalized.append(
+                                torch.cat(
+                                    [level_0, level_1, level_2, level_3],
+                                    dim=2,
+                                )
+                            )
+                        else:
+                            normalized.append(
+                                F.layer_norm(
+                                    embedding,
+                                    (embedding.size(-1),),
+                                )
+                            )
+                    return normalized
+
+                def forward_target(c):
+                    if target_encoder is None:
+                        raise RuntimeError(
+                            "EMA target encoder is unavailable in SIGReg mode"
+                        )
                     with torch.no_grad():
-                        h = target_encoder(c, gram_mode=False, training_mode=True)
-                        new_h = []
-                        for hi in h:
-                            if levels_predictor > 1:
-                                hi_0 = F.layer_norm(hi[:, :, :embed_dim], (embed_dim,))
-                                hi_1 = F.layer_norm(
-                                    hi[:, :, embed_dim : embed_dim * 2],
-                                    (embed_dim,),
-                                )
-                                hi_2 = F.layer_norm(
-                                    hi[:, :, embed_dim * 2 : embed_dim * 3],
-                                    (embed_dim,),
-                                )
-                                hi_3 = F.layer_norm(hi[:, :, -embed_dim:], (embed_dim,))
-                                hi_norm = torch.cat([hi_0, hi_1, hi_2, hi_3], dim=2)
-                                new_h.append(hi_norm)
-                            else:
-                                new_h.append(F.layer_norm(hi, (hi.size(-1),)))
-                        return new_h
+                        target_embeddings = target_encoder(
+                            c,
+                            gram_mode=False,
+                            training_mode=True,
+                        )
+                        return normalize_target_embeddings(target_embeddings)
 
                 def forward_context(_clips, embed_dim=embed_dim_encoder):
                     modality = "video"
@@ -836,6 +1020,39 @@ def main(args, resume_preempt: bool = False):
                         if predict_all:
                             z_context = normalize_nested(z_context, embed_dim)
                     return z_pred, z_context
+
+                def forward_online_target_and_context(
+                    _clips,
+                    embed_dim=embed_dim_encoder,
+                ):
+                    modality = "video"
+                    if (
+                        img_temporal_dim_size is not None
+                        and _clips[0].shape[2] == img_temporal_dim_size
+                    ):
+                        modality = "image"
+                    target_embeddings, context_embeddings = encoder(
+                        _clips,
+                        masks_enc,
+                        gram_mode=False,
+                        training_mode=True,
+                        return_full_and_masked=True,
+                    )
+                    z_pred, z_context = predictor(
+                        context_embeddings,
+                        masks_enc,
+                        masks_pred,
+                        mod=modality,
+                    )
+                    if normalize_predictor:
+                        z_pred = normalize_nested(z_pred, embed_dim)
+                        if predict_all:
+                            z_context = normalize_nested(z_context, embed_dim)
+                    return (
+                        normalize_target_embeddings(target_embeddings),
+                        z_pred,
+                        z_context,
+                    )
 
                 def loss_fn(z, h, masks_to_apply, cls_loss, d_weights):
                     if cls_loss:
@@ -873,12 +1090,55 @@ def main(args, resume_preempt: bool = False):
                             n += 1
                     return loss_v / max(n, 1)
 
+                def sigreg_loss_fn(target_embeddings):
+                    if sigreg is None:
+                        return None
+                    sigreg_inputs = []
+                    for embedding in target_embeddings:
+                        if sigreg_per_level and embedding.shape[-1] > embed_dim_encoder:
+                            sigreg_inputs.extend(
+                                torch.split(
+                                    embedding,
+                                    embed_dim_encoder,
+                                    dim=-1,
+                                )
+                            )
+                        else:
+                            sigreg_inputs.append(embedding)
+                    return sigreg(sigreg_inputs)
+
+                def target_batch_std_fn(target_embeddings, max_tokens=512):
+                    values = []
+                    with torch.no_grad():
+                        for embedding in target_embeddings:
+                            sampled = embedding.detach().float()
+                            if sampled.shape[1] > max_tokens:
+                                token_indices = torch.linspace(
+                                    0,
+                                    sampled.shape[1] - 1,
+                                    steps=max_tokens,
+                                    device=sampled.device,
+                                ).round().long()
+                                sampled = sampled.index_select(1, token_indices)
+                            values.append(
+                                sampled.std(dim=0, unbiased=False).mean()
+                            )
+                    return torch.stack(values).mean()
+
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z_pred, z_context = forward_context(clips)
+                    if sigreg is None:
+                        h = forward_target(clips)
+                        z_pred, z_context = forward_context(clips)
+                    else:
+                        h, z_pred, z_context = (
+                            forward_online_target_and_context(clips)
+                        )
+                    target_batch_std = target_batch_std_fn(h)
 
                     loss_context = None
                     loss_context_weighted = None
+                    loss_sigreg = None
+                    loss_sigreg_weighted = None
                     lambda_value_step = 0.0
 
                     loss_pred = loss_fn(
@@ -913,6 +1173,11 @@ def main(args, resume_preempt: bool = False):
                         )
                         loss_context_weighted = loss_context * lambda_value_step
                         loss = loss + loss_context_weighted
+
+                    if sigreg is not None:
+                        loss_sigreg = sigreg_loss_fn(h)
+                        loss_sigreg_weighted = loss_sigreg * sigreg_weight
+                        loss = loss + loss_sigreg_weighted
 
                     debug_images = None
                     if should_visualize:
@@ -973,15 +1238,20 @@ def main(args, resume_preempt: bool = False):
                         optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                m = min(next(momentum_scheduler), ema[1])
-                with torch.no_grad():
-                    params_k = []
-                    params_q = []
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        params_k.append(param_k)
-                        params_q.append(param_q)
-                    torch._foreach_mul_(params_k, m)
-                    torch._foreach_add_(params_k, params_q, alpha=1 - m)
+                if target_encoder is not None:
+                    assert momentum_scheduler is not None
+                    m = min(next(momentum_scheduler), ema[1])
+                    with torch.no_grad():
+                        params_k = []
+                        params_q = []
+                        for param_q, param_k in zip(
+                            encoder.parameters(),
+                            target_encoder.parameters(),
+                        ):
+                            params_k.append(param_k)
+                            params_q.append(param_q)
+                        torch._foreach_mul_(params_k, m)
+                        torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
                 loss_context_value = (
                     0.0 if loss_context is None else float(loss_context.detach())
@@ -991,10 +1261,21 @@ def main(args, resume_preempt: bool = False):
                     if loss_context_weighted is None
                     else float(loss_context_weighted.detach())
                 )
+                loss_sigreg_value = (
+                    0.0 if loss_sigreg is None else float(loss_sigreg.detach())
+                )
+                loss_sigreg_weighted_value = (
+                    0.0
+                    if loss_sigreg_weighted is None
+                    else float(loss_sigreg_weighted.detach())
+                )
                 loss_details = {
                     "loss_pred": float(loss_pred.detach()),
                     "loss_context": loss_context_value,
                     "loss_context_weighted": loss_context_weighted_value,
+                    "loss_sigreg": loss_sigreg_value,
+                    "loss_sigreg_weighted": loss_sigreg_weighted_value,
+                    "target_batch_std": float(target_batch_std.detach()),
                     "context_lambda": float(lambda_value_step),
                 }
 
@@ -1021,6 +1302,11 @@ def main(args, resume_preempt: bool = False):
             loss_pred_meter.update(loss_details["loss_pred"])
             loss_context_meter.update(loss_details["loss_context"])
             loss_context_weighted_meter.update(loss_details["loss_context_weighted"])
+            loss_sigreg_meter.update(loss_details["loss_sigreg"])
+            loss_sigreg_weighted_meter.update(
+                loss_details["loss_sigreg_weighted"]
+            )
+            target_batch_std_meter.update(loss_details["target_batch_std"])
             context_lambda_meter.update(loss_details["context_lambda"])
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
@@ -1055,6 +1341,21 @@ def main(args, resume_preempt: bool = False):
                 tb_writer.add_scalar(
                     "train/loss_context_weighted",
                     loss_details["loss_context_weighted"],
+                    global_step,
+                )
+                tb_writer.add_scalar(
+                    "train/loss_sigreg",
+                    loss_details["loss_sigreg"],
+                    global_step,
+                )
+                tb_writer.add_scalar(
+                    "train/loss_sigreg_weighted",
+                    loss_details["loss_sigreg_weighted"],
+                    global_step,
+                )
+                tb_writer.add_scalar(
+                    "train/target_batch_std",
+                    loss_details["target_batch_std"],
                     global_step,
                 )
                 tb_writer.add_scalar(
@@ -1125,6 +1426,21 @@ def main(args, resume_preempt: bool = False):
             tb_writer.add_scalar(
                 "epoch/loss_context_weighted_avg",
                 loss_context_weighted_meter.avg,
+                epoch + 1,
+            )
+            tb_writer.add_scalar(
+                "epoch/loss_sigreg_avg",
+                loss_sigreg_meter.avg,
+                epoch + 1,
+            )
+            tb_writer.add_scalar(
+                "epoch/loss_sigreg_weighted_avg",
+                loss_sigreg_weighted_meter.avg,
+                epoch + 1,
+            )
+            tb_writer.add_scalar(
+                "epoch/target_batch_std_avg",
+                target_batch_std_meter.avg,
                 epoch + 1,
             )
             tb_writer.add_scalar(

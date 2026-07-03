@@ -88,6 +88,62 @@ torchrun --nproc_per_node=4 scripts/train/run_train.py \
   - video rank は通常の `data` と `mask` を継続使用
 - `meta.use_tqdm=true` で、stepごとの logger 出力を抑えて tqdm 進捗表示に切り替えられます。
 
+## SIGRegによる崩壊防止
+
+`loss.collapse_prevention`で、崩壊防止方式を切り替えられます。
+
+- `stopgrad_ema`（既定）:
+  従来どおりtarget encoderをstop-gradientし、online encoderからEMA更新します。
+- `sigreg`:
+  target encoderとEMAを使わず、online encoderでfull-token targetを計算します。
+  予測損失のtarget側にも勾配を流し、hierarchical target embeddingへSIGRegを加えます。
+
+```bash
+python3 scripts/train/run_train.py \
+  data=m3ed_raw \
+  data.datasets=[/path/to/M3ED] \
+  mask=stage1_event_sigreg_small \
+  loss.predict_all=false \
+  loss.collapse_prevention=sigreg
+```
+
+SIGRegの既定値は`tmp/le_wm`に合わせて`weight=0.09`、`knots=17`、
+`num_proj=1024`です。イベント動画ではpatch token数が多いため、既定では
+`max_tokens=512`でtokenをランダム抽出し、projectionを64本ずつ処理します。
+backward時にはprojection chunkを再計算してpeak memoryを抑えます。全tokenを
+使う場合は`loss.sigreg.max_tokens=null`を指定します。複数GPUの場合、SIGReg
+統計量はrankごとのlocal batchで計算され、勾配がDDPで平均化されます。
+SIGRegはbatch方向の経験特性関数を使うため、GPUメモリが許す範囲で
+`data.batch_size`を大きくするのが望ましいです。
+
+TensorBoardには以下が追加されます。
+
+- `train/loss_sigreg`
+- `train/loss_sigreg_weighted`
+- `train/target_batch_std`
+- `epoch/loss_sigreg_avg`
+- `epoch/loss_sigreg_weighted_avg`
+- `epoch/target_batch_std_avg`
+
+### Stop-grad/EMAとの比較
+
+M3ED raw、ViT-Tiny、同一の小maskで2方式を順番に実行するスクリプトがあります。
+
+```bash
+M3ED_ROOT=/path/to/M3ED \
+  ./scripts/experiments/pretrain_jepa_sigreg_m3ed_raw_smallmask_comparison.sh
+```
+
+比較では`mask=stage1_event_sigreg_small`を共通使用し、追加のcontext lossを
+無効化して、予測損失と崩壊防止方式の差を見やすくしています。
+
+片方だけ実行する場合:
+
+```bash
+RUN_STOPGRAD=1 RUN_SIGREG=0 ./scripts/experiments/pretrain_jepa_sigreg_m3ed_raw_smallmask_comparison.sh
+RUN_STOPGRAD=0 RUN_SIGREG=1 ./scripts/experiments/pretrain_jepa_sigreg_m3ed_raw_smallmask_comparison.sh
+```
+
 ## ViT Tiny preset
 
 `model=vit_tiny_2_1` を指定すると、ViT-Tiny + 軽量predictor設定に切り替えられます。

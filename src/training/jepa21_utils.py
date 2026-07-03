@@ -110,8 +110,15 @@ def load_checkpoint(
     logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
     if target_encoder is not None:
+        target_state = checkpoint.get("target_encoder")
+        if target_state is None:
+            logger.warning(
+                "Checkpoint has no target_encoder; initializing EMA target "
+                "from the loaded online encoder."
+            )
+            target_state = encoder.state_dict()
         pretrained_dict = _align_state_dict_keys(
-            target_encoder.state_dict(), checkpoint["target_encoder"]
+            target_encoder.state_dict(), target_state
         )
         for k, v in target_encoder.state_dict().items():
             if k not in pretrained_dict:

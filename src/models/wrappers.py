@@ -16,7 +16,46 @@ class MultiSeqWrapper(nn.Module):
         self.backbone = backbone
         self.embed_dim = backbone.embed_dim
 
-    def forward(self, x, masks=None, gram_mode=False, training_mode=False):
+    def forward(
+        self,
+        x,
+        masks=None,
+        gram_mode=False,
+        training_mode=False,
+        return_full_and_masked=False,
+    ):
+        if return_full_and_masked:
+            if masks is None:
+                raise ValueError(
+                    "masks must be provided when return_full_and_masked=True"
+                )
+            full_outputs = self._forward_impl(
+                x,
+                masks=None,
+                gram_mode=gram_mode,
+                training_mode=training_mode,
+            )
+            masked_outputs = self._forward_impl(
+                x,
+                masks=masks,
+                gram_mode=gram_mode,
+                training_mode=training_mode,
+            )
+            return full_outputs, masked_outputs
+        return self._forward_impl(
+            x,
+            masks=masks,
+            gram_mode=gram_mode,
+            training_mode=training_mode,
+        )
+
+    def _forward_impl(
+        self,
+        x,
+        masks=None,
+        gram_mode=False,
+        training_mode=False,
+    ):
         """
         :param x: [list] List of Tensors of different seq lengths
         :param masks: [list] List of Tensors (index: masks for given seq length)

@@ -6,3 +6,24 @@ shift_by_n: 0
 # Weight predictor/context loss by mask distance.
 weight_distance_loss: true
 offset_context_loss: false
+
+# Collapse prevention:
+# - stopgrad_ema: existing frozen target encoder + EMA update
+# - sigreg: online target embeddings receive gradients; no target encoder/EMA
+collapse_prevention: stopgrad_ema
+
+# Sketch Isotropic Gaussian Regularizer, following tmp/le_wm.
+sigreg:
+  weight: 0.09
+  knots: 17
+  num_proj: 1024
+  # Chunk random projections to bound B*N*num_proj*knots peak memory.
+  projection_chunk_size: 64
+  # Event video clips have many patch tokens. null uses all tokens.
+  max_tokens: 512
+  t_max: 3.0
+  # false regularizes the concatenated hierarchical target once (cheaper).
+  # true regularizes each encoder level independently.
+  per_level: false
+  # Recompute trigonometric projection chunks during backward to reduce memory.
+  use_checkpoint: true

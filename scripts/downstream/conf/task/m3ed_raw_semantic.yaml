@@ -1,0 +1,97 @@
+name: m3ed_raw_semantic
+dataset_kind: m3ed_raw
+target: semantic
+
+# Downloaded M3ED roots, manifests, or *_data.h5 files.
+# Each *_data.h5 is paired with a sibling *_semantics.h5 by default.
+train_roots: []
+val_roots: []
+file_pattern: "*_data.h5"
+recursive: true
+
+# Input clip sampling around each semantic frame anchor.
+# Keep this aligned with the raw JEPA pretraining run unless intentionally probing
+# a different temporal context.
+clip_num_frames: 16
+clip_frame_stride: 1
+
+# Final input HxW for the downstream model. Raw event windows are generated at
+# input_height/downsample_factor x input_width/downsample_factor and then resized.
+input_size: [240, 320]
+input_resize_mode: bilinear
+eval_original_resolution: true
+eval_logits_resize_mode: bilinear
+
+# Loader.
+batch_size: 4
+num_workers: 4
+pin_mem: true
+persistent_workers: true
+max_open_h5_files: 8
+
+# Raw M3ED pairing.
+event_camera: left
+semantics_suffix: semantics
+semantics_ts_path: ts
+semantics_ts_divisor: 1
+label_dataset_path: predictions
+
+# Match F3's 19->11 Cityscapes-style semantic mapping by default.
+num_classes: 11
+ignore_index: 255
+label_remap: cityscapes_19_to_11
+infer_num_classes_max_samples: 256
+
+# Online event representation; matches the m3ed_raw JEPA pretraining preset.
+representation: voxel_grid
+input_height: 720
+input_width: 1280
+output_height: 720
+output_width: 1280
+downsample_factor: 2
+t_bins: 10
+split_polarity: true
+normalize: true
+use_trilinear: false
+output_dtype: float16
+event_image_percentile: 99.0
+
+# Label-aligned event window mode. "semantics_middle" matches the existing
+# M3ED semantic preprocessing preset; "fixed_before" is available for F3-style
+# pre-frame context if needed.
+window_mode: semantics_middle
+accum_time_us: 50000
+
+# F3 standard segmentation split.
+#
+# F3 config uses:
+#   confs/segmentation/m3ed_train.yml for training
+#   confs/segmentation/m3ed_test.yml for validation/evaluation
+#
+# The range values below follow F3 exactly:
+#   [start_fraction, step, stop_fraction]
+# Missing *_semantics.h5 sequences are skipped by the loader.
+train_sequence_include: []
+val_sequence_include: []
+train_sequence_exclude: []
+val_sequence_exclude: []
+train_sequence_ranges:
+  car_urban_day_penno_big_loop: [0.0, 2, 1.0]
+  car_urban_day_penno_small_loop: [0.0, 2, 1.0]
+  car_urban_day_ucity_big_loop: [0.0, 2, 1.0]
+  car_urban_day_city_hall: [0.0, 2, 1.0]
+val_sequence_ranges:
+  car_urban_day_rittenhouse: [0.0, 1, 1.0]
+  car_urban_day_ucity_small_loop: [0.0, 1, 1.0]
+train_sample_start_fraction: 0.0
+train_sample_stop_fraction: 1.0
+train_sample_stride: 1
+val_sample_start_fraction: 0.0
+val_sample_stop_fraction: 1.0
+val_sample_stride: 1
+
+# Common dense-task fields kept for compatibility.
+require_labels: true
+depth_scale: 1.0
+depth_valid_min: 0.0
+depth_valid_max: 1000000000.0

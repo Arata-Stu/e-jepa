@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
 import src.models.vision_transformer as video_vit
-from src.downstream.datasets import EventDenseTaskDataset
+from src.downstream.datasets import build_dense_task_dataset_from_config
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.distributed import init_distributed
 from src.utils.logging import CSVLogger, AverageMeter, get_logger
@@ -356,7 +356,7 @@ def _depth_metrics_reduce(
 
 
 def _infer_num_classes(
-    dataset: EventDenseTaskDataset,
+    dataset: torch.utils.data.Dataset,
     *,
     ignore_index: int,
     max_samples: int = 256,
@@ -444,34 +444,16 @@ def main(args: dict):
     if len(train_roots) == 0 or len(val_roots) == 0:
         raise ValueError("task.train_roots and task.val_roots must be non-empty lists.")
 
-    train_dataset = EventDenseTaskDataset(
+    train_dataset = build_dense_task_dataset_from_config(
+        cfg_task=cfg_task,
         roots=train_roots,
-        dataset_kind=dataset_kind,
-        target=target,
-        clip_num_frames=clip_num_frames,
-        clip_frame_stride=clip_frame_stride,
-        file_pattern=str(cfg_task.get("file_pattern", "*.h5")),
-        recursive=bool(cfg_task.get("recursive", True)),
-        ignore_index=int(cfg_task.get("ignore_index", 255)),
-        depth_scale=float(cfg_task.get("depth_scale", 1.0)),
-        require_labels=bool(cfg_task.get("require_labels", True)),
-        input_size=cfg_task.get("input_size", None),
-        input_resize_mode=str(cfg_task.get("input_resize_mode", "bilinear")),
+        split="train",
         return_eval_target=False,
     )
-    val_dataset = EventDenseTaskDataset(
+    val_dataset = build_dense_task_dataset_from_config(
+        cfg_task=cfg_task,
         roots=val_roots,
-        dataset_kind=dataset_kind,
-        target=target,
-        clip_num_frames=clip_num_frames,
-        clip_frame_stride=clip_frame_stride,
-        file_pattern=str(cfg_task.get("file_pattern", "*.h5")),
-        recursive=bool(cfg_task.get("recursive", True)),
-        ignore_index=int(cfg_task.get("ignore_index", 255)),
-        depth_scale=float(cfg_task.get("depth_scale", 1.0)),
-        require_labels=bool(cfg_task.get("require_labels", True)),
-        input_size=cfg_task.get("input_size", None),
-        input_resize_mode=str(cfg_task.get("input_resize_mode", "bilinear")),
+        split="val",
         return_eval_target=bool(cfg_task.get("eval_original_resolution", True)),
     )
 

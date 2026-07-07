@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 try:
     import hdf5plugin  # noqa: F401
@@ -19,9 +20,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from src.datasets.m3ed_raw import (
+    _align_anchor_timebase_to_events,
+    _build_middle_windows,
+    _discover_m3ed_h5_files,
+    _h5_searchsorted_left,
+    _read_t_offset,
+    _resolve_companion_h5,
+    _sequence_name_from_event_path,
+)
+from src.representations import EventVoxelGrid, accumulate_events_to_rgb
+
 
 TaskTarget = Literal["semantic", "depth"]
-DatasetKind = Literal["dsec", "m3ed"]
+DatasetKind = Literal["dsec", "m3ed", "m3ed_raw"]
 
 
 def _parse_manifest_paths(manifest_path: Path) -> list[Path]:
@@ -199,6 +211,21 @@ def _resize_clip_cthw(
     return resized.permute(1, 0, 2, 3).contiguous()
 
 
+def _resize_label_like_dense_target(
+    label: torch.Tensor,
+    *,
+    target_h: int,
+    target_w: int,
+    target: TaskTarget,
+) -> torch.Tensor:
+    return _resize_label_to_hw(
+        label,
+        target_h=target_h,
+        target_w=target_w,
+        target=target,
+    )
+
+
 def _pad_or_crop_semantic_label_to_hw(
     label: torch.Tensor,
     *,
@@ -336,6 +363,189 @@ class _FileMeta:
     label_dataset_path: str | None = None
     label_length: int = 0
     embedded_label_dataset_path: str | None = None
+
+
+def _cityscapes_19_to_11_mapping(*, ignore_index: int) -> np.ndarray:
+    mapping = np.full((256,), int(ignore_index), dtype=np.int64)
+    mapping[:19] = np.asarray(
+        [
+            5,
+            6,
+            1,
+            9,
+            2,
+            4,
+            10,
+            10,
+            7,
+            7,
+            0,
+            3,
+            3,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+        ],
+        dtype=np.int64,
+    )
+    if 0 <= int(ignore_index) < mapping.size:
+        mapping[int(ignore_index)] = int(ignore_index)
+    return mapping
+
+
+def _apply_semantic_label_remap(
+    label: np.ndarray,
+    *,
+    remap: str,
+    ignore_index: int,
+) -> np.ndarray:
+    label_i64 = np.asarray(label, dtype=np.int64)
+    remap_name = str(remap).lower()
+    if remap_name in {"", "none", "identity"}:
+        return label_i64
+    if remap_name != "cityscapes_19_to_11":
+        raise ValueError(
+            f"Unsupported semantic label_remap={remap!r}. "
+            "Use 'none' or 'cityscapes_19_to_11'."
+        )
+
+    mapping = _cityscapes_19_to_11_mapping(ignore_index=int(ignore_index))
+    out = np.full_like(label_i64, fill_value=int(ignore_index), dtype=np.int64)
+    valid = (label_i64 >= 0) & (label_i64 < int(mapping.size))
+    if np.any(valid):
+        out[valid] = mapping[label_i64[valid]]
+    return out
+
+
+def _normalise_optional_sequence_names(value) -> set[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        names = [value]
+    else:
+        names = list(value)
+    out = {str(name).strip() for name in names if str(name).strip()}
+    return out if len(out) > 0 else None
+
+
+@dataclass(frozen=True)
+class _SequenceRange:
+    start_fraction: float = 0.0
+    stop_fraction: float = 1.0
+    stride: int = 1
+
+
+def _parse_sequence_range_spec(value) -> _SequenceRange:
+    if isinstance(value, Mapping):
+        if "f3_range" in value:
+            return _parse_sequence_range_spec(value["f3_range"])
+        start = float(value.get("start_fraction", value.get("start", 0.0)))
+        stop = float(value.get("stop_fraction", value.get("stop", 1.0)))
+        stride = int(value.get("stride", value.get("step", 1)))
+        return _SequenceRange(
+            start_fraction=start,
+            stop_fraction=stop,
+            stride=max(1, stride),
+        )
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        # Match F3 segmentation configs: range = [start_fraction, step, stop_fraction].
+        return _SequenceRange(
+            start_fraction=float(value[0]),
+            stop_fraction=float(value[2]),
+            stride=max(1, int(value[1])),
+        )
+    raise ValueError(
+        "sequence range must be a dict or F3-style "
+        "[start_fraction, step, stop_fraction] list, got: "
+        f"{value!r}"
+    )
+
+
+def _normalise_sequence_ranges(value) -> dict[str, _SequenceRange]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return {
+            str(name).strip(): _parse_sequence_range_spec(spec)
+            for name, spec in value.items()
+            if str(name).strip()
+        }
+    if isinstance(value, (list, tuple)):
+        ranges: dict[str, _SequenceRange] = {}
+        for entry in value:
+            if not isinstance(entry, Mapping):
+                raise ValueError(
+                    "sequence range list entries must be dicts with a 'name' field"
+                )
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                raise ValueError(f"sequence range entry is missing name: {entry!r}")
+            if "range" in entry:
+                ranges[name] = _parse_sequence_range_spec(entry["range"])
+            else:
+                ranges[name] = _parse_sequence_range_spec(entry)
+        return ranges
+    raise ValueError(f"Unsupported sequence_ranges value: {value!r}")
+
+
+def _sequence_name_candidates(event_path: Path) -> set[str]:
+    return {
+        name
+        for name in (
+            _sequence_name_from_event_path(event_path),
+            event_path.parent.name.strip(),
+            event_path.stem.strip(),
+        )
+        if name
+    }
+
+
+def _sequence_is_selected(
+    event_path: Path,
+    *,
+    include: set[str] | None,
+    exclude: set[str] | None,
+) -> bool:
+    candidates = _sequence_name_candidates(event_path)
+    if include is not None and candidates.isdisjoint(include):
+        return False
+    if exclude is not None and not candidates.isdisjoint(exclude):
+        return False
+    return True
+
+
+def _sequence_range_for_path(
+    event_path: Path,
+    sequence_ranges: dict[str, _SequenceRange],
+) -> _SequenceRange | None:
+    for name in _sequence_name_candidates(event_path):
+        if name in sequence_ranges:
+            return sequence_ranges[name]
+    return None
+
+
+def _fractional_subset(
+    indices: np.ndarray,
+    *,
+    start_fraction: float,
+    stop_fraction: float,
+    stride: int,
+) -> np.ndarray:
+    if indices.size == 0:
+        return indices.astype(np.int64, copy=False)
+    start = max(0.0, min(1.0, float(start_fraction)))
+    stop = max(0.0, min(1.0, float(stop_fraction)))
+    if stop < start:
+        start, stop = stop, start
+    lo = int(indices.size * start)
+    hi = int(indices.size * stop)
+    if stop >= 1.0:
+        hi = int(indices.size)
+    step = max(1, int(stride))
+    return indices[lo:hi:step].astype(np.int64, copy=False)
 
 
 class EventDenseTaskDataset(Dataset):
@@ -607,3 +817,707 @@ class EventDenseTaskDataset(Dataset):
         if self.return_eval_target:
             sample["eval_target"] = eval_depth.to(torch.float32)
         return sample
+
+
+@dataclass(frozen=True)
+class _RawM3EDSemanticMeta:
+    # Keep this compatibility name so visualization utilities can display
+    # dataset.files[file_idx].preprocessed_h5 for both preprocessed and raw data.
+    preprocessed_h5: Path
+    semantics_h5: Path
+    num_windows: int
+    event_group_path: str
+    t_offset_us: int
+    anchors_us: np.ndarray
+    window_starts_us: np.ndarray
+    window_ends_us: np.ndarray
+    label_dataset_path: str
+
+
+class M3EDRawSemanticDataset(Dataset):
+    """
+    Dense semantic downstream dataset for downloaded M3ED layout.
+
+    Event representations are generated on demand from ``<sequence>_data.h5``.
+    Labels are read from the sibling ``<sequence>_semantics.h5`` file, usually
+    from ``/predictions`` aligned by ``/ts``.
+    """
+
+    def __init__(
+        self,
+        *,
+        roots: Sequence[str | Path],
+        clip_num_frames: int,
+        clip_frame_stride: int = 1,
+        file_pattern: str = "*_data.h5",
+        recursive: bool = True,
+        ignore_index: int = 255,
+        require_labels: bool = True,
+        input_size: Sequence[int] | int | None = None,
+        input_resize_mode: str = "bilinear",
+        return_eval_target: bool = False,
+        max_open_h5_files: int = 8,
+        event_camera: str = "left",
+        semantics_suffix: str | None = None,
+        semantics_ts_path: str = "ts",
+        semantics_ts_divisor: int = 1,
+        label_dataset_path: str = "predictions",
+        label_remap: str = "cityscapes_19_to_11",
+        window_mode: str = "semantics_middle",
+        accum_time_us: int = 50_000,
+        representation: str = "voxel_grid",
+        input_height: int = 720,
+        input_width: int = 1280,
+        output_height: int = 720,
+        output_width: int = 1280,
+        downsample_factor: int = 2,
+        t_bins: int = 10,
+        split_polarity: bool = True,
+        normalize: bool = True,
+        use_trilinear: bool = False,
+        output_dtype: str = "float16",
+        event_image_percentile: float = 99.0,
+        sequence_include: Sequence[str] | str | None = None,
+        sequence_exclude: Sequence[str] | str | None = None,
+        sequence_ranges: Mapping[str, object] | Sequence[Mapping[str, object]] | None = None,
+        sample_start_fraction: float = 0.0,
+        sample_stop_fraction: float = 1.0,
+        sample_stride: int = 1,
+    ):
+        if isinstance(roots, (str, Path)):
+            roots = [roots]
+        if len(roots) == 0:
+            raise ValueError("roots must be non-empty for M3ED raw semantic dataset")
+        if int(clip_num_frames) <= 0 or int(clip_frame_stride) <= 0:
+            raise ValueError("clip_num_frames and clip_frame_stride must be > 0")
+        if representation not in {"voxel_grid", "event_image"}:
+            raise ValueError("representation must be 'voxel_grid' or 'event_image'")
+        if window_mode not in {"semantics_middle", "fixed_before", "fixed_after"}:
+            raise ValueError(
+                "window_mode must be one of "
+                "{'semantics_middle', 'fixed_before', 'fixed_after'}"
+            )
+        if int(accum_time_us) <= 0:
+            raise ValueError("accum_time_us must be > 0")
+        if int(downsample_factor) not in {1, 2}:
+            raise ValueError("downsample_factor must be 1 or 2")
+        if int(t_bins) <= 0:
+            raise ValueError("t_bins must be > 0")
+        if output_dtype not in {"float16", "float32"}:
+            raise ValueError("output_dtype must be 'float16' or 'float32'")
+
+        self.roots = [Path(root).expanduser() for root in roots]
+        self.clip_num_frames = int(clip_num_frames)
+        self.clip_frame_stride = int(clip_frame_stride)
+        self.ignore_index = int(ignore_index)
+        self.require_labels = bool(require_labels)
+        self.input_size = _to_optional_hw_tuple(input_size, field_name="input_size")
+        self.input_resize_mode = str(input_resize_mode).lower()
+        self.return_eval_target = bool(return_eval_target)
+        self.max_open_h5_files = max(1, int(max_open_h5_files))
+        self.event_camera = str(event_camera).strip().lower()
+        self.event_group_path = f"prophesee/{self.event_camera}"
+        self.semantics_suffix = (
+            str(semantics_suffix)
+            if semantics_suffix is not None
+            else (
+                "semantics"
+                if self.event_camera == "left"
+                else f"semantics_{self.event_camera}"
+            )
+        )
+        self.semantics_ts_path = str(semantics_ts_path).strip()
+        self.semantics_ts_divisor = int(semantics_ts_divisor)
+        if self.semantics_ts_divisor <= 0:
+            raise ValueError("semantics_ts_divisor must be > 0")
+        self.label_dataset_path = str(label_dataset_path).strip()
+        self.label_remap = str(label_remap)
+        self.window_mode = str(window_mode)
+        self.accum_time_us = int(accum_time_us)
+        self.representation = str(representation)
+        self.input_height = int(input_height)
+        self.input_width = int(input_width)
+        self.downsample_factor = int(downsample_factor)
+        self.t_bins = int(t_bins)
+        self.split_polarity = bool(split_polarity)
+        self.normalize = bool(normalize)
+        self.use_trilinear = bool(use_trilinear)
+        self.output_dtype = str(output_dtype)
+        self.event_image_percentile = float(event_image_percentile)
+        self.sequence_include = _normalise_optional_sequence_names(sequence_include)
+        self.sequence_exclude = _normalise_optional_sequence_names(sequence_exclude)
+        self.sequence_ranges = _normalise_sequence_ranges(sequence_ranges)
+        self.sample_start_fraction = float(sample_start_fraction)
+        self.sample_stop_fraction = float(sample_stop_fraction)
+        self.sample_stride = max(1, int(sample_stride))
+
+        if self.input_height <= 0 or self.input_width <= 0:
+            raise ValueError("input_height and input_width must be > 0")
+        if self.downsample_factor == 1:
+            self.output_height = int(output_height)
+            self.output_width = int(output_width)
+        else:
+            if (
+                self.input_height % self.downsample_factor != 0
+                or self.input_width % self.downsample_factor != 0
+            ):
+                raise ValueError(
+                    "M3ED input resolution must be divisible by downsample_factor"
+                )
+            self.output_height = self.input_height // self.downsample_factor
+            self.output_width = self.input_width // self.downsample_factor
+        if self.output_height <= 0 or self.output_width <= 0:
+            raise ValueError("resolved output resolution must be > 0")
+
+        self.output_channels = (
+            self.t_bins * (2 if self.split_polarity else 1)
+            if self.representation == "voxel_grid"
+            else 3
+        )
+        self._voxelizer = (
+            EventVoxelGrid(
+                input_size=(self.t_bins, self.output_height, self.output_width),
+                normalize=self.normalize,
+                separate_polarity=self.split_polarity,
+                trilinear_interpolation=self.use_trilinear,
+            )
+            if self.representation == "voxel_grid"
+            else None
+        )
+
+        self.files: list[_RawM3EDSemanticMeta] = []
+        self.samples: list[tuple[int, int]] = []
+        self._event_h5_cache: OrderedDict[str, h5py.File] = OrderedDict()
+        self._semantics_h5_cache: OrderedDict[str, h5py.File] = OrderedDict()
+        self._ms_idx_cache: OrderedDict[str, np.ndarray | None] = OrderedDict()
+
+        for root in self.roots:
+            for event_path in _discover_m3ed_h5_files(
+                root,
+                file_pattern=file_pattern,
+                recursive=bool(recursive),
+            ):
+                if not _sequence_is_selected(
+                    event_path,
+                    include=self.sequence_include,
+                    exclude=self.sequence_exclude,
+                ):
+                    continue
+                sequence_range = _sequence_range_for_path(
+                    event_path,
+                    self.sequence_ranges,
+                )
+                if self.sequence_ranges and sequence_range is None:
+                    continue
+                semantics_path = _resolve_companion_h5(
+                    event_path,
+                    suffix=self.semantics_suffix,
+                )
+                if semantics_path is None:
+                    if self.require_labels:
+                        continue
+                    continue
+                meta, valid_indices = self._build_file_meta(
+                    event_path=event_path,
+                    semantics_path=semantics_path,
+                    sequence_range=sequence_range,
+                )
+                if meta is None or valid_indices.size == 0:
+                    continue
+                file_idx = len(self.files)
+                self.files.append(meta)
+                self.samples.extend(
+                    (file_idx, int(label_idx)) for label_idx in valid_indices.tolist()
+                )
+
+        if len(self.files) == 0 or len(self.samples) == 0:
+            raise RuntimeError(
+                "No valid raw M3ED semantic samples found. "
+                "Check *_data.h5 paths, sibling *_semantics.h5 files, "
+                "sequence filters, and label dataset names."
+            )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_event_h5_cache"] = OrderedDict()
+        state["_semantics_h5_cache"] = OrderedDict()
+        state["_ms_idx_cache"] = OrderedDict()
+        return state
+
+    def __del__(self):
+        for cache_name in ("_event_h5_cache", "_semantics_h5_cache"):
+            cache = getattr(self, cache_name, None)
+            if isinstance(cache, dict):
+                for h5f in cache.values():
+                    try:
+                        h5f.close()
+                    except Exception:
+                        pass
+                cache.clear()
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _build_file_meta(
+        self,
+        *,
+        event_path: Path,
+        semantics_path: Path,
+        sequence_range: _SequenceRange | None,
+    ) -> tuple[_RawM3EDSemanticMeta | None, np.ndarray]:
+        with h5py.File(str(event_path), "r") as event_h5, h5py.File(str(semantics_path), "r") as sem_h5:
+            if self.event_group_path not in event_h5:
+                return None, np.empty((0,), dtype=np.int64)
+            events = event_h5[self.event_group_path]
+            if not all(key in events for key in ("x", "y", "t", "p")):
+                return None, np.empty((0,), dtype=np.int64)
+            if self.semantics_ts_path not in sem_h5 or self.label_dataset_path not in sem_h5:
+                return None, np.empty((0,), dtype=np.int64)
+
+            event_t = events["t"]
+            label_ds = sem_h5[self.label_dataset_path]
+            if int(len(event_t)) == 0 or label_ds.ndim < 3 or int(label_ds.shape[0]) <= 0:
+                return None, np.empty((0,), dtype=np.int64)
+
+            semantics_ts = np.asarray(
+                sem_h5[self.semantics_ts_path][()],
+                dtype=np.int64,
+            ).reshape(-1)
+            if semantics_ts.size == 0:
+                return None, np.empty((0,), dtype=np.int64)
+            if self.semantics_ts_divisor != 1:
+                semantics_ts = np.floor_divide(
+                    semantics_ts,
+                    self.semantics_ts_divisor,
+                ).astype(np.int64, copy=False)
+
+            num_windows = min(int(label_ds.shape[0]), int(semantics_ts.size))
+            if num_windows <= 0:
+                return None, np.empty((0,), dtype=np.int64)
+            semantics_ts = semantics_ts[:num_windows]
+
+            t_offset_us = _read_t_offset(event_h5)
+            t_first_us = int(event_t[0]) + int(t_offset_us)
+            t_last_exclusive_us = int(event_t[-1]) + int(t_offset_us) + 1
+            anchors_us = _align_anchor_timebase_to_events(
+                semantics_ts,
+                t_first_us=t_first_us,
+                t_last_exclusive_us=t_last_exclusive_us,
+                t_offset_us=int(t_offset_us),
+            )
+
+            if self.window_mode == "semantics_middle":
+                starts_us, ends_us = _build_middle_windows(
+                    anchors_us,
+                    t_first_us=t_first_us,
+                    t_last_exclusive_us=t_last_exclusive_us,
+                )
+            elif self.window_mode == "fixed_before":
+                starts_us = anchors_us - int(self.accum_time_us)
+                ends_us = anchors_us.copy()
+                np.maximum(starts_us, int(t_first_us), out=starts_us)
+                np.minimum(ends_us, int(t_last_exclusive_us), out=ends_us)
+            else:
+                starts_us = anchors_us.copy()
+                ends_us = anchors_us + int(self.accum_time_us)
+                np.maximum(starts_us, int(t_first_us), out=starts_us)
+                np.minimum(ends_us, int(t_last_exclusive_us), out=ends_us)
+
+        if anchors_us.size != num_windows or starts_us.size != num_windows or ends_us.size != num_windows:
+            return None, np.empty((0,), dtype=np.int64)
+
+        valid = np.nonzero(ends_us > starts_us)[0].astype(np.int64, copy=False)
+        sample_start_fraction = self.sample_start_fraction
+        sample_stop_fraction = self.sample_stop_fraction
+        sample_stride = self.sample_stride
+        if sequence_range is not None:
+            sample_start_fraction = sequence_range.start_fraction
+            sample_stop_fraction = sequence_range.stop_fraction
+            sample_stride = sequence_range.stride
+        valid = _fractional_subset(
+            valid,
+            start_fraction=sample_start_fraction,
+            stop_fraction=sample_stop_fraction,
+            stride=sample_stride,
+        )
+        if valid.size == 0:
+            return None, np.empty((0,), dtype=np.int64)
+
+        meta = _RawM3EDSemanticMeta(
+            preprocessed_h5=event_path,
+            semantics_h5=semantics_path,
+            num_windows=int(num_windows),
+            event_group_path=self.event_group_path,
+            t_offset_us=int(t_offset_us),
+            anchors_us=anchors_us.astype(np.int64, copy=False),
+            window_starts_us=starts_us.astype(np.int64, copy=False),
+            window_ends_us=ends_us.astype(np.int64, copy=False),
+            label_dataset_path=self.label_dataset_path,
+        )
+        return meta, valid
+
+    def _get_h5_from_cache(
+        self,
+        cache: OrderedDict[str, h5py.File],
+        path: Path,
+    ) -> h5py.File:
+        key = str(path)
+        h5f = cache.get(key)
+        if h5f is not None:
+            cache.move_to_end(key, last=True)
+            return h5f
+
+        h5f = h5py.File(key, "r")
+        cache[key] = h5f
+        while len(cache) > self.max_open_h5_files:
+            old_key, old_h5 = cache.popitem(last=False)
+            try:
+                old_h5.close()
+            except Exception:
+                pass
+            self._ms_idx_cache.pop(old_key, None)
+        return h5f
+
+    def _get_event_h5(self, path: Path) -> h5py.File:
+        return self._get_h5_from_cache(self._event_h5_cache, path)
+
+    def _get_semantics_h5(self, path: Path) -> h5py.File:
+        return self._get_h5_from_cache(self._semantics_h5_cache, path)
+
+    def _get_ms_idx(self, meta: _RawM3EDSemanticMeta) -> np.ndarray | None:
+        key = str(meta.preprocessed_h5)
+        if key in self._ms_idx_cache:
+            value = self._ms_idx_cache[key]
+            self._ms_idx_cache.move_to_end(key, last=True)
+            return value
+
+        h5f = self._get_event_h5(meta.preprocessed_h5)
+        events = h5f[meta.event_group_path]
+        if "ms_map_idx" in events:
+            value = np.asarray(events["ms_map_idx"], dtype=np.int64)
+        elif "ms_to_idx" in h5f:
+            value = np.asarray(h5f["ms_to_idx"], dtype=np.int64)
+        else:
+            value = None
+        self._ms_idx_cache[key] = value
+        while len(self._ms_idx_cache) > self.max_open_h5_files:
+            self._ms_idx_cache.popitem(last=False)
+        return value
+
+    def _extract_events_by_time(
+        self,
+        meta: _RawM3EDSemanticMeta,
+        *,
+        start_us: int,
+        end_us: int,
+    ) -> dict[str, np.ndarray]:
+        empty = {
+            "x": np.empty((0,), dtype=np.float32),
+            "y": np.empty((0,), dtype=np.float32),
+            "p": np.empty((0,), dtype=np.float32),
+            "t": np.empty((0,), dtype=np.int64),
+        }
+        if end_us <= start_us:
+            return empty
+
+        h5f = self._get_event_h5(meta.preprocessed_h5)
+        events = h5f[meta.event_group_path]
+        timestamps = events["t"]
+        num_events = int(len(timestamps))
+        if num_events == 0:
+            return empty
+
+        ms_idx = self._get_ms_idx(meta)
+        if ms_idx is not None and ms_idx.size > 0:
+            start_rel_us = int(start_us) - int(meta.t_offset_us)
+            end_rel_us = int(end_us) - int(meta.t_offset_us)
+            if end_rel_us <= 0:
+                return empty
+            start_ms = max(start_rel_us // 1000, 0)
+            end_ms_exclusive = max((end_rel_us + 999) // 1000, start_ms + 1)
+            start_ms = min(start_ms, int(ms_idx.size) - 1)
+            coarse_start = int(ms_idx[start_ms])
+            coarse_end = (
+                num_events
+                if end_ms_exclusive >= int(ms_idx.size)
+                else int(ms_idx[end_ms_exclusive])
+            )
+            coarse_start = max(0, min(coarse_start, num_events))
+            coarse_end = max(0, min(coarse_end, num_events))
+            if coarse_end <= coarse_start:
+                return empty
+            t_coarse = (
+                np.asarray(timestamps[coarse_start:coarse_end], dtype=np.int64)
+                + int(meta.t_offset_us)
+            )
+            rel_start = int(np.searchsorted(t_coarse, start_us, side="left"))
+            rel_end = int(np.searchsorted(t_coarse, end_us, side="left"))
+            event_start = coarse_start + rel_start
+            event_end = coarse_start + rel_end
+            selected_t = t_coarse[rel_start:rel_end]
+        else:
+            start_rel_us = int(start_us) - int(meta.t_offset_us)
+            end_rel_us = int(end_us) - int(meta.t_offset_us)
+            event_start = _h5_searchsorted_left(timestamps, start_rel_us)
+            event_end = _h5_searchsorted_left(timestamps, end_rel_us)
+            selected_t = (
+                np.asarray(timestamps[event_start:event_end], dtype=np.int64)
+                + int(meta.t_offset_us)
+            )
+
+        if event_end <= event_start:
+            return empty
+        return {
+            "x": np.asarray(events["x"][event_start:event_end]),
+            "y": np.asarray(events["y"][event_start:event_end]),
+            "p": np.asarray(events["p"][event_start:event_end]),
+            "t": selected_t,
+        }
+
+    def _normalize_event_coordinates(
+        self,
+        events: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        if events["t"].size == 0:
+            return {
+                "x": np.empty((0,), dtype=np.float32),
+                "y": np.empty((0,), dtype=np.float32),
+                "p": np.empty((0,), dtype=np.float32),
+                "t": np.empty((0,), dtype=np.int64),
+            }
+
+        x = np.asarray(events["x"], dtype=np.float32)
+        y = np.asarray(events["y"], dtype=np.float32)
+        p = np.asarray(events["p"])
+        t = np.asarray(events["t"], dtype=np.int64)
+        valid = (
+            (x >= 0)
+            & (x < float(self.input_width))
+            & (y >= 0)
+            & (y < float(self.input_height))
+        )
+        if not np.any(valid):
+            return {
+                "x": np.empty((0,), dtype=np.float32),
+                "y": np.empty((0,), dtype=np.float32),
+                "p": np.empty((0,), dtype=np.float32),
+                "t": np.empty((0,), dtype=np.int64),
+            }
+
+        x = x[valid]
+        y = y[valid]
+        p = p[valid]
+        t = t[valid]
+        if self.output_width == self.input_width and self.output_height == self.input_height:
+            x_out = x
+            y_out = y
+        elif self.input_width % self.output_width == 0 and self.input_height % self.output_height == 0:
+            x_out = np.floor(x / float(self.input_width // self.output_width))
+            y_out = np.floor(y / float(self.input_height // self.output_height))
+        else:
+            x_out = np.floor(x * (float(self.output_width) / float(self.input_width)))
+            y_out = np.floor(y * (float(self.output_height) / float(self.input_height)))
+
+        valid_out = (
+            (x_out >= 0)
+            & (x_out < float(self.output_width))
+            & (y_out >= 0)
+            & (y_out < float(self.output_height))
+        )
+        return {
+            "x": x_out[valid_out].astype(np.float32, copy=False),
+            "y": y_out[valid_out].astype(np.float32, copy=False),
+            "p": (p[valid_out] > 0).astype(np.float32, copy=False),
+            "t": t[valid_out].astype(np.int64, copy=False),
+        }
+
+    def _make_representation(
+        self,
+        meta: _RawM3EDSemanticMeta,
+        window_idx: int,
+    ) -> torch.Tensor:
+        events = self._extract_events_by_time(
+            meta,
+            start_us=int(meta.window_starts_us[window_idx]),
+            end_us=int(meta.window_ends_us[window_idx]),
+        )
+        events = self._normalize_event_coordinates(events)
+
+        if self.representation == "voxel_grid":
+            assert self._voxelizer is not None
+            if events["t"].size == 0:
+                representation = torch.zeros(
+                    (self.output_channels, self.output_height, self.output_width),
+                    dtype=torch.float32,
+                )
+            else:
+                shifted_t = (events["t"] - events["t"][0]).astype(np.float32, copy=False)
+                representation = self._voxelizer.convert(
+                    {
+                        "x": torch.from_numpy(events["x"]),
+                        "y": torch.from_numpy(events["y"]),
+                        "p": torch.from_numpy(events["p"]),
+                        "t": torch.from_numpy(shifted_t),
+                    }
+                ).cpu()
+        else:
+            image, _ = accumulate_events_to_rgb(
+                events["x"],
+                events["y"],
+                events["p"],
+                (self.output_height, self.output_width),
+                percentile=self.event_image_percentile,
+                dtype=np.float32,
+            )
+            representation = torch.from_numpy(image)
+
+        representation = representation.to(torch.float32)
+        if self.output_dtype == "float16":
+            representation = representation.to(torch.float16).to(torch.float32)
+        return representation.contiguous()
+
+    def _read_semantic_label(
+        self,
+        meta: _RawM3EDSemanticMeta,
+        label_idx: int,
+    ) -> torch.Tensor:
+        sem_h5 = self._get_semantics_h5(meta.semantics_h5)
+        label_arr = np.asarray(sem_h5[meta.label_dataset_path][int(label_idx)])
+        label_arr = _squeeze_to_hw(label_arr, target="semantic")
+        label_arr = _apply_semantic_label_remap(
+            label_arr,
+            remap=self.label_remap,
+            ignore_index=self.ignore_index,
+        )
+        return torch.from_numpy(label_arr.astype(np.int64, copy=False))
+
+    def __getitem__(self, index: int):
+        file_idx, center_window = self.samples[index]
+        meta = self.files[file_idx]
+
+        clip_indices = _build_centered_clip_indices(
+            center_idx=int(center_window),
+            num_total=meta.num_windows,
+            num_frames=self.clip_num_frames,
+            frame_stride=self.clip_frame_stride,
+        )
+        frame_cache: dict[int, torch.Tensor] = {}
+        frames: list[torch.Tensor] = []
+        for window_idx in clip_indices.tolist():
+            cached = frame_cache.get(int(window_idx))
+            if cached is None:
+                cached = self._make_representation(meta, int(window_idx))
+                frame_cache[int(window_idx)] = cached
+            frames.append(cached)
+
+        clip_tchw = torch.stack(frames, dim=0)
+        clip_cthw = clip_tchw.permute(1, 0, 2, 3).contiguous()
+        clip_cthw = _resize_clip_cthw(
+            clip_cthw,
+            target_hw=self.input_size,
+            mode=self.input_resize_mode,
+        )
+        target_h, target_w = int(clip_cthw.shape[-2]), int(clip_cthw.shape[-1])
+
+        eval_label = self._read_semantic_label(meta, int(center_window))
+        label = _resize_label_like_dense_target(
+            eval_label,
+            target_h=target_h,
+            target_w=target_w,
+            target="semantic",
+        )
+        sample = {
+            "input": clip_cthw.to(torch.float32),
+            "target": label.to(torch.int64),
+            "is_semantic": True,
+        }
+        if self.return_eval_target:
+            sample["eval_target"] = eval_label.to(torch.int64)
+        return sample
+
+
+def _get_split_cfg_value(
+    cfg_task: dict,
+    split: str,
+    key: str,
+    default=None,
+):
+    split_key = f"{split}_{key}"
+    if split_key in cfg_task and cfg_task.get(split_key) is not None:
+        return cfg_task.get(split_key)
+    return cfg_task.get(key, default)
+
+
+def build_dense_task_dataset_from_config(
+    *,
+    cfg_task: dict,
+    roots: Sequence[str | Path],
+    split: str,
+    return_eval_target: bool,
+) -> Dataset:
+    target = str(cfg_task.get("target", "semantic")).lower()
+    dataset_kind = str(cfg_task.get("dataset_kind", "dsec")).lower()
+    common_kwargs = {
+        "roots": roots,
+        "clip_num_frames": int(cfg_task.get("clip_num_frames", 2)),
+        "clip_frame_stride": int(cfg_task.get("clip_frame_stride", 1)),
+        "file_pattern": str(
+            cfg_task.get(
+                "file_pattern",
+                "*_data.h5" if dataset_kind == "m3ed_raw" else "*.h5",
+            )
+        ),
+        "recursive": bool(cfg_task.get("recursive", True)),
+        "ignore_index": int(cfg_task.get("ignore_index", 255)),
+        "require_labels": bool(cfg_task.get("require_labels", True)),
+        "input_size": cfg_task.get("input_size", None),
+        "input_resize_mode": str(cfg_task.get("input_resize_mode", "bilinear")),
+        "return_eval_target": bool(return_eval_target),
+    }
+
+    if dataset_kind == "m3ed_raw":
+        if target != "semantic":
+            raise ValueError("dataset_kind=m3ed_raw currently supports target=semantic only")
+        return M3EDRawSemanticDataset(
+            **common_kwargs,
+            max_open_h5_files=int(cfg_task.get("max_open_h5_files", 8)),
+            event_camera=str(cfg_task.get("event_camera", "left")),
+            semantics_suffix=cfg_task.get("semantics_suffix", None),
+            semantics_ts_path=str(cfg_task.get("semantics_ts_path", "ts")),
+            semantics_ts_divisor=int(cfg_task.get("semantics_ts_divisor", 1)),
+            label_dataset_path=str(cfg_task.get("label_dataset_path", "predictions")),
+            label_remap=str(cfg_task.get("label_remap", "cityscapes_19_to_11")),
+            window_mode=str(cfg_task.get("window_mode", "semantics_middle")),
+            accum_time_us=int(cfg_task.get("accum_time_us", 50_000)),
+            representation=str(cfg_task.get("representation", "voxel_grid")),
+            input_height=int(cfg_task.get("input_height", 720)),
+            input_width=int(cfg_task.get("input_width", 1280)),
+            output_height=int(cfg_task.get("output_height", 720)),
+            output_width=int(cfg_task.get("output_width", 1280)),
+            downsample_factor=int(cfg_task.get("downsample_factor", 2)),
+            t_bins=int(cfg_task.get("t_bins", 10)),
+            split_polarity=bool(cfg_task.get("split_polarity", True)),
+            normalize=bool(cfg_task.get("normalize", True)),
+            use_trilinear=bool(cfg_task.get("use_trilinear", False)),
+            output_dtype=str(cfg_task.get("output_dtype", "float16")),
+            event_image_percentile=float(cfg_task.get("event_image_percentile", 99.0)),
+            sequence_include=_get_split_cfg_value(cfg_task, split, "sequence_include", None),
+            sequence_exclude=_get_split_cfg_value(cfg_task, split, "sequence_exclude", None),
+            sequence_ranges=_get_split_cfg_value(cfg_task, split, "sequence_ranges", None),
+            sample_start_fraction=float(
+                _get_split_cfg_value(cfg_task, split, "sample_start_fraction", 0.0)
+            ),
+            sample_stop_fraction=float(
+                _get_split_cfg_value(cfg_task, split, "sample_stop_fraction", 1.0)
+            ),
+            sample_stride=int(
+                _get_split_cfg_value(cfg_task, split, "sample_stride", 1)
+            ),
+        )
+
+    return EventDenseTaskDataset(
+        **common_kwargs,
+        dataset_kind=dataset_kind,
+        target=target,
+        depth_scale=float(cfg_task.get("depth_scale", 1.0)),
+    )

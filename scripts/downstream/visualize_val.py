@@ -26,7 +26,7 @@ from scripts.downstream.train import (
     _to_dtype,
 )
 from scripts.preprocess.utils import RgbMp4Writer
-from src.downstream.datasets import EventDenseTaskDataset
+from src.downstream.datasets import build_dense_task_dataset_from_config
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 
 
@@ -825,19 +825,10 @@ def main() -> None:
         raise ValueError(f"Config field task.{roots_key} is empty.")
 
     target = str(cfg_task.get("target", "semantic")).lower()
-    dataset = EventDenseTaskDataset(
+    dataset = build_dense_task_dataset_from_config(
+        cfg_task=cfg_task,
         roots=roots,
-        dataset_kind=str(cfg_task.get("dataset_kind", "dsec")).lower(),
-        target=target,
-        clip_num_frames=int(cfg_task.get("clip_num_frames", 2)),
-        clip_frame_stride=int(cfg_task.get("clip_frame_stride", 1)),
-        file_pattern=str(cfg_task.get("file_pattern", "*.h5")),
-        recursive=bool(cfg_task.get("recursive", True)),
-        ignore_index=int(cfg_task.get("ignore_index", 255)),
-        depth_scale=float(cfg_task.get("depth_scale", 1.0)),
-        require_labels=bool(cfg_task.get("require_labels", True)),
-        input_size=cfg_task.get("input_size", None),
-        input_resize_mode=str(cfg_task.get("input_resize_mode", "bilinear")),
+        split=split_name,
         return_eval_target=bool(cfg_task.get("eval_original_resolution", True)),
     )
 
